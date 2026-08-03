@@ -1,0 +1,18 @@
+# Copy to config.toml (git-ignored) and edit. All keys optional; defaults shown.
+
+[device]
+host = "10.0.4.20"          # USB-Ethernet default; set your LAN IP for Wi-Fi
+
+[calendar_countdown]
+poll_seconds = 60
+lookahead_hours = 12
+warn_minutes = 5
+include_all_day = false
+auto_busy = false
+# calendars = ["Work"]      # omit to read all calendars
+
+[ci_status]
+poll_seconds = 120
+repos = ["your-user/your-repo"]
+show_green = false
+# stale_queued_minutes = 15 # omit to disable stuck-queue detection
