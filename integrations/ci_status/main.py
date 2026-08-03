@@ -37,7 +37,8 @@ def run_once(client, poller, cfg: dict, now: datetime,
         return "all green; cleared"
     result = client.draw(APP, payload["elements"], priority=payload["priority"],
                          led_notification_color=payload["led"])
-    return f"{payload['elements'][0]['text'][:40]!r} -> {result.value}"
+    text = next(e["text"] for e in payload["elements"] if e["type"] == "text")
+    return f"{text[:40]!r} -> {result.value}"
 
 
 def main() -> int:

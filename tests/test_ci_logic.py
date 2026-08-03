@@ -15,6 +15,14 @@ def run(workflow_id: int, name: str, status: str, conclusion: str | None,
             "conclusion": conclusion, "created_at": created}
 
 
+def _text_element(elements: list[dict]) -> dict:
+    return next(e for e in elements if e["type"] == "text")
+
+
+def _bg_element(elements: list[dict]) -> dict:
+    return next(e for e in elements if e["type"] == "rectangle")
+
+
 def test_failure_detected_on_latest_run_only():
     runs = [run(1, "tests", "completed", "success"),          # newest for wf 1
             run(1, "tests", "completed", "failure", 60),      # older failure — ignore
@@ -34,14 +42,46 @@ def test_payload_none_when_green_and_quiet():
     assert build_ci_payload([RepoState("o/r", [], [])], False, 180) is None
 
 
-def test_payload_red_on_failure():
+def test_payload_shows_green_glyph_when_enabled():
+    payload = build_ci_payload([RepoState("o/r", [], [])], True, 180)
+    assert payload["priority"] == 60
+    text_el = _text_element(payload["elements"])
+    assert text_el["color"] == "#00FF00FF"
+    # quiet green case has no full-panel background badge
+    assert not any(e["type"] == "rectangle" for e in payload["elements"])
+
+
+def test_payload_red_badge_on_failure():
     payload = build_ci_payload([RepoState("o/r", ["tests"], [])], False, 180)
     assert payload["priority"] == 60 and payload["led"] == "#FF0000FF"
-    assert "o/r" in payload["elements"][0]["text"]
-    assert payload["elements"][0]["color"] == "#FF0000FF"
+
+    bg = _bg_element(payload["elements"])
+    assert bg["x"] == 0 and bg["y"] == 0 and bg["width"] == 72 and bg["height"] == 16
+    assert bg["radius"] == 2 and bg["fill"] == "solid"
+    assert bg["fill_colors"] == ["#A32D2DFF"]
+    # default 1px white border would outline the badge; must be disabled
+    assert bg["border_width"] == 0
+
+    text_el = _text_element(payload["elements"])
+    assert "o/r" in text_el["text"] and "tests" in text_el["text"]
+    assert text_el["color"] == "#FFFFFFFF"
+    assert text_el["font"] == "bold"
 
 
-def test_payload_yellow_on_stuck_only():
+def test_payload_amber_badge_on_stuck_only():
     payload = build_ci_payload([RepoState("o/r", [], ["tests"])], False, 180)
-    assert payload["led"] is None and payload["elements"][0]["color"] == "#FFFF00FF"
-    assert "stuck" in payload["elements"][0]["text"]
+    assert payload["led"] is None
+
+    bg = _bg_element(payload["elements"])
+    assert bg["fill_colors"] == ["#BA7517FF"]
+
+    text_el = _text_element(payload["elements"])
+    assert "stuck" in text_el["text"]
+    assert text_el["color"] == "#0B0B0BFF"
+    assert text_el["font"] == "bold"
+
+
+def test_failure_badge_takes_priority_over_stuck():
+    payload = build_ci_payload([RepoState("o/r", ["tests"], ["lint"])], False, 180)
+    bg = _bg_element(payload["elements"])
+    assert bg["fill_colors"] == ["#A32D2DFF"]  # red failure badge wins
