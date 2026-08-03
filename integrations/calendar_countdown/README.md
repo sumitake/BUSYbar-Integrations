@@ -113,8 +113,8 @@ rm ~/Library/LaunchAgents/com.busybar.calendar-countdown.plist
 
 ## Logs
 
-Stdout and stderr are redirected to `/tmp/busybar-calendar.log`. View recent activity with:
+Stdout and stderr are redirected to `~/Library/Logs/busybar/calendar.log`. View recent activity with:
 
 ```bash
-tail -f /tmp/busybar-calendar.log
+tail -f ~/Library/Logs/busybar/calendar.log
 ```

@@ -108,10 +108,10 @@ rm ~/Library/LaunchAgents/com.busybar.ci-status.plist
 
 ## Logs
 
-Stdout and stderr are redirected to `/tmp/busybar-ci.log`. View recent activity with:
+Stdout and stderr are redirected to `~/Library/Logs/busybar/ci.log`. View recent activity with:
 
 ```bash
-tail -f /tmp/busybar-ci.log
+tail -f ~/Library/Logs/busybar/ci.log
 ```
 
 ## GitHub-Hosted and Self-Hosted Runners
