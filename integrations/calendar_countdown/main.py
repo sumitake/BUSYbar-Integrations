@@ -14,8 +14,8 @@ from datetime import datetime, timezone
 from busybar.client import BusyBarClient, DrawResult
 from busybar.config import load_config
 
-from .logic import (build_elements, format_countdown,
-                    select_active_event, select_next_event)
+from .logic import (ascii_safe, build_elements, select_active_event,
+                    select_next_event)
 
 APP = "calendar_countdown"
 PRIORITY = 20
@@ -26,28 +26,32 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool) -> str:
     c = cfg["calendar_countdown"]
     timeout_s = int(c["poll_seconds"] * 1.5)
     events = fetch(c["lookahead_hours"])
-    nxt = select_next_event(events, now, c["lookahead_hours"], c["include_all_day"])
+    active = select_active_event(events, now)
 
-    if c["auto_busy"] and not dry_run:
-        active = select_active_event(events, now)
-        if active is not None:
-            remaining_ms = int((active.end - now).total_seconds() * 1000)
-            busy = client.get_busy() or {}
-            if busy.get("type") in (None, "NOT_STARTED"):
-                client.set_busy_simple(remaining_ms)
+    if c["auto_busy"] and not dry_run and active is not None:
+        remaining_ms = int((active.end - now).total_seconds() * 1000)
+        busy = client.get_busy() or {}
+        if busy.get("type") in (None, "NOT_STARTED"):
+            client.set_busy_simple(remaining_ms)
 
-    if nxt is None:
+    # An in-progress event takes display priority over a later upcoming one.
+    if active is not None:
+        event, in_progress = active, True
+    else:
+        event, in_progress = select_next_event(
+            events, now, c["lookahead_hours"], c["include_all_day"]), False
+
+    if event is None:
         if not dry_run:
             client.clear(APP)
         return "no upcoming event; cleared"
 
-    warning = (nxt.start - now).total_seconds() / 60 <= c["warn_minutes"]
-    text = format_countdown(nxt, now)
-    elements = build_elements(text, warning, timeout_s)
+    label = f"{'active' if in_progress else 'upcoming'} {ascii_safe(event.title)!r}"
     if dry_run:
-        return f"DRY-RUN would draw: {text!r} (warning={warning})"
+        return f"DRY-RUN would draw: {label} (in_progress={in_progress})"
+    elements = build_elements(event, now, c, timeout_s, in_progress)
     result = client.draw(APP, elements=elements, priority=PRIORITY)
-    return f"drew {text!r} -> {result.value}"
+    return f"drew {label} -> {result.value}"
 
 
 def main() -> int:

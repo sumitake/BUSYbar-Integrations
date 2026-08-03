@@ -6,7 +6,9 @@ host = "10.0.4.20"          # USB-Ethernet default; set your LAN IP for Wi-Fi
 [calendar_countdown]
 poll_seconds = 60
 lookahead_hours = 12
-warn_minutes = 5
+warn_minutes = 5             # bar/countdown turn red within N minutes of start
+notice_minutes = 15          # bar/countdown turn amber within N minutes of start
+progress_window_minutes = 60 # progress bar drains from full over this many minutes
 include_all_day = false
 auto_busy = false
 # calendars = ["Work"]      # omit to read all calendars
