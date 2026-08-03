@@ -74,7 +74,7 @@ sed -e "s|__REPO__|$(git rev-parse --show-toplevel)|" -e "s|__UV__|$(command -v 
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.busybar.calendar-countdown.plist
 ```
 
-The agent will start automatically at your next login and run continuously, polling your calendar at the interval specified in `config.toml`.
+The agent will start automatically at your next login and run continuously, polling your calendar at the interval specified in `config.toml`. The agent sets PYTHONPATH to the repo's src/ directory so the busybar package resolves even without a healthy editable install.
 
 ### Uninstall LaunchAgent
 

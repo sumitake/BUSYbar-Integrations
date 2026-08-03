@@ -13,6 +13,11 @@
     <string>-m</string>
     <string>ci_status.main</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>__REPO__/src</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/tmp/busybar-ci.log</string>
