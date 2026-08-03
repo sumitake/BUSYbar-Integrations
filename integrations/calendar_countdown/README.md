@@ -32,7 +32,7 @@ lookahead_hours = 12           # how far ahead to scan (default: 12)
 warn_minutes = 5               # show countdown when within N minutes (default: 5)
 include_all_day = false        # include all-day events (default: false)
 auto_busy = false              # auto-mark as BUSY during events (default: false)
-# calendars = ["Work"]         # optional: limit to specific calendars
+# calendars = ["Calendar1", "Calendar2"]  # optional: list calendar names to limit scope
 ```
 
 ### 2. Test in Foreground

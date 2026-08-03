@@ -48,7 +48,7 @@ show_green = false             # display green builds (default: false)
 # stale_queued_minutes = 15    # optional: alert if runs stuck queued for N minutes
 ```
 
-At minimum, set `repos` to the repositories you want to monitor (e.g., `["alice/web", "alice/api"]`).
+At minimum, set `repos` to the repositories you want to monitor (e.g., `["owner/repo1", "owner/repo2"]`).
 
 ### 3. Test in Foreground
 
