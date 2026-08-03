@@ -20,3 +20,6 @@ packages = ["src/busybar"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Belt-and-braces: import busybar from src/ even if the venv's editable
+# .pth is unusable (macOS UF_HIDDEN on .pth files makes site skip them).
+pythonpath = ["src"]
