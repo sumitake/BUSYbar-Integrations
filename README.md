@@ -2,13 +2,6 @@
 
 Local-API integrations for the BUSY Bar — a 72×16 LED status display on USB or LAN.
 
-## What's inside
-
-| Integration | Description |
-|---|---|
-| [`calendar_countdown`](integrations/calendar_countdown/) | Next-meeting countdown on the LED display from macOS Calendar; optional auto-BUSY during events. |
-| [`ci_status`](integrations/ci_status/) | GitHub Actions status via REST with ETag caching; red alert on failure, yellow on stuck-queued runs. |
-
 ## Requirements
 
 - **BUSY Bar** on USB (default address `10.0.4.20`) or LAN
@@ -50,9 +43,10 @@ Per-integration extras (e.g., macOS Calendar access for `calendar_countdown`) ar
 
 The display is a shared 72×16 canvas. Each integration publishes text, shapes, or status via the `busybar.client.BusyBarClient` API (see [`src/busybar/client.py`](src/busybar/client.py)). The display arbitrates by **priority**:
 
-- **Built-in apps** (priority 10) get the top row.
-- **Integrations** claim lower priorities: `calendar_countdown` at **20**, CI alerts at **60**, active BUSY session at **90** (higher wins the display).
-- Each element has an optional `timeout`; if the source doesn't refresh within that window, the element self-clears.
+- **Built-in apps** sit at priority **10** — the idle baseline.
+- **Integrations** claim higher priorities to preempt the baseline: `calendar_countdown` at **20**, CI alerts at **60**.
+- **Active BUSY session** at **90** — an authenticated BUSY firmware state that outranks all integrations (e.g., CI failures blink the LED during an active session).
+- **Equal-or-higher priority wins** the display. Each element has an optional `timeout`; if the source doesn't refresh within that window, the element self-clears.
 
 The `application_name` field tags the source, letting the display track ownership and multi-instance behavior.
 
@@ -73,3 +67,10 @@ To add a new integration:
 - All secrets (API tokens, credentials) go in `config.toml`, which you provide locally.
 - The repo ships only `config.example.toml`, documenting all fields and defaults.
 - CI/CD can inject secrets via environment-variable expansion in config parsing if needed.
+
+## What's inside
+
+| Integration | Description |
+|---|---|
+| [`calendar_countdown`](integrations/calendar_countdown/) | Next-meeting countdown on the LED display from macOS Calendar; optional auto-BUSY during events. |
+| [`ci_status`](integrations/ci_status/) | GitHub Actions status via REST with ETag caching; red alert on failure, yellow on stuck-queued runs. |
