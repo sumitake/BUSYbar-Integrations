@@ -20,7 +20,9 @@
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/busybar-calendar.log</string>
-  <key>StandardErrorPath</key><string>/tmp/busybar-calendar.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/busybar/calendar.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/busybar/calendar.log</string>
 </dict>
 </plist>

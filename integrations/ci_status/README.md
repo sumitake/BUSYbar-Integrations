@@ -89,7 +89,8 @@ From the repository root, run these commands to install the CI integration as a 
 
 ```bash
 cd integrations/ci_status
-sed -e "s|__REPO__|$(git rev-parse --show-toplevel)|" -e "s|__UV__|$(command -v uv)|" \
+mkdir -p ~/Library/Logs/busybar
+sed -e "s|__REPO__|$(git rev-parse --show-toplevel)|" -e "s|__UV__|$(command -v uv)|" -e "s|__HOME__|$HOME|" \
   com.busybar.ci-status.plist > ~/Library/LaunchAgents/com.busybar.ci-status.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.busybar.ci-status.plist
 ```
