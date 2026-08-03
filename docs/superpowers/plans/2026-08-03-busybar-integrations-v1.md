@@ -226,7 +226,10 @@ git commit -m "client: add config loader with defaults and env override"
 **Interfaces:**
 - Consumes: nothing (requests only).
 - Produces (used by both integrations):
-  - `DrawResult` enum: `DRAWN`, `REJECTED`, `UNREACHABLE`
+  - `DrawResult` enum: `DRAWN`, `REJECTED`, `ERROR`, `UNREACHABLE`
+    *(ERROR added by operator ruling in review: non-200/409 HTTP response
+    from a live device; UNREACHABLE is reserved for connection failures and
+    remains the only state that triggers loop backoff)*
   - `BusyBarClient(host: str = "10.0.4.20", timeout: tuple = (3, 5))`
   - `.draw(application_name: str, elements: list[dict], priority: int = 50, led_notification_color: str | None = None) -> DrawResult`
   - `.clear(application_name: str) -> bool`

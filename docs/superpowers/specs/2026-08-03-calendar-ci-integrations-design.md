@@ -62,7 +62,10 @@ busybar-integrations/
 `BusyBarClient(host)` wraps the device API with the calls v1 needs:
 
 - `draw(application_name, elements, priority)` → POST `/api/display/draw`;
-  returns a tri-state result (drawn / rejected-409 / device-unreachable).
+  returns a four-state result (drawn / rejected-409 / http-error /
+  device-unreachable). *(Amended 2026-08-03 by operator ruling during
+  implementation review: HTTP errors from a live device are distinguished
+  from unreachable; only unreachable triggers loop backoff.)*
 - `clear(application_name)` → DELETE `/api/display/draw?application_name=…`.
 - `set_busy(...)` / `get_busy()` → `/api/busy/snapshot`.
 - `status()` → GET `/api/status` (used for reachability checks).
