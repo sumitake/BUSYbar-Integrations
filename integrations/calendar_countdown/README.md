@@ -15,7 +15,28 @@ The integration looks ahead 12 hours by default, surfaces events within a config
 
 ## Setup
 
-### 1. Configure
+### 1. Grant Calendar Permission
+
+From the repository root, run the integration once to answer the calendar-permission prompt:
+
+```bash
+cd integrations
+uv run python -m calendar_countdown.main --once --dry-run
+```
+
+This foreground run is required before automating — the permission prompt appears in the terminal and cannot be answered by a background agent. After the permission dialog, press ^C to exit.
+
+### 2. Discover Calendar Names
+
+To limit polling to specific calendars, first discover the exact names available on your system:
+
+```bash
+uv run python -m calendar_countdown.main --list-calendars
+```
+
+This prints the calendar names organized by account. Use these exact names in the config.
+
+### 3. Configure
 
 Copy the example config to your repository root:
 
@@ -32,23 +53,18 @@ lookahead_hours = 12           # how far ahead to scan (default: 12)
 warn_minutes = 5               # show countdown when within N minutes (default: 5)
 include_all_day = false        # include all-day events (default: false)
 auto_busy = false              # auto-mark as BUSY during events (default: false)
-# calendars = ["Calendar1", "Calendar2"]  # optional: list calendar names to limit scope
+# calendars = ["Work"]         # optional: list calendar names to limit scope (discover with --list-calendars)
 ```
 
-### 2. Test in Foreground
+### 4. Test Live
 
-From the repository root, run the integration once to answer the calendar-permission prompt:
+Once config is in place, test the integration with a dry-run:
 
 ```bash
-cd integrations
 uv run python -m calendar_countdown.main --once --dry-run
 ```
 
-Verify that the output shows upcoming events. **This foreground run is required** before installing the LaunchAgent — the permission prompt appears in the terminal and cannot be answered by a background agent.
-
-### 3. Verify Config
-
-Once the foreground test completes, your `config.toml` is in place and the permission is granted. The LaunchAgent installation step below will automate polling.
+Verify that the output shows your next upcoming event with the correct countdown.
 
 ## Config Reference
 
@@ -59,7 +75,7 @@ Once the foreground test completes, your `config.toml` is in place and the permi
 | `warn_minutes` | integer | 5 | Show countdown when within N minutes of event start |
 | `include_all_day` | boolean | false | Include all-day events in the display |
 | `auto_busy` | boolean | false | Automatically mark device BUSY during event time |
-| `calendars` | array of strings | (all) | Comma-separated list of calendar names to monitor (omit to read all) |
+| `calendars` | array of strings | (all) | List of calendar names to monitor. Discover available names with `uv run python -m calendar_countdown.main --list-calendars` |
 
 ## Autostart
 

@@ -54,6 +54,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="BUSY Bar calendar countdown")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--list-calendars", action="store_true",
+                        help="print available calendar names and exit")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -62,6 +64,12 @@ def main() -> int:
         log.error("Calendar access denied. Grant access in System Settings > "
                   "Privacy & Security > Calendars, then rerun.")
         return 1
+
+    if args.list_calendars:
+        for title, account in eventkit.list_calendars():
+            print(f"{account}: {title}")
+        print("Add the titles you want to [calendar_countdown] calendars in config.toml")
+        return 0
 
     cfg = load_config()
     client = BusyBarClient(host=cfg["device"]["host"])

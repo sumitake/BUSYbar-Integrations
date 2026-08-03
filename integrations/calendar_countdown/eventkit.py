@@ -49,3 +49,10 @@ def fetch_events(lookahead_hours: int, calendar_names: list[str]) -> list[CalEve
             all_day=bool(e.isAllDay()),
         ))
     return out
+
+
+def list_calendars() -> list[tuple[str, str]]:
+    """(calendar title, account/source title) pairs, sorted by account then title."""
+    calendars = _store.calendarsForEntityType_(EKEntityTypeEvent)
+    pairs = [(str(c.title()), str(c.source().title())) for c in calendars]
+    return sorted(pairs, key=lambda p: (p[1], p[0]))
