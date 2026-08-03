@@ -12,7 +12,7 @@ class DrawResult(Enum):
     DRAWN = "drawn"
     REJECTED = "rejected"        # 409: higher-priority app on screen — expected
     UNREACHABLE = "unreachable"  # device off / USB unplugged — caller backs off
-    ERROR = "error"              # 5xx or other HTTP error — caller should retry/backoff
+    ERROR = "error"              # non-200/409 from a live device — no backoff; retried next poll
 
 
 class BusyBarClient:

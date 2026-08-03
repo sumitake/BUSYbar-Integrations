@@ -6,10 +6,9 @@ This integration monitors GitHub Actions workflows across your repositories and 
 
 ## Requirements
 
-- **macOS 10.14+**
-- **GitHub CLI installed** and authenticated via `gh auth login` (the integration reuses your existing auth token, stored securely by GitHub CLI; no separate token configuration required)
+- **Python 3.12+**, `uv` package manager, and **GitHub CLI** installed and authenticated via `gh auth login` (platform-independent; runs on any OS; the integration reuses your existing auth token, stored securely by GitHub CLI)
+- **Optional: macOS for autostart.** The LaunchAgent autostart packaging is macOS-specific; manual runs of the integration work on any OS with Python 3.12 + gh CLI
 - **Device reachable** on your LAN (default `10.0.4.20` over USB-Ethernet; configurable for Wi-Fi)
-- **Python 3.12+** and `uv` package manager
 - **GitHub repositories** with GitHub-hosted and/or self-hosted runners (both are fully supported)
 
 ## Design: REST-only, Quota-Efficient

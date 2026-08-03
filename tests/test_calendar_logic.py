@@ -37,8 +37,9 @@ def test_ascii_safe():
     assert ascii_safe("日本語") == "event"
 
 def test_format_countdown_minutes_and_hours():
-    assert format_countdown(ev(23), NOW) == "14:00 Standup in 23m"
-    assert format_countdown(ev(65), NOW) == "14:42 Standup in 1h05m"
+    e23, e65 = ev(23), ev(65)
+    assert format_countdown(e23, NOW) == f"{e23.start.astimezone():%H:%M} Standup in 23m"
+    assert format_countdown(e65, NOW) == f"{e65.start.astimezone():%H:%M} Standup in 1h05m"
 
 def test_build_elements_shape():
     els = build_elements("hello", warning=False, timeout_s=90)

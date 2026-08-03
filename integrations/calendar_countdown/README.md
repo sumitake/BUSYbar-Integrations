@@ -8,7 +8,7 @@ The integration looks ahead 12 hours by default, surfaces events within a config
 
 ## Requirements
 
-- **macOS 10.14+** with Calendar app enabled
+- **macOS 14+ (Sonoma)** with Calendar app enabled
 - **Calendar permission granted** in System Settings > Privacy & Security > Calendars (must be answered once in a foreground terminal run before automating)
 - **Device reachable** on your LAN (default `10.0.4.20` over USB-Ethernet; configurable for Wi-Fi)
 - **Python 3.12+** and `uv` package manager
