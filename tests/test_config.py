@@ -20,3 +20,14 @@ def test_env_overrides_file(tmp_path, monkeypatch):
     p.write_text('[device]\nhost = "192.0.2.7"\n')
     monkeypatch.setenv("BUSYBAR_HOST", "192.0.2.99")
     assert load_config(p)["device"]["host"] == "192.0.2.99"
+
+def test_returned_config_mutation_does_not_corrupt_defaults(tmp_path):
+    # Mutate the returned config in place
+    cfg1 = load_config(tmp_path / "missing.toml")
+    cfg1["ci_status"]["repos"].append("mutated/repo")
+    cfg1["calendar_countdown"]["poll_seconds"] = 999
+
+    # Load a fresh config and verify it is unaffected
+    cfg2 = load_config(tmp_path / "missing.toml")
+    assert cfg2["ci_status"]["repos"] == []
+    assert cfg2["calendar_countdown"]["poll_seconds"] == 60

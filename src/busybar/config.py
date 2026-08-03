@@ -1,3 +1,4 @@
+import copy
 import os
 import tomllib
 from pathlib import Path
@@ -39,7 +40,7 @@ def find_config() -> Path | None:
 def load_config(path: Path | None = None) -> dict:
     if path is None:
         path = find_config()
-    cfg = DEFAULTS
+    cfg = copy.deepcopy(DEFAULTS)
     if path is not None and Path(path).exists():
         with open(path, "rb") as fh:
             cfg = _merge(cfg, tomllib.load(fh))
