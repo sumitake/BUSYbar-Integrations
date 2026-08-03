@@ -17,6 +17,8 @@
   <dict>
     <key>PYTHONPATH</key>
     <string>__REPO__/src</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
