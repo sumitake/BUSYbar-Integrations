@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from EventKit import (EKEventStore, EKEntityTypeEvent,
                       EKAuthorizationStatusFullAccess)
+from Foundation import NSDate
 
 from .logic import CalEvent
 
@@ -34,8 +35,10 @@ def fetch_events(lookahead_hours: int, calendar_names: list[str]) -> list[CalEve
     calendars = _store.calendarsForEntityType_(EKEntityTypeEvent)
     if calendar_names:
         calendars = [c for c in calendars if c.title() in calendar_names]
+    start_ns = NSDate.dateWithTimeIntervalSince1970_(now.timestamp())
+    end_ns = NSDate.dateWithTimeIntervalSince1970_((now + timedelta(hours=lookahead_hours)).timestamp())
     predicate = _store.predicateForEventsWithStartDate_endDate_calendars_(
-        now, now + timedelta(hours=lookahead_hours), calendars)
+        start_ns, end_ns, calendars)
     events = _store.eventsMatchingPredicate_(predicate) or []
     out = []
     for e in events:
