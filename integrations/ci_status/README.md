@@ -9,14 +9,14 @@ This integration monitors GitHub Actions workflows across your repositories and 
 - **macOS 10.14+**
 - **GitHub CLI installed** and authenticated via `gh auth login` (the integration reuses your existing auth token, stored securely by GitHub CLI; no separate token configuration required)
 - **Device reachable** on your LAN (default `10.0.4.20` over USB-Ethernet; configurable for Wi-Fi)
-- **Python 3.9+** and `uv` package manager
+- **Python 3.12+** and `uv` package manager
 - **GitHub repositories** with GitHub-hosted and/or self-hosted runners (both are fully supported)
 
 ## Design: REST-only, Quota-Efficient
 
 The integration uses the **GitHub REST API only** (no GraphQL) to maintain strict quota isolation between CI status and other GitHub API consumers. This design choice ensures that CI monitoring never interferes with other API quota pools.
 
-**Steady-state quota overhead is near zero.** The integration leverages **ETag/304 conditional requests**: when no workflow state has changed since the last poll, GitHub returns a cached `304 Not Modified` response, which does not consume API quota. Typical polling at 2-minute intervals consumes **one API call every 30–60 minutes** during steady state (green workflows), scaling up only when failures occur or state changes.
+**Steady-state quota overhead is near zero.** The integration leverages **ETag/304 conditional requests**: an HTTP request is sent at each poll interval (e.g., every 120 seconds), but when no workflow state has changed, GitHub returns a cached `304 Not Modified` response, which does not consume REST API quota. Therefore, quota is spent only when CI state actually changes (workflows complete, fail, or queue transitions occur), not on every polling cycle.
 
 ## Setup
 
@@ -86,9 +86,10 @@ For example:
 
 ### Install LaunchAgent
 
-Run this command to install the CI integration as a background service that starts at login:
+From the repository root, run these commands to install the CI integration as a background service that starts at login:
 
 ```bash
+cd integrations/ci_status
 sed -e "s|__REPO__|$(git rev-parse --show-toplevel)|" -e "s|__UV__|$(command -v uv)|" \
   com.busybar.ci-status.plist > ~/Library/LaunchAgents/com.busybar.ci-status.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.busybar.ci-status.plist

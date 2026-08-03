@@ -9,9 +9,9 @@ The integration looks ahead 12 hours by default, surfaces events within a config
 ## Requirements
 
 - **macOS 10.14+** with Calendar app enabled
-- **Calendar permission granted** to Claude Code (must be answered once in a foreground terminal run before automating)
+- **Calendar permission granted** in System Settings > Privacy & Security > Calendars (must be answered once in a foreground terminal run before automating)
 - **Device reachable** on your LAN (default `10.0.4.20` over USB-Ethernet; configurable for Wi-Fi)
-- **Python 3.9+** and `uv` package manager
+- **Python 3.12+** and `uv` package manager
 
 ## Setup
 
@@ -65,9 +65,10 @@ Once the foreground test completes, your `config.toml` is in place and the permi
 
 ### Install LaunchAgent
 
-Run this command to install the calendar integration as a background service that starts at login:
+From the repository root, run these commands to install the calendar integration as a background service that starts at login:
 
 ```bash
+cd integrations/calendar_countdown
 sed -e "s|__REPO__|$(git rev-parse --show-toplevel)|" -e "s|__UV__|$(command -v uv)|" \
   com.busybar.calendar-countdown.plist > ~/Library/LaunchAgents/com.busybar.calendar-countdown.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.busybar.calendar-countdown.plist
