@@ -49,4 +49,8 @@ class RestPoller:
             return None
         if "ETag" in resp.headers:
             self._etags[repo] = resp.headers["ETag"]
-        return resp.json().get("workflow_runs", [])
+        try:
+            return resp.json().get("workflow_runs", [])
+        except ValueError as exc:
+            log.warning("github returned non-JSON: %s", exc)
+            return None
