@@ -12,6 +12,7 @@ class DrawResult(Enum):
     DRAWN = "drawn"
     REJECTED = "rejected"        # 409: higher-priority app on screen — expected
     UNREACHABLE = "unreachable"  # device off / USB unplugged — caller backs off
+    ERROR = "error"              # 5xx or other HTTP error — caller should retry/backoff
 
 
 class BusyBarClient:
@@ -40,7 +41,7 @@ class BusyBarClient:
         if resp.status_code == 200:
             return DrawResult.DRAWN
         log.warning("draw failed: HTTP %s %s", resp.status_code, resp.text[:200])
-        return DrawResult.UNREACHABLE
+        return DrawResult.ERROR
 
     def clear(self, application_name: str) -> bool:
         resp = self._request("DELETE", "/api/display/draw",

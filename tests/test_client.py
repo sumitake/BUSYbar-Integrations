@@ -9,6 +9,7 @@ def _response(status_code: int, payload: dict | None = None) -> Mock:
     resp = Mock()
     resp.status_code = status_code
     resp.json.return_value = payload or {}
+    resp.text = "error text"
     return resp
 
 
@@ -60,3 +61,23 @@ def test_set_busy_simple_payload(mock_request):
         "time_left_ms": 90_000,
         "is_paused": False,
     }
+
+
+@patch("busybar.client.requests.request")
+def test_draw_500_is_error_not_unreachable(mock_request):
+    mock_request.return_value = _response(500)
+    assert BusyBarClient().draw("app", ELEMENTS) == DrawResult.ERROR
+
+
+@patch("busybar.client.requests.request")
+def test_get_busy_success(mock_request):
+    payload = {"type": "SIMPLE", "time_left_ms": 12_000}
+    mock_request.return_value = _response(200, payload)
+    assert BusyBarClient().get_busy() == payload
+
+
+@patch("busybar.client.requests.request")
+def test_status_success(mock_request):
+    payload = {"version": "1.0.0", "uptime_ms": 300_000}
+    mock_request.return_value = _response(200, payload)
+    assert BusyBarClient().status() == payload
