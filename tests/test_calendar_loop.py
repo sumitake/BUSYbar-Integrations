@@ -5,8 +5,9 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 from calendar_countdown.logic import CalEvent, _format_countdown
-from calendar_countdown.main import run_once
+from calendar_countdown.main import run_once, should_log_info
 from busybar.client import DrawResult
+from busybar.display import PRIORITY_AMBIENT
 
 TZ = timezone.utc
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=TZ)
@@ -29,7 +30,7 @@ def test_draws_countdown_for_upcoming_event():
     summary = run_once(client, lambda hours: [event], CFG, NOW, dry_run=False)
     client.draw.assert_called_once()
     kwargs = client.draw.call_args.kwargs
-    assert kwargs["priority"] == 20
+    assert kwargs["priority"] == PRIORITY_AMBIENT == 20
     by_id = {el["id"]: el for el in kwargs["elements"]}
     # v1.4 "airy": no card elements.
     assert set(by_id) == {"bg", "title", "track", "track_fill", "time", "divider", "cd_text"}
@@ -177,3 +178,26 @@ def test_state_reset_after_no_event_clear():
     run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
     # No stale elements remain after the "no event" clear -- no extra clear needed.
     client.clear.assert_not_called()
+
+
+# --- log-noise control (v1.5: 10s default poll cadence) ------------------------
+#
+# At the ambient tier's shortened default poll interval (60s -> 10s), the
+# old "log every summary at INFO" behavior would sixfold calendar.log's
+# line rate for no new information on most polls (the summary is usually
+# unchanged poll to poll). should_log_info decides INFO vs DEBUG.
+
+def test_should_log_info_true_on_first_poll_no_prior_summary():
+    assert should_log_info("drew X -> drawn", None, seconds_since_heartbeat=0) is True
+
+def test_should_log_info_true_when_summary_changes():
+    assert should_log_info("drew Y -> drawn", "drew X -> drawn", seconds_since_heartbeat=0) is True
+
+def test_should_log_info_false_when_summary_unchanged_and_no_heartbeat_due():
+    assert should_log_info("drew X -> drawn", "drew X -> drawn", seconds_since_heartbeat=1) is False
+
+def test_should_log_info_true_on_heartbeat_even_if_unchanged():
+    assert should_log_info("drew X -> drawn", "drew X -> drawn",
+                           seconds_since_heartbeat=600, heartbeat_seconds=600) is True
+    assert should_log_info("drew X -> drawn", "drew X -> drawn",
+                           seconds_since_heartbeat=599, heartbeat_seconds=600) is False

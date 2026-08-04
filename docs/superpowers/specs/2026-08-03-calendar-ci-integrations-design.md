@@ -552,3 +552,355 @@ divider has at least one blank column on each side (checked directly:
 neither the neighboring text's ink nor the divider's own ink reaches the
 immediately adjacent column). See the implementation report for the
 verbatim check output and captures.
+
+## 2026-08-03 — v1.5 running-CI badge
+
+**Status:** Implemented (branch `dev/claude/ci-running-v1.5`); revised
+in-branch (operator decision) to generalize the priority/dwell mechanics
+into a shared framework, tune the alternation rhythm, and add a
+GitHub-API-quota overlay -- see "Framework generalization, tuned
+alternation, and quota frames" below, added after the original probe
+findings and feature description but describing the code's final state.
+
+New feature: `ci_status` shows an actively-running CI job on the bar,
+alternating with the calendar. The design brief assumed a "clean
+alternation, zero coordination" mechanism based on the OpenAPI doc's
+priority-arbitration description. **Two empirical probes done before any
+implementation found the doc's description doesn't match firmware 1.1.1's
+actual behavior**, which reshaped the whole approach -- see below before
+the feature description, since it changes what "alternating" actually
+means here.
+
+### Probe findings (read this first -- the design depends on it)
+
+**Finding 1: equal priority from a different `application_name` is
+REJECTED, not an override.** The OpenAPI doc states: *"A draw request is
+accepted when its priority is >= the priority of the currently running
+system app. Equal-priority requests from a different application_name
+override whatever is on screen."* Probed directly: with the live
+`calendar_countdown` agent showing at priority 20, a draw from a different
+`application_name` at priority 20 returned `409 {"error":"Not drawn due to
+low priority"}` in every trial (19, 20 both rejected); only priority 21
+(strictly greater) succeeded. **Consequence: the running badge cannot use
+priority 20 as the brief specified -- it must use priority 21
+(`RUNNING_PRIORITY` in `ci_status/logic.py`), a deliberate, evidence-backed
+deviation from the literal brief.**
+
+**Finding 2: occluded elements are EVICTED, not restored.** Probed with
+two test apps (`probe_a` at priority 21, long timeout; `probe_b` at
+priority 22, occluding it) across two scenarios -- (a) `probe_b`'s own
+timeout expiring, (b) `probe_b` being explicitly cleared. In **both**
+cases, `probe_a`'s still-live element (well within its own 30s timeout)
+did **not** reappear; the panel went black instead, and stayed black until
+a fresh draw from any app. A follow-up probe confirmed the "currently
+running app" baseline resets low enough after eviction that a plain
+priority-20 draw from a third app then succeeds again. **Consequence: the
+brief's "if occluded elements restore: clean alternation, zero
+coordination" branch does not apply. This forces the "if evicted" fallback
+design:** the badge occupies the screen for its own timeout, then the
+panel goes blank until *some* app performs a fresh draw -- either the
+badge's own next cycle, or the calendar's independent 60s redraw landing
+in the gap by chance (no cross-process coordination exists, and none was
+added).
+
+**Observed rhythm (on-device, ~130s window against the live
+`calendar_countdown` agent, badge at priority 21/10s timeout/20s cadence,
+sampled every 2s):**
+
+```
+sample counts: {'BADGE': 33, 'BLANK': 31}
+```
+
+The rhythm is **exactly** badge-visible-~10s / blank-~10s, repeating every
+~20s cycle -- and the live calendar agent did **not** reclaim the screen
+even once across six ~10s gaps spanning more than two of its own 60s
+redraw cycles. This is a materially different experience than "badge
+alternates with calendar": in practice, while a run is active, the panel
+shows the badge roughly half the time and is **dark** the other half; the
+calendar effectively does not get airtime back until the CI run finishes
+(cadence reverts to `poll_seconds`) or the calendar's redraw happens to
+land in a gap by chance, which was not observed in this test window. This
+is exactly the kind of deviation the brief asked to be reported
+prominently rather than silently redesigned around -- implemented as
+specified (fixed ~10s badge timeout, `running_poll_seconds` cadence), not
+adjusted to hide the gap, so the operator can judge whether the parameters
+need tuning.
+
+### Feature: running-CI badge (`integrations/ci_status/`)
+
+Per configured repo, `GET .../actions/runs?status=in_progress&per_page=5`
+(separate ETag slot from the existing failure/stuck poll -- different URL,
+`RestPoller._running_etags` not `._etags`). Across all repos, the
+most-recently-started `in_progress` run is selected (`select_running_run`);
+if others are also running, a `+N` suffix is added to the title.
+
+**Title ribbon** (`small` font, `y=-2`, uppercase, scrolls if it doesn't
+fit): `REPO #PR WORKFLOW` (PR number from `run.pull_requests[0].number`;
+fork/push runs with an empty `pull_requests` array fall back to
+`head_branch`), with a `+N` suffix when other runs are active.
+
+**Numeral row** (`large` font, `y=5`): ETA remaining, reusing
+`calendar_countdown.logic._format_countdown` verbatim (imported across
+integrations, along with `ascii_safe`, `_title_fits`,
+`SCROLL_RATE`/`SCROLL_DELAY_MS`, `PANEL_WIDTH`/`PANEL_HEIGHT` -- see the
+comment at the top of `ci_status/logic.py` for why these specific helpers
+are shared while the layout geometry/palette constants are independently
+declared per integration).
+
+- ETA = median duration of the last 5 successful runs of the *same*
+  workflow (`.../workflows/{workflow_id}/runs?status=success&per_page=5`,
+  duration = `updated_at - run_started_at`, cached per `workflow_id` for
+  the process's lifetime in `RestPoller._eta_cache` -- a successful fetch
+  is cached even if the history is confirmed empty; a network/HTTP error is
+  **not** cached, so the next encounter retries rather than permanently
+  locking the workflow into "no history") minus elapsed (`now -
+  run_started_at`), floored at 0.
+- History exists: `"~" + _format_countdown(eta)` (e.g. `"~4m"`,
+  `"~1h05m"`), or `"soon"` once the estimate floors to under a minute
+  (covers both "past the median" and "a few seconds under a minute left" --
+  neither reads sensibly as `"~0m"`).
+- No history: `_format_countdown(elapsed) + " in"` (e.g. `"3m in"`).
+
+**Track row**: repurposed from the calendar's drain metaphor to a
+fill-*up* progress bar: `elapsed / median`, clamped to `[1, PANEL_WIDTH]`,
+full width when the median is unknown (same defensive shape as
+`_track_fill_width`/`_progress_width`). Solid cyan fill (`RUNNING_TRACK_FILL_COLOR`,
+`#29B6F6FF`) -- no gradient, per the brief.
+
+### Palette and geometry
+
+A distinct cyan/blue theme, following the same luminance-contrast
+principle established in v1.4 (near-black gradient background + bright
+saturated text; no mid-luminance "dim-mud" fills):
+
+| Element | Color | Notes |
+|---|---|---|
+| `bg` | `#031A2EFF` → `#00060DFF` gradient | deep blue night, distinct hue from every calendar state |
+| `title` | `#7FDBFFFF` | bright sky-cyan |
+| `track` (groove) | `#0F2A42FF` | decorative, not text-bearing -- same treatment as the calendar's `TRACK_COLOR` |
+| `track_fill` | `#29B6F6FF` | solid, saturated cyan (spec: "solid cyan") |
+| `eta` (numeral) | `#66E1FFFF` | bright cyan, distinguishable from the title for a small hierarchy |
+
+Geometry follows the v1.4 "airy" row template (title ribbon / blank buffer
+row 5 / full-width horizon-line track at row 6 / numeral row) but is
+independently declared in `ci_status/logic.py` (`RUNNING_TITLE_X`,
+`RUNNING_TRACK_Y`, etc.) rather than importing the calendar's geometry
+constants -- only the *algorithms* are shared across integrations, not the
+layout objects, since the two badges are visually similar but structurally
+distinct (no divider, no card, a single numeral).
+
+### Cadence and precedence
+
+`ci_status` shortens its poll interval to `running_poll_seconds` (new
+config key, default 20) while any configured repo has an `in_progress`
+run, reverting to `poll_seconds` when idle (`main.next_poll_seconds`, a
+pure function of the post-poll `running_cache` so it's unit-testable
+without mocking `time.sleep`). The running badge's own element `timeout`
+is a fixed `RUNNING_BADGE_TIMEOUT_S = 10` regardless of
+`running_poll_seconds`'s configured value -- per the brief ("timeout
+~10s"), not derived from the cadence. A much larger or smaller
+`running_poll_seconds` than the default would change the observed ratio of
+badge-visible to dark time; this is a real configuration interaction, not
+a bug, and is called out in the README.
+
+Precedence in `build_ci_payload`: **failure (60) > stuck (60) > running
+(21) > quiet green (60) > nothing**. Failure and stuck are evaluated first
+specifically so an active alert always wins over "just" a running-job
+status update, even if both conditions are true in the same poll.
+
+### Config additions (`src/busybar/config.py`, `config.example.toml`)
+
+Added to `[ci_status]`: `show_running = true`, `running_poll_seconds = 20`.
+
+### Verification
+
+On-device: the two probes above; captured frames of all four badge content
+variants (PR number, branch fallback, `"soon"`, `"3m in"`) passing the
+same ink-overlap + buffer gate used for the v1.4 calendar work (title ⊆
+rows 0-4, `eta` ⊆ rows 7-15, row 5 has no foreground ink, columns 0-1 have
+no text ink); the ~130s alternation-rhythm observation above. See the
+implementation report for verbatim check output, the probe transcripts,
+and captures.
+
+### Framework generalization, tuned alternation, and quota frames
+
+Operator decision after reviewing the probe findings above: (1) generalize
+the priority/dwell mechanics discovered here into a reusable framework in
+the shared package, so future integrations adopt the same pattern instead
+of re-deriving it; (2) tune the alternation rhythm toward "near-true"
+rather than shipping the ~50%-dark finding as-is; (3) add a rotating
+GitHub-API-quota overlay (GraphQL + REST buckets) that joins the running
+badge in the same dwell/gap rotation while a run is active. All three
+landed together on this branch; this subsection documents the final
+design, generalizing the language above (`RUNNING_PRIORITY`, the
+running-badge-specific rhythm numbers) into the shared vocabulary below.
+
+#### Display tier framework (`src/busybar/display.py`)
+
+The two probe findings above are not specific to the running-CI badge --
+any integration that wants to time-share the screen with another
+integration runs into the same firmware behavior. Rather than let each
+integration re-derive its own priority number and dwell logic, the ladder
+and the shared contracts now live in `src/busybar/display.py`:
+
+| Tier | Constant | Priority | Contract |
+|---|---|---|---|
+| Ambient | `PRIORITY_AMBIENT` | 20 | Persistent baseline apps (e.g. the calendar). Redraw at least every `AMBIENT_REDRAW_SECONDS` (10s); element `timeout` = `ambient_timeout(poll_seconds)` (1.5x poll, floored). Must tolerate eviction -- the contract does not promise the screen back, only that redrawing often enough gives it a fair chance to reclaim gaps. |
+| Overlay | `PRIORITY_OVERLAY` | 21 | Short-dwell, time-shared frames (e.g. the running badge, quota frames). Draw with `timeout` = `OVERLAY_DWELL_SECONDS` (10s), then stay silent for >= one more dwell period before redrawing (`overlay_gap_elapsed(last_dwell_end, now) >= OVERLAY_DWELL_SECONDS`) -- this is what lets the ambient tier's own redraws land in the gap instead of the overlay tier hogging every cycle. |
+| Alert | `PRIORITY_ALERT` | 60 | Urgent, preempting states (CI failure/stuck, calendar BUSY-adjacent alerts). Always strictly above the overlay tier so it preempts unconditionally. |
+| Session | `PRIORITY_SESSION` | 90 | Reference only -- the firmware's own BUSY/CUSTOM tier, not something an integration draws at directly. |
+
+Every tier boundary is a **strictly greater** priority than the one below
+it, never equal -- Finding 1 above (equal priority from a different
+`application_name` is rejected, not an override) makes "greater-or-equal"
+adjacency actively wrong, not just imprecise. `test_display.py` asserts
+the ladder is strictly increasing and has no duplicate values, specifically
+to catch a future addition that violates this.
+
+`ambient_timeout(poll_seconds)` and `overlay_gap_elapsed(last_dwell_end,
+now)` are the only two helpers factored out; nothing more was built --
+both consumers (`calendar_countdown`, `ci_status`) needed exactly this
+much and no more.
+
+**Join recipe for a future integration:**
+- Persistent/background display, no urgency: draw at `PRIORITY_AMBIENT`,
+  poll at whatever cadence keeps `ambient_timeout(poll)` reasonable, redraw
+  at least every `AMBIENT_REDRAW_SECONDS` if you want a fair shot at
+  reclaiming gaps left by any overlay-tier apps sharing the device.
+- Short-lived, time-shared status that should rotate with other overlay
+  content: draw at `PRIORITY_OVERLAY` with `timeout=OVERLAY_DWELL_SECONDS`,
+  and gate your own redraw on `overlay_gap_elapsed(...) >=
+  OVERLAY_DWELL_SECONDS` so you don't starve the ambient tier or other
+  overlay-tier frames sharing the rotation.
+- Urgent/preempting: draw at `PRIORITY_ALERT`, and make sure your
+  precedence logic checks alert conditions before overlay/ambient ones (see
+  `build_ci_payload`'s failure > stuck > overlay > quiet green > nothing
+  ordering for the reference implementation).
+
+#### Tuned alternation: calendar ambient cadence
+
+`calendar_countdown`'s default `poll_seconds` moved from 60 to 15 and then
+to **10**, on-device re-measured at each step (~130s window, 2s sampling,
+against the live agent, classifying each sample as the overlay's own
+BADGE ink, BLANK, or OTHER -- a genuine non-badge, non-black pixel matched
+by exact hex against the calendar's own palette, e.g. `#160A2E` /
+`#FFD166`):
+
+| `poll_seconds` | Dwell cycles recovered (of 6) | Sample counts (BADGE / BLANK / OTHER) |
+|---|---|---|
+| 60 (pre-v1.5 baseline) | 0 | 33 / 31 / 0 |
+| 15 | 2 | 34 / 26 / 5 |
+| 10 (shipped default) | 4 | 35 / 20 / 10 |
+
+10s was chosen because it exactly matches `OVERLAY_DWELL_SECONDS`, giving
+the ambient tier's redraw the best mathematical chance of landing inside a
+gap without the two independent timers needing any actual coordination.
+This is "near-true alternation," not perfect alternation -- 2 of 6 sampled
+cycles at 10s still showed no recovery at all, and recovery within a
+recovered cycle happened anywhere from ~2s to ~8s into the 10s gap,
+because the timers remain uncoordinated by design (no IPC was added; that
+was explicitly out of scope). A confirmatory run exercising the full
+3-frame overlay rotation (below) independently found the calendar
+reclaiming 3 of 4 sampled gap windows at the same 10s/10s setting,
+consistent with the standalone measurement.
+
+#### Quota frames (`show_quota`)
+
+Two additional overlay-tier frames join the running badge's rotation
+while a run is active, cycling `ci_badge -> quota_gql -> quota_rest ->
+repeat` (`overlay_frame_sequence`, `OVERLAY_FRAME_*` constants in
+`ci_status/logic.py`) -- the running badge always leads, and is the only
+frame at all when `show_quota` is off.
+
+**Data source:** `GET https://api.github.com/rate_limit`
+(`RestPoller.fetch_rate_limit`), fetched once per `running_poll_seconds`
+cycle while a run is active. This endpoint is documented as **exempt from
+GitHub's own rate limiting**, so polling it every cycle costs nothing
+against any quota pool -- it exists specifically so clients can check
+their standing without spending it. No ETag caching is attempted (unlike
+`fetch_median_eta`'s process-lifetime cache) since the values change
+continuously and the endpoint is free regardless. `parse_rate_limit`
+extracts the `core` (REST) and `graphql` buckets; a response with only one
+usable bucket still yields that one rather than discarding both, and a
+completely unusable response yields `None`. main.py layers a **5-minute
+staleness window** (`QUOTA_STALE_SECONDS`) on top of the raw fetch: a
+single failed fetch doesn't blank the frame immediately, but sustained
+failures eventually do (`build_overlay_payload` returns `None` for a
+frame whose data isn't available, and the caller must skip that dwell
+slot entirely -- no draw, no clear, no stale numbers).
+
+**Frame layout** (v1.4 row template, numeral-floor rule -- every numeral
+is `large` font, floored not rounded): title ribbon (`small`, uppercase)
+reads `GITHUB GRAPHQL` or `GITHUB REST` -- these were originally
+abbreviated `GH GRAPHQL`/`GH REST`, but the operator amended them to the
+unabbreviated form; `GITHUB GRAPHQL` exceeds the 68px title ribbon width
+at the `small` font and scrolls per the existing title-scroll rule
+(`_title_fits`), same as any other overlay title that doesn't fit --
+`GITHUB REST` is short enough to sit static. Track row: fraction of the
+bucket used, `width = round(PANEL_WIDTH * used / limit)` clamped to `[1,
+PANEL_WIDTH]` (the same defensive clamp shape as every other track-fill
+calculation in this codebase; verified against a real GitHub account
+where the GraphQL bucket's reported `used` exceeded `limit` -- an observed
+live-data quirk in GitHub's point-based GraphQL cost accounting, not a
+parsing bug -- and the clamp correctly rendered a full track rather than
+overflowing or crashing). Numeral row: percentage *remaining* on the left
+(`pct`, e.g. `"18%"`) and reset-in on the right (`reset`, reusing
+`_format_countdown`, e.g. `"42m"`), sharing the row the way no other
+overlay frame currently does (the running badge has only one numeral).
+
+**Headroom theming** (background gradient, track-fill, title, and numeral
+color all keyed off the same computed `remaining_pct`):
+
+| Headroom | Remaining | `bg` gradient | `title` | `track_fill` | numerals |
+|---|---|---|---|---|---|
+| High | > 50% | `#031F17` → `#000A08` | `#6FFFCF` | `#33FFC1` | `#7CFFE0` |
+| Medium | 20-50% (inclusive both ends) | `#231400` → `#0A0400` | `#FFCB6B` | `#FFB300` | `#FFD98C` |
+| Low | < 20% | `#2E0509` → `#0A0101` | `#FF6B7A` | `#FF3B4E` | `#FF8A96` |
+
+The 50% boundary belongs to "medium" and the 20% boundary also belongs to
+"medium" -- i.e. "low" requires headroom to have genuinely dropped below
+20%, not merely reached it. All three palettes follow the v1.4
+near-black-gradient + bright-saturated-text contrast principle used
+throughout this codebase.
+
+**Round-robin and shape-change clears.** `OVERLAY_FRAME_SHAPE` maps
+`ci_badge -> "badge"` and both quota frames `-> "quota"`: the badge's
+element id set (`eta`) differs from the quota frames' (`pct`, `reset`),
+so switching from the badge to either quota frame needs an explicit
+`client.clear(APP)` first -- the same upsert-by-id firmware behavior that
+required the v1.3.1 calendar transition-clear fix. `quota_gql` and
+`quota_rest` share an identical id set, so switching between *those* two
+needs no clear. `main.py` tracks the last-drawn shape and clears only on
+an actual shape change, not on every dwell slot.
+
+**On-device verification (real data, no fabrication for the quota
+frames):** both quota frames built via the real `RestPoller.fetch_rate_limit`
+-> `parse_rate_limit` -> `QuotaInfo` -> `build_overlay_payload` pipeline
+(not hand-written payloads), drawn to `preview`, and passed the same
+ink-overlap + buffer gate used for the running badge (title ⊆ rows 0-4,
+`pct`+`reset` ⊆ rows 7-15, row 5 has no foreground ink, columns 0-1 have no
+title ink). Real fetched data at capture time: REST bucket ~97-98%
+remaining (high headroom, teal theme); GraphQL bucket varied across
+captures from fully exhausted (0% remaining, low/red theme) to ~94%
+remaining (high/teal theme) depending on real account activity between
+runs -- both headroom tiers were exercised on live data, not synthesized.
+Every element's `text` field was enumerated and confirmed to contain only
+the bucket label, a percentage, or a countdown string -- no token,
+username, or other account-identifying value ever appears in a quota
+frame, structurally, since neither field is ever populated from anything
+but the numeric `remaining`/`limit`/`reset` values. A separate on-device
+run exercised the full 3-frame rotation end to end against the live
+calendar agent: draw sequence `ci_badge -> quota_gql -> quota_rest ->
+ci_badge`, landing at t=0s, 20.2s, 40.4s, 60.5s (each ~20s apart, matching
+10s dwell + 10s gap per frame), all draws returning `200`; the calendar
+reclaimed 3 of 4 sampled gap windows in that run, consistent with the
+standalone ambient-tuning measurement above.
+
+#### Config additions (final state)
+
+`[ci_status]` gained, cumulative with the original round: `show_running =
+true`, `running_poll_seconds = 20`, and now `show_quota = true`. `show_quota`
+has no effect when `show_running` is false, since the quota frames only
+ever appear as part of the running badge's own rotation. `calendar_countdown`'s
+`poll_seconds` default changed from 60 to 10 (see the tuning table above);
+existing configs that set `poll_seconds` explicitly are unaffected.

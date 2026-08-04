@@ -4,8 +4,11 @@ from busybar.config import load_config
 def test_defaults_when_no_file(tmp_path):
     cfg = load_config(tmp_path / "missing.toml")
     assert cfg["device"]["host"] == "10.0.4.20"
-    assert cfg["calendar_countdown"]["poll_seconds"] == 60
+    assert cfg["calendar_countdown"]["poll_seconds"] == 10  # v1.5 ambient-tier default
     assert cfg["ci_status"]["repos"] == []
+    assert cfg["ci_status"]["show_running"] is True
+    assert cfg["ci_status"]["running_poll_seconds"] == 20
+    assert cfg["ci_status"]["show_quota"] is True
 
 def test_file_overrides_defaults(tmp_path):
     p = tmp_path / "config.toml"
@@ -30,4 +33,4 @@ def test_returned_config_mutation_does_not_corrupt_defaults(tmp_path):
     # Load a fresh config and verify it is unaffected
     cfg2 = load_config(tmp_path / "missing.toml")
     assert cfg2["ci_status"]["repos"] == []
-    assert cfg2["calendar_countdown"]["poll_seconds"] == 60
+    assert cfg2["calendar_countdown"]["poll_seconds"] == 10
