@@ -260,3 +260,96 @@ payload (looked correct) and only showed up rendered.
 
 Added to `[calendar_countdown]`: `notice_minutes = 15`,
 `progress_window_minutes = 60`.
+
+## 2026-08-03 — v1.3 "Color Horizon" display redesign
+
+**Status:** Implemented (branch `dev/claude/display-v1.3`).
+
+Replaces v1.1's "progress accent bar + title row" with a denser, full-panel
+card layout: a gradient background that itself signals urgency, a
+horizontal drain track under the title, and a two-card bottom row (a large
+digital-clock-style start time, or an "ENDS" label, alongside a native
+countdown). Config keys, `logic.build_elements` signature, and
+`main.run_once`'s public contract (dry-run behavior, summary strings ending
+in the `DrawResult` value, priority 20, `timeout = 1.5 * poll_seconds`) are
+all unchanged from v1.1.
+
+### Design provenance
+
+Layout structure (the two-card bottom row, the divider, the horizontal
+drain track replacing the vertical bar) originated from a Codex structural
+pass. Gemini reviewed that structure for contrast and legibility against
+the panel's small bitmap fonts and flagged the need for state-differentiated
+background gradients (rather than a fixed dark background) so urgency reads
+at a glance even before the title or countdown color registers, plus
+brighter title/digit colors per state to hold contrast against each
+gradient. Claude synthesized the final four-state threshold model
+(`normal` / `notice` / `warning` / `in_progress`, reusing the existing
+`notice_minutes` / `warn_minutes` config semantics from v1.1's three-color
+scheme rather than introducing new keys) and the concrete hex palette below.
+
+### Element table (`integrations/calendar_countdown/logic.build_elements`)
+
+Draw order is z-order, first = behind. `time_card`+`time` and `ends` are
+mutually exclusive (upcoming vs. in-progress); every other element is
+always drawn.
+
+| id | type | geometry | notes |
+|---|---|---|---|
+| `bg` | rectangle | x0 y0 72×16 | `fill=gradient_v`, per-state colors, `border_width=0` |
+| `title` | text | x1 y0 w70, font `small` | `ascii_safe` title, per-state color; scrolls (`scroll_rate=2000`, 800ms start/repeat delay) only if it doesn't fit |
+| `track` | rectangle | x0 y5 72×1 | fixed `#24193BFF` groove, solid, `border_width=0` |
+| `track_fill` | rectangle | x0 y5 w×1 | `w = round(72 * minutes_left / progress_window_minutes)` clamped `[1,72]`; `gradient_h` per-state (in-progress: solid `#24D6C5FF`, always full width -- no drain) |
+| `time_card` (upcoming only) | rectangle | x0 y6 34×10 r1 | fixed `#062238FF` solid |
+| `time` (upcoming only) | text | x1 y6, font `extra_large` | fixed `#8DDEFFFF`, local `HH:MM` of event start |
+| `ends` (in-progress only) | text | x3 y8, font `bold` | fixed `#8CFFF4FF`, literal `"ENDS"`, no card behind it |
+| `divider` | rectangle | x34 y6 2×10 | per-state solid, `border_width=0` |
+| `cd_card` | rectangle | x36 y6 36×10 r1 | per-state solid, `border_width=0` |
+| `countdown` | countdown (native) | y6, `align=top_right` x71 | `timestamp` = event start (upcoming) or end (in-progress) as string; `direction=time_left`, `show_hours=when_non_zero`; per-state digit color; right-anchored in `cd_card` via the firmware `align` field (see gotcha below) |
+
+### State palette
+
+| State | Threshold | `bg` gradient | `title` | `track_fill` gradient | `divider` | `cd_card` | `countdown` digits |
+|---|---|---|---|---|---|---|---|
+| `normal` | `minutes_left > notice_minutes` | `#160A2EFF` → `#03040DFF` | `#FFD166FF` | `#1ED6FFFF` → `#5CFFB1FF` | `#643B8FFF` | `#062A22FF` | `#6BFFD0FF` |
+| `notice` | `minutes_left <= notice_minutes` | `#291300FF` → `#070301FF` | `#FFE3A3FF` | `#FF9F1CFF` → `#FFE66DFF` | `#C37A0CFF` | `#3A2000FF` | `#FFC247FF` |
+| `warning` | `minutes_left <= warn_minutes` | `#30040BFF` → `#080103FF` | `#FFE7ECFF` | `#FF204EFF` → `#FF7A22FF` | `#E02A4CFF` | `#3A0711FF` | `#FF4B68FF` |
+| `in_progress` | event currently active (overrides the above) | `#032B2CFF` → `#010809FF` | `#83FFF3FF` | solid `#24D6C5FF`, full width | `#178C88FF` | `#063238FF` | `#64FFEAFF` |
+
+`warning` and `notice` thresholds are inclusive at their boundary
+(`minutes_left <= warn_minutes` wins over `<= notice_minutes` when both are
+true), matching v1.1's `_urgency_color` boundary semantics. `in_progress` is
+orthogonal to the other three -- it overrides threshold evaluation entirely
+rather than being reached through it.
+
+### Firmware findings from on-device verification
+
+- **`align="top_right"` is reliable on firmware 1.1.1.** The countdown
+  element's `align` field (part of the shared `DisplayElement` schema, not
+  documented against `CountdownElement` specifically) right-anchors the
+  element's bounding box at the given `(x, y)`. Verified by drawing both a
+  7-character (`H:MM:SS`) and a 4-character (`M:SS`) countdown with
+  `align="top_right", x=71, y=6`: the rendered right edge stayed at the same
+  column (x≈69) in both captures while the left edge moved, confirming true
+  right-anchoring rather than a fixed left position. Used in place of the
+  spec's fixed-`x=40` fallback; `COUNTDOWN_FALLBACK_X` remains defined in
+  `logic.py` (unused) documenting the approved fallback if a future firmware
+  regresses this.
+- **`RectangleElement`'s default 1px white border** (same v1.1 gotcha)
+  applies to every rectangle in this layout -- `bg`, `track`, `track_fill`,
+  `time_card`, `divider`, and `cd_card` all set `border_width=0` explicitly.
+- **New: the draw endpoint upserts elements by id within an
+  `application_name`; it does not replace that app's whole element set.**
+  Found by drawing the upcoming layout (ids include `time_card`+`time`),
+  then drawing the in-progress layout (ids include `ends` instead) without
+  an explicit clear in between: the previous draw's opaque `time_card` and
+  `time` digits remained rendered, visible behind the new `ends` text, until
+  their own `timeout` expired. `clearDisplay` (`DELETE
+  /api/display/draw?application_name=...`) does fully remove an app's
+  elements -- confirmed by clearing and observing the panel fall through to
+  whatever lower-priority app was already drawing underneath. Fixed in
+  `main.run_once` via an optional `state` dict that remembers the previous
+  `in_progress` value across polls and calls `client.clear(APP)` only at the
+  upcoming ⟷ in-progress transition (not on every poll, which would flicker
+  the display). See `tests/test_calendar_loop.py` state-transition tests and
+  the implementation report for the before/after captures.
