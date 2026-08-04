@@ -13,12 +13,17 @@ from datetime import datetime, timezone
 
 from busybar.client import BusyBarClient, DrawResult
 from busybar.config import load_config
+from busybar.display import PRIORITY_AMBIENT, ambient_timeout
 
 from .logic import (ascii_safe, build_elements, select_active_event,
                     select_next_event)
 
 APP = "calendar_countdown"
-PRIORITY = 20
+# Ambient-tier priority (see busybar.display for the full ladder contract
+# and the two firmware facts it's built on). Was a local PRIORITY=20
+# constant before v1.5's shared display-tier framework.
+PRIORITY = PRIORITY_AMBIENT
+HEARTBEAT_SECONDS = 600
 log = logging.getLogger(APP)
 
 
@@ -40,7 +45,7 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
     every poll.
     """
     c = cfg["calendar_countdown"]
-    timeout_s = int(c["poll_seconds"] * 1.5)
+    timeout_s = ambient_timeout(c["poll_seconds"])
     events = fetch(c["lookahead_hours"])
     active = select_active_event(events, now)
 
@@ -94,6 +99,21 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
     return f"drew {label} -> {result.value}"
 
 
+def should_log_info(summary: str, last_logged_summary: str | None,
+                    seconds_since_heartbeat: float,
+                    heartbeat_seconds: int = HEARTBEAT_SECONDS) -> bool:
+    """Log-noise control for the v1.5 poll-cadence drop (poll_seconds
+    60 -> 15 as the ambient-tier default): at 15s polling, logging every
+    summary at INFO would quadruple the audit log's line rate versus the
+    old 60s cadence for no new information on most polls (the summary is
+    usually identical poll to poll). INFO only when the summary actually
+    changed since the last INFO line, or a heartbeat interval has elapsed
+    (so a long unchanging run still leaves a periodic "yes, I'm alive"
+    trail) -- DEBUG otherwise.
+    """
+    return summary != last_logged_summary or seconds_since_heartbeat >= heartbeat_seconds
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="BUSY Bar calendar countdown")
     parser.add_argument("--once", action="store_true")
@@ -131,9 +151,17 @@ def main() -> int:
 
     backoff = 5
     state: dict = {}
+    last_logged_summary: str | None = None
+    last_heartbeat = time.monotonic()
     while True:
         summary = run_once(client, fetch, cfg, datetime.now(timezone.utc), args.dry_run, state=state)
-        log.info(summary)
+        now_monotonic = time.monotonic()
+        if args.once or should_log_info(summary, last_logged_summary, now_monotonic - last_heartbeat):
+            log.info(summary)
+            last_logged_summary = summary
+            last_heartbeat = now_monotonic
+        else:
+            log.debug(summary)
         if args.once:
             return 0
         if summary.endswith(DrawResult.UNREACHABLE.value):
