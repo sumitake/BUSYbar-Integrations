@@ -50,17 +50,42 @@ def test_status_none_when_unreachable(mock_request):
     assert BusyBarClient().status() is None
 
 
+@patch("busybar.client.time.time")
 @patch("busybar.client.requests.request")
-def test_set_busy_simple_payload(mock_request):
+def test_set_busy_simple_payload(mock_request, mock_time):
+    # Regression test for the confirmed-on-device bug: the device rejects a
+    # flat BusySnapshot body (HTTP 400 "Failed to parse snapshot") even
+    # though that's the shape /openapi.yaml's schema literally describes.
+    # The firmware actually requires the snapshot nested under a
+    # "snapshot" key alongside "snapshot_timestamp_ms" -- mirroring what
+    # get_busy() (GET) returns -- and does NOT want busy_bar_settings on
+    # this write path.
     mock_request.return_value = _response(200)
+    mock_time.return_value = 1_700_000_000.5
     assert BusyBarClient().set_busy_simple(90_000) is True
+    method, url = mock_request.call_args.args
+    assert method == "PUT" and url == "http://10.0.4.20/api/busy/snapshot"
     body = mock_request.call_args.kwargs["json"]
     assert body == {
-        "type": "SIMPLE",
-        "card_id": "00000000-0000-0000-0000-000000000000",
-        "time_left_ms": 90_000,
-        "is_paused": False,
+        "snapshot": {
+            "type": "SIMPLE",
+            "card_id": "00000000-0000-0000-0000-000000000000",
+            "time_left_ms": 90_000,
+            "is_paused": False,
+        },
+        "snapshot_timestamp_ms": 1_700_000_000_500,
     }
+    assert "busy_bar_settings" not in body
+    assert "busy_bar_settings" not in body["snapshot"]
+
+
+@patch("busybar.client.requests.request")
+def test_set_busy_simple_false_on_400(mock_request):
+    # The pre-fix flat body reproduced a live 400 "Failed to parse
+    # snapshot" on every call -- guard against regressing to that shape by
+    # asserting the method's own failure handling is intact.
+    mock_request.return_value = _response(400)
+    assert BusyBarClient().set_busy_simple(90_000) is False
 
 
 @patch("busybar.client.requests.request")
