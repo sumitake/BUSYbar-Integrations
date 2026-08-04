@@ -138,6 +138,13 @@ per dwell slot (`OVERLAY_DWELL_SECONDS`, 10s), before repeating:
    successful-run history yet to estimate from); and a thin progress line
    tracking elapsed time against the workflow's typical duration (median
    of its last 5 successful runs, cached for the life of the process).
+   When there's room, a small muted `remain` (or `left`, if `remain`
+   doesn't fit) is appended right after the ETA — e.g. `~57m remain` or
+   `~1h01m left` — never on `soon` (already imminent) or the no-history
+   `3m in` form (that's elapsed time, not a remaining estimate, so a
+   remaining-time label would be wrong, not just superfluous). Whether it
+   fits at all, and which word if so, is a width-based decision (see
+   `ci_status/logic.py`'s `_eta_label`); nothing to configure.
 2. **GraphQL quota** (`show_quota`): title ribbon `GITHUB GRAPHQL`, a track bar
    showing the fraction of the bucket used, and two numerals — percentage
    *remaining* on the left, reset-in on the right (e.g. `18%` / `42m`).

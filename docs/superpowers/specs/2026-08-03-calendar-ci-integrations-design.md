@@ -1022,3 +1022,102 @@ live GitHub API. Discovered-repo count and public-repo names are in the
 implementation report; private repo names are redacted there (`<private-N>`)
 since reports may be quoted in public PRs, even though the display itself
 has no such redaction (see the caveat above).
+
+## 2026-08-03 — v1.5.1 running-badge ETA label ("remain" / "left")
+
+**Status:** Implemented, same branch (`dev/claude/account-wide-v1.5.1`).
+Additive, orthogonal to the account-wide watching feature above -- both
+landed on this branch but touch unrelated code paths (this one is
+entirely within the running badge's own render function).
+
+Next to the ETA numeral on the running badge, a small muted label is
+appended when it fits: `remain` preferred, `left` as a fallback, omitted
+entirely if neither fits. Grammar guard: applies only to remaining-
+estimate ETA forms (`~4m`, `~1h05m`, `~10h`, ...) -- never `soon` or the
+no-history elapsed form (`3m in`), since a label reads as nonsense or
+outright wrong on either of those. The guard is a single prefix check
+(`eta_text.startswith("~")`), reliable because every remaining-estimate
+form `_format_eta_text` produces is `~`-prefixed by construction and
+neither of the other two forms ever is.
+
+### Fit decision (`_eta_label`, `ci_status/logic.py`)
+
+Reuses `calendar_countdown.logic.GLYPH_ADVANCE_PX`/`_text_width_px` (the
+existing large-font per-glyph width table, extended -- see below) to
+measure `eta_text`'s own rendered width, then checks whether
+`eta_width + RUNNING_LABEL_GAP_PX + width(label)` fits within
+`RUNNING_LABEL_BUDGET_PX` (68px: `PANEL_WIDTH - RUNNING_NUMERAL_X - 2`,
+the same 2px-right-margin convention as `OVERLAY_TITLE_WIDTH`), trying
+`"remain"` first, then `"left"`.
+
+A deliberate, documented modeling choice: the label itself renders in the
+**small** font, not `large`, but its width is estimated through the
+large-font table anyway. On-device calibration: `"remain"` measures 22px
+in its real small font vs. 35px as estimated via the large-font table;
+`"left"` measures 11px vs. 20px. The large-font table always
+overestimates a small-font string's width on this device, so reusing it
+is safe for a fits/doesn't-fit decision (the failure mode is an
+occasionally-omitted label that would have visually fit, never a clipped
+one) -- and it means no second, small-font-specific glyph table was
+needed.
+
+`GLYPH_ADVANCE_PX` gained nine entries for this feature: `~` (the
+remaining-estimate prefix) plus every letter needed to measure `"remain"`
+and `"left"` through the same table (`r`, `a`, `e`, `i`, `n`, `l`, `f`,
+`t`; `m` already existed). Measured on-device via the same successive-
+prefix rightmost-ink-column differencing technique the original digit
+table's comment documents -- self-validated by re-measuring `"0"` through
+this exact technique and reproducing the table's existing value (7px)
+with no adjustment needed.
+
+### Geometry
+
+`RUNNING_LABEL_Y = 9` (small font) puts the label's own ink at rows
+11-15, baseline-aligned with the large ETA numeral's ink (rows 7-15,
+`OVERLAY_NUMERAL_Y = 5`) via the calendar's established "+2px ink-offset"
+model (a small-font element at `y=Y` inks starting at row `Y+2`) --
+confirmed on-device, not just derived. `RUNNING_LABEL_COLOR = "#8FA3B3FF"`,
+a muted gray-blue, deliberately desaturated and dimmer than
+`RUNNING_NUMERAL_COLOR`, extending the same title/numeral brightness
+hierarchy one step further; confirmed legible against
+`RUNNING_BG_GRADIENT` on-device.
+
+### Shape tracking
+
+Adding `eta_label` changes the running badge's own element-id shape
+(`{bg, title, track, track_fill, eta}` -> `{..., eta_label}`) whenever the
+ETA text's width crosses a fit boundary between polls (e.g. counting down
+from `~1h00m`, which only fits `left`, into `~59m`, which fits `remain`,
+or losing the label entirely as the ETA widens). No new code was needed
+in `main.py` for this: the unified shape tracker added in the prior
+revision (a generic `frozenset(e["id"] for e in payload["elements"])`
+comparison, not a hardcoded badge/quota mapping) already detects any
+element-id-set change on any draw to `APP` and clears first -- this is
+exactly the generalization that fix was for.
+
+### Verification
+
+Tests (`tests/test_ci_logic.py`): fit-decision boundaries using real
+`_format_countdown` output at the exact measured widths (`"~59m"` = 29px
+fits `remain`; `"~1h00m"` = 40px only fits `left`; a synthetic
+`"~23h59m"` = 49px, wider than any real `_format_eta_text` output can
+reach today, fits neither -- included specifically to exercise that
+branch defensively), both exclusion forms (`"soon"`, `"3m in"` and a
+longer no-history form), the label element's `x` position tying back to
+the measured eta width, and both running-badge shape variants (with and
+without the label) via `build_overlay_payload`. `test_glyph_advance_table_
+covers_every_countdown_glyph` (`test_calendar_logic.py`) relaxed from
+exact-set equality to a subset check, since the table now carries more
+than `_format_countdown` alone needs.
+
+On-device: both fit outcomes captured through the ink-overlap + buffer
+gate (title rows 0-4, eta rows 7-15, label rows 11-15, no ink in the row-5
+buffer for any of the three text elements, no label ink in columns 0-1 or
+column 71/the right edge -- confirming no clip). Drawn to `preview` at
+priority 25, not the payload's own `PRIORITY_OVERLAY` (21): the live
+`ci_status` LaunchAgent was genuinely active during this session (real
+runs on `agent-collab-workspace`) and draws at priority 21 too, so a
+same-priority `preview` draw was observed being rejected outright (the
+same equal-priority-different-`application_name` firmware behavior the
+v1.5 probes found) until the priority was raised, matching the precedent
+already set by the original v1.5 badge-variant verification script.

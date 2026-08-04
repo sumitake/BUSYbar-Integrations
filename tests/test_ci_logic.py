@@ -11,9 +11,10 @@ from ci_status.logic import (
     _pr_or_branch, select_running_run, compute_median_duration_minutes,
     _format_eta_text, _progress_width, _build_running_title,
     parse_rate_limit, _quota_headroom, _quota_used_width,
-    resolve_repo_list,
+    resolve_repo_list, _eta_label, RUNNING_NUMERAL_X, RUNNING_LABEL_GAP_PX,
 )
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS, PRIORITY_ALERT
+from calendar_countdown.logic import _text_width_px
 
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=timezone.utc)
 
@@ -279,8 +280,13 @@ def test_overlay_ci_badge_shape():
     assert payload["led"] is None
 
     by_id = _by_id(payload["elements"])
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "eta"}
-    assert [e["id"] for e in payload["elements"]] == ["bg", "title", "track", "track_fill", "eta"]
+    # v1.5.1: a fitting remain-estimate ETA ("~11m" here) picks up the
+    # "eta_label" element too -- see test_eta_label_* below for the full
+    # fit-decision and grammar-guard coverage.
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "eta", "eta_label"}
+    assert [e["id"] for e in payload["elements"]] == \
+        ["bg", "title", "track", "track_fill", "eta", "eta_label"]
+    assert by_id["eta_label"]["text"] == "remain"
 
     bg = by_id["bg"]
     assert bg["fill"] == "gradient_v" and bg["border_width"] == 0
@@ -300,6 +306,17 @@ def test_overlay_ci_badge_shape():
     eta = by_id["eta"]
     assert eta["font"] == "large" and eta["y"] == 5   # numeral-floor rule: large font
     assert eta["text"] == _format_eta_text(run_, 14, NOW)
+
+def test_overlay_ci_badge_shape_no_history_has_no_label():
+    # No median history -> "3m in" (elapsed, not a remaining estimate) --
+    # the label's grammar guard excludes this form, so the baseline
+    # 5-element shape (no "eta_label") is what actually draws.
+    run_ = running_run(name="tests", pr_number=42, started_min_ago=3)
+    info = running_info(run=run_, median_minutes=None)
+    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    by_id = _by_id(payload["elements"])
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "eta"}
+    assert by_id["eta"]["text"] == "3m in"
 
 def test_overlay_ci_badge_title_scrolls_when_long():
     run_ = running_run(name="a-very-long-workflow-name-that-will-not-fit", pr_number=12345, started_min_ago=1)
@@ -540,3 +557,55 @@ def test_resolve_repo_list_sorted_deterministic_order():
     account = [_account_repo("z/last"), _account_repo("a/first")]
     result = resolve_repo_list(["m/middle"], [], True, account, 30, NOW)
     assert result == ["a/first", "m/middle", "z/last"]
+
+
+# --- _eta_label: fit decision + grammar guard (v1.5.1 ETA label) -----------------
+
+def test_eta_label_remain_fits_short_eta():
+    # "~59m" measures 29px; remain (35px) + 3px gap = 38 > budget(68) is
+    # false only relative to eta width, i.e. 29+3+35=67 <= 68 -- fits.
+    assert _text_width_px("~59m") == 29
+    assert _eta_label("~59m") == "remain"
+
+def test_eta_label_falls_back_to_left_when_remain_does_not_fit():
+    # "~1h00m" measures 40px -- remain would need 40+3+35=78 > 68 (doesn't
+    # fit), but left needs only 40+3+20=63 <= 68 (fits).
+    assert _text_width_px("~1h00m") == 40
+    assert _eta_label("~1h00m") == "left"
+
+def test_eta_label_omitted_when_neither_fits():
+    # Synthetic, deliberately-wide input -- _format_eta_text/_format_countdown
+    # never actually produce a string this wide in practice (the h+mm full
+    # form is itself capped by CD_TEXT_MAX_WIDTH and falls back to an
+    # hour-only form well before reaching 45px), but _eta_label is a pure
+    # function of its string argument and must degrade safely (omit, not
+    # crash or draw an overflowing label) if it's ever fed one anyway --
+    # this is the defensive "neither fits" boundary the brief asked for.
+    synthetic = "~23h59m"
+    assert _text_width_px(synthetic) == 49   # > 45 (the "only left fits" ceiling)
+    assert _eta_label(synthetic) is None
+
+def test_eta_label_excluded_on_soon():
+    assert _eta_label("soon") is None
+
+def test_eta_label_excluded_on_no_history_elapsed_form():
+    assert _eta_label("3m in") is None
+    assert _eta_label("1h05m in") is None   # longer elapsed form, still excluded
+
+def test_eta_label_x_position_follows_eta_text_width():
+    run_ = running_run(name="tests", pr_number=42, started_min_ago=1)
+    info = running_info(run=run_, median_minutes=60)   # eta = 59m -> "~59m", label fits
+    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    by_id = _by_id(payload["elements"])
+    eta_text = by_id["eta"]["text"]
+    assert by_id["eta_label"]["x"] == RUNNING_NUMERAL_X + _text_width_px(eta_text) + RUNNING_LABEL_GAP_PX
+    assert by_id["eta_label"]["font"] == "small"
+    assert by_id["eta_label"]["y"] == 9
+
+def test_eta_label_falls_back_to_left_end_to_end_through_build_overlay_payload():
+    run_ = running_run(name="tests", pr_number=42, started_min_ago=0)
+    info = running_info(run=run_, median_minutes=60)   # eta = 60m -> "~1h00m"
+    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    by_id = _by_id(payload["elements"])
+    assert by_id["eta"]["text"] == "~1h00m"
+    assert by_id["eta_label"]["text"] == "left"
