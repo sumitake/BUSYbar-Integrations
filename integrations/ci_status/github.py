@@ -189,6 +189,32 @@ class RestPoller:
         falling back to an empty list (an empty list would look
         indistinguishable from "this account genuinely owns zero repos,"
         which would silently stop watching everything).
+
+        The page-1 ETag is committed to `self._account_repos_etag` ONLY
+        after pagination completes in full -- not right after page 1's
+        own response, even though that response is where the ETag value
+        comes from. Committing it earlier would create a silent
+        lock-in bug for >100-repo accounts: if page 2+ then failed, this
+        call would still return the partial `repos` list collected so
+        far (a partial result being better than discarding everything),
+        but the page-1 ETag would already be cached -- so the *next*
+        call sends `If-None-Match` for a page-1 body that genuinely
+        hasn't changed, gets a 304, and this method returns `None`. The
+        caller reads `None` as "nothing changed, keep the cached list" --
+        permanently freezing the account's watch list at that one
+        incomplete pagination run's partial subset, with no future call
+        ever able to recover the rest (every subsequent page-1 request
+        keeps matching the same cached ETag). On an incomplete pagination
+        run, `self._account_repos_etag` is simply left as whatever it
+        was (not overwritten) -- safe, not just "not actively wrong":
+        reaching this branch means page 1's *response this call* was a
+        fresh 200, not a 304, so page 1's content has already been
+        confirmed to differ from whatever the old cached ETag matched;
+        the next call sending that same old ETag will therefore get
+        another fresh 200 (never a wrongful 304), giving pagination
+        another full chance to complete rather than reusing the partial
+        result. See the regression test for the failure mode this
+        guards against.
         """
         url = f"{API}/user/repos"
         headers = self._headers()
@@ -206,8 +232,7 @@ class RestPoller:
         if resp.status_code != 200:
             log.warning("github %s (account repo enumeration)", resp.status_code)
             return None
-        if "ETag" in resp.headers:
-            self._account_repos_etag = resp.headers["ETag"]
+        new_etag = resp.headers.get("ETag")   # not committed yet -- see the docstring above
         try:
             page_items = resp.json()
         except ValueError as exc:
@@ -219,6 +244,7 @@ class RestPoller:
 
         repos = list(page_items)
         page = 2
+        complete = True
         while len(page_items) == 100 and page <= 10:  # cap: 1000 owned repos
             try:
                 resp = requests.get(url, headers=self._headers(),
@@ -227,19 +253,26 @@ class RestPoller:
                                     timeout=(5, 15))
             except requests.RequestException as exc:
                 log.debug("github unreachable (account repo enumeration page %d): %s", page, exc)
+                complete = False
                 break  # a partial result is still better than discarding everything
             if resp.status_code != 200:
                 log.warning("github %s (account repo enumeration page %d)", resp.status_code, page)
+                complete = False
                 break
             try:
                 page_items = resp.json()
             except ValueError as exc:
                 log.warning("github returned non-JSON (account repo enumeration page %d): %s", page, exc)
+                complete = False
                 break
             if not isinstance(page_items, list):
+                complete = False
                 break
             repos.extend(page_items)
             page += 1
+
+        if complete and new_etag is not None:
+            self._account_repos_etag = new_etag
         return repos
 
     def forget_repo(self, repo: str) -> None:

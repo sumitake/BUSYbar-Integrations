@@ -255,6 +255,42 @@ def test_fetch_account_repos_partial_pagination_failure_keeps_earlier_pages(mock
     assert len(result) == 100   # page 1 kept, page 2's failure just stops pagination
 
 @patch("ci_status.github.requests.get")
+def test_fetch_account_repos_etag_not_locked_in_by_partial_pagination_failure(mock_get):
+    # Regression test: page 1 must NOT have its ETag committed until the
+    # WHOLE pagination run succeeds -- otherwise a transient page-2+
+    # failure would "lock in" a truncated list forever (every future
+    # call sends the page-1 ETag, gets a 304 since page 1 itself is
+    # unchanged, and the caller reads that as "nothing changed, keep the
+    # stale partial list" -- with no way to ever recover the rest).
+    page1 = [_repo(f"o/r{i}") for i in range(100)]
+    page2_full = [_repo("o/r100"), _repo("o/r101")]
+
+    # First call: page 1 succeeds (with an ETag), page 2 fails.
+    mock_get.side_effect = [_list_response(200, page1, etag='W/"page1-v1"'), _list_response(500)]
+    poller = RestPoller("tok")
+    first = poller.fetch_account_repos()
+    assert len(first) == 100   # partial result returned, as before
+
+    # Second call: must NOT send If-None-Match for the page-1 ETag from
+    # the incomplete run above -- the ETag was never committed. Both
+    # pages now succeed, and the FULL list (102 repos) must be recovered.
+    mock_get.reset_mock()
+    mock_get.side_effect = [_list_response(200, page1, etag='W/"page1-v1"'), _list_response(200, page2_full)]
+    second = poller.fetch_account_repos()
+    first_call_headers = mock_get.call_args_list[0].kwargs["headers"]
+    assert "If-None-Match" not in first_call_headers
+    assert len(second) == 102   # full list recovered, not stuck at the earlier partial 100
+
+    # Third call, now that a FULL pagination run has succeeded: the ETag
+    # SHOULD be committed this time, and a genuinely-unchanged page 1
+    # correctly short-circuits via 304.
+    mock_get.reset_mock()
+    mock_get.side_effect = [_list_response(304)]
+    third = poller.fetch_account_repos()
+    assert third is None
+    assert mock_get.call_args.kwargs["headers"]["If-None-Match"] == 'W/"page1-v1"'
+
+@patch("ci_status.github.requests.get")
 def test_fetch_account_repos_swallows_network_errors(mock_get):
     mock_get.side_effect = requests.ConnectionError()
     assert RestPoller("tok").fetch_account_repos() is None

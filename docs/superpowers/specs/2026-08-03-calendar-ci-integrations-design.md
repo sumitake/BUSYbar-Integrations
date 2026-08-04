@@ -1115,8 +1115,8 @@ gate (title rows 0-4, eta rows 7-15, label rows 11-15, no ink in the row-5
 buffer for any of the three text elements, no label ink in columns 0-1 or
 column 71/the right edge -- confirming no clip). Drawn to `preview` at
 priority 25, not the payload's own `PRIORITY_OVERLAY` (21): the live
-`ci_status` LaunchAgent was genuinely active during this session (real
-runs on `agent-collab-workspace`) and draws at priority 21 too, so a
+`ci_status` LaunchAgent was genuinely active during this session (a
+private repo's live agent activity) and draws at priority 21 too, so a
 same-priority `preview` draw was observed being rejected outright (the
 same equal-priority-different-`application_name` firmware behavior the
 v1.5 probes found) until the priority was raised, matching the precedent

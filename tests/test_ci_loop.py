@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 from busybar.client import DrawResult
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS
 from ci_status.logic import RepoState
-from ci_status.main import run_once, next_poll_seconds
+from ci_status.main import run_once, next_poll_seconds, config_requires_repos
 
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=timezone.utc)
 CFG = {"ci_status": {"poll_seconds": 120, "repos": ["o/r"],
@@ -569,3 +569,29 @@ def test_next_poll_seconds_shortens_for_auto_discovered_repo_not_in_explicit_rep
 def test_next_poll_seconds_reverts_when_all_running_cache_entries_empty():
     running_cache = {"o/a": [], "o/b": []}
     assert next_poll_seconds(CFG_RUNNING["ci_status"], running_cache) == 120
+
+
+# --- config_requires_repos: main()'s startup validation, extracted for testability
+
+def test_config_requires_repos_errors_when_empty_and_account_mode_off():
+    cfg = {"ci_status": {"repos": [], "watch_account_repos": False}}
+    err = config_requires_repos(cfg)
+    assert err is not None
+    assert "No repos configured" in err
+
+def test_config_requires_repos_ok_when_empty_but_account_mode_on():
+    cfg = {"ci_status": {"repos": [], "watch_account_repos": True}}
+    assert config_requires_repos(cfg) is None
+
+def test_config_requires_repos_ok_when_nonempty_and_account_mode_off():
+    cfg = {"ci_status": {"repos": ["o/r"], "watch_account_repos": False}}
+    assert config_requires_repos(cfg) is None
+
+def test_config_requires_repos_ok_when_watch_account_repos_key_absent():
+    # Backward compat: an old-style cfg dict without the v1.5.1 key at
+    # all (predates .get's default) must not crash, and behaves like
+    # watch_account_repos=False.
+    cfg = {"ci_status": {"repos": ["o/r"]}}
+    assert config_requires_repos(cfg) is None
+    cfg_empty = {"ci_status": {"repos": []}}
+    assert config_requires_repos(cfg_empty) is not None

@@ -287,6 +287,22 @@ def next_poll_seconds(cfg_ci: dict, running_cache: dict[str, list[dict]]) -> int
     return cfg_ci["running_poll_seconds"] if any_running else cfg_ci["poll_seconds"]
 
 
+def config_requires_repos(cfg: dict) -> str | None:
+    """Validates that this config gives ci_status *something* to watch --
+    either an explicit `repos` list, or `watch_account_repos = true`
+    (which discovers repos at runtime, so an empty `repos` list is valid
+    in that mode -- see v1.5.1's account-wide watching). Returns the
+    error message to log if neither is satisfied, else None. Pulled out
+    of main() as a pure function of `cfg` so this validation is testable
+    without exercising the rest of main()'s side effects (argparse,
+    logging setup, gh auth, device connection).
+    """
+    if not cfg["ci_status"]["repos"] and not cfg["ci_status"].get("watch_account_repos"):
+        return ("No repos configured. Copy config.example.toml to config.toml "
+               "and set [ci_status] repos, or set watch_account_repos = true.")
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="BUSY Bar CI status")
     parser.add_argument("--once", action="store_true")
@@ -295,9 +311,9 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cfg = load_config()
-    if not cfg["ci_status"]["repos"] and not cfg["ci_status"].get("watch_account_repos"):
-        log.error("No repos configured. Copy config.example.toml to config.toml "
-                  "and set [ci_status] repos, or set watch_account_repos = true.")
+    error = config_requires_repos(cfg)
+    if error is not None:
+        log.error(error)
         return 1
     from .github import RestPoller, get_token
     try:
