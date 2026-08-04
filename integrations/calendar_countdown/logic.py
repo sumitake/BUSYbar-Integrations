@@ -145,6 +145,17 @@ CD_TEXT_MAX_WIDTH = PANEL_WIDTH - CD_TEXT_X   # 33px
 GLYPH_ADVANCE_PX = {
     "0": 7, "1": 5, "2": 7, "3": 7, "4": 7, "5": 7, "6": 7, "7": 7, "8": 7, "9": 7,
     "h": 6, "m": 8,
+    # v1.5.1: extended for ci_status's running-badge ETA label feature --
+    # "~" (the remaining-estimate prefix, e.g. "~4m") plus every letter
+    # needed to also measure "remain"/"left" through this same table (see
+    # ci_status/logic.py's _eta_label docstring for why the label -- which
+    # actually renders in the *small* font -- is deliberately measured via
+    # this *large*-font table anyway: on-device calibration found it's a
+    # sizeable but safe overestimate of the label's real small-font width).
+    # Same on-device successive-prefix differencing methodology as the
+    # digits/h/m above; self-validated by re-measuring "0" via this
+    # technique and getting the same 7px already in this table.
+    "~": 7, "r": 5, "a": 6, "e": 6, "i": 4, "n": 6, "l": 4, "f": 5, "t": 5,
 }
 
 

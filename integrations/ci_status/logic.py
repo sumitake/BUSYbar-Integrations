@@ -1,6 +1,6 @@
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Reuse the calendar integration's generic text/formatting helpers rather
@@ -9,15 +9,17 @@ from pathlib import Path
 # verbatim by the running badge's ETA text and the quota frames' reset-in
 # text per the v1.5 spec), _title_fits (scroll-vs-static decision,
 # parameterized by width so it's not calendar-geometry-specific),
-# SCROLL_RATE/SCROLL_DELAY_MS (the same scroll timing), and
-# PANEL_WIDTH/PANEL_HEIGHT (hardware constants, not actually
+# _text_width_px (per-glyph width via GLYPH_ADVANCE_PX, v1.5.1: reused by
+# the running badge's ETA "remain"/"left" label fit decision --
+# see _eta_label below), SCROLL_RATE/SCROLL_DELAY_MS (the same scroll
+# timing), and PANEL_WIDTH/PANEL_HEIGHT (hardware constants, not actually
 # calendar-specific despite living in that module). Geometry and palette
 # below are ci_status's own -- only the algorithms are shared, not the
 # layout constants, since the two integrations' layouts are visually
 # similar (v1.4 "airy" language) but structurally distinct.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from calendar_countdown.logic import (  # noqa: E402
-    ascii_safe, _format_countdown, _title_fits,
+    ascii_safe, _format_countdown, _title_fits, _text_width_px,
     SCROLL_RATE, SCROLL_DELAY_MS, PANEL_WIDTH, PANEL_HEIGHT,
 )
 
@@ -67,6 +69,64 @@ class QuotaInfo:
 
 def _parse_ts(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_repos: bool,
+                      account_repos: list[dict] | None, active_within_days: int,
+                      now: datetime) -> list[str]:
+    """The effective set of repos to poll this cycle (v1.5.1 account-wide
+    watching).
+
+    In account mode (`watch_account_repos`), the watch list is the union
+    of auto-discovered account repos -- filtered to non-archived and
+    pushed within `active_within_days` -- and the explicit `repos` list.
+    An explicitly configured repo is always included regardless of its
+    own push recency: the user named it on purpose, so staleness
+    filtering shouldn't silently drop it. `account_repos` (raw dicts from
+    `RestPoller.fetch_account_repos`, or the caller's cached copy of an
+    earlier successful fetch) may be `None` or empty -- e.g. enumeration
+    hasn't succeeded yet, or `watch_account_repos` is off -- in which
+    case the result is just `repos` minus `repos_exclude`, same as
+    pre-v1.5.1 behavior.
+
+    `repos_exclude` is applied last, unconditionally, in both modes --
+    always a no-op when empty, not something that only matters in
+    account mode -- so a user can silence a noisy repo without leaving
+    account mode, or (less commonly) without editing an explicit `repos`
+    list either.
+
+    Caveat (documented in the README too): a repo whose most recent push
+    predates `active_within_days` is excluded from account-mode
+    discovery even if it has a *schedule*-triggered workflow run more
+    recent than that -- `pushed_at` is a repo-level field, not aware of
+    scheduled/dispatched runs that don't touch the git history. Such a
+    repo is only observed if named explicitly in `repos`.
+
+    Returns a sorted, deduplicated list -- the raw account-repo discovery
+    order (by `pushed_at`) isn't meaningful to callers, and a stable,
+    deterministic order makes both testing and reading `--dry-run` output
+    easier.
+    """
+    names = set(repos)
+    if watch_account_repos and account_repos:
+        cutoff = now - timedelta(days=active_within_days)
+        for r in account_repos:
+            if r.get("archived"):
+                continue
+            pushed_at = r.get("pushed_at")
+            if not pushed_at:
+                continue
+            try:
+                pushed = _parse_ts(pushed_at)
+            except (ValueError, TypeError):
+                continue
+            if pushed < cutoff:
+                continue
+            full_name = r.get("full_name")
+            if full_name:
+                names.add(full_name)
+    names -= set(repos_exclude)
+    return sorted(names)
 
 
 def evaluate_runs(repo: str, runs: list[dict], now: datetime,
@@ -144,6 +204,24 @@ RUNNING_TRACK_COLOR = "#0F2A42FF"
 RUNNING_TRACK_FILL_COLOR = "#29B6F6FF"   # spec: "solid cyan" -- one flat color, no gradient
 RUNNING_NUMERAL_COLOR = "#66E1FFFF"
 
+# ETA label (v1.5.1): a muted gray-blue, deliberately desaturated and
+# dimmer than the bright cyan numeral it sits beside -- a secondary-tier
+# color, following the same hierarchy already established between
+# RUNNING_TITLE_COLOR and RUNNING_NUMERAL_COLOR (the numeral is the
+# brighter/more-saturated of the two), just pushed one step further.
+# Confirmed legible on-device against RUNNING_BG_GRADIENT.
+RUNNING_LABEL_COLOR = "#8FA3B3FF"
+RUNNING_LABEL_GAP_PX = 3   # breathing room between the eta numeral and the label
+# Same 2px right margin convention as OVERLAY_TITLE_WIDTH (68 = 72 - 2*2).
+RUNNING_LABEL_BUDGET_PX = PANEL_WIDTH - RUNNING_NUMERAL_X - 2
+# ink rows 11-15 (small font, y=9) -- baseline-aligned with the large
+# numeral's own ink rows 7-15 (OVERLAY_NUMERAL_Y=5): the calendar's
+# established "+2px ink-offset" model means a small-font element at y=Y
+# inks starting at Y+2, so y=9 -> ink starts at row 11, landing the
+# label's bottom edge (row 15) flush with the numeral's own bottom edge
+# rather than vertically centered against it. Verified on-device.
+RUNNING_LABEL_Y = 9
+
 
 def _pr_or_branch(run: dict) -> str:
     """PR number ("#42") if the run belongs to a pull request, else the
@@ -210,6 +288,42 @@ def _format_eta_text(run: dict, median_minutes: float | None, now: datetime) -> 
     if int(eta) <= 0:
         return "soon"
     return f"~{_format_countdown(eta)}"
+
+
+def _eta_label(eta_text: str) -> str | None:
+    """"remain" / "left" / None, appended after a remaining-estimate ETA
+    numeral (v1.5.1).
+
+    Grammar guard: applies ONLY to the remaining-estimate forms
+    _format_eta_text produces ("~4m", "~1h05m", "~10h", ...) -- every one
+    of which is "~"-prefixed by construction. Never on "soon" (already
+    imminent -- a label would read as nonsense, "soon remain") and never
+    on the no-history elapsed form ("3m in" -- that's elapsed time, not a
+    remaining estimate, so "remain"/"left" would be actively wrong, not
+    just superfluous). The prefix check is the entire guard; there is no
+    other "~"-prefixed eta_text this function ever sees.
+
+    Fit is decided via the (extended) large-font GLYPH_ADVANCE_PX table
+    -- used here as a deliberately conservative proxy for the label's
+    real width even though the label itself renders in the *small* font,
+    not `large`. On-device calibration: "remain" measures 22px in the
+    actual small font vs. 35px as estimated through this large-font
+    table; "left" measures 11px vs. 20px estimated. The large-font
+    table always overestimates a small-font string's width on this
+    device, so reusing it here is safe -- the failure mode is
+    occasionally omitting a label that would have visually fit, never
+    drawing one that clips. Prefers "remain"; falls back to "left" if
+    "remain" plus the eta numeral doesn't fit within
+    RUNNING_LABEL_BUDGET_PX; omits the label entirely if even "left"
+    doesn't fit.
+    """
+    if not eta_text.startswith("~"):
+        return None
+    eta_width = _text_width_px(eta_text)
+    for label in ("remain", "left"):
+        if eta_width + RUNNING_LABEL_GAP_PX + _text_width_px(label) <= RUNNING_LABEL_BUDGET_PX:
+            return label
+    return None
 
 
 def _progress_width(elapsed_minutes: float, median_minutes: float | None) -> int:
@@ -282,7 +396,25 @@ def _build_running_elements(info: RunningInfo, timeout_s: int) -> list[dict]:
         "color": RUNNING_NUMERAL_COLOR, "x": RUNNING_NUMERAL_X, "y": RUNNING_NUMERAL_Y,
         "timeout": timeout_s,
     }
-    return [bg_element, title_element, track_element, track_fill_element, numeral_element]
+    elements = [bg_element, title_element, track_element, track_fill_element, numeral_element]
+
+    # ETA label (v1.5.1): appended only when _eta_label decides it fits
+    # (grammar guard + width check -- see its docstring). This changes
+    # the badge's own element-id shape (adds "eta_label") between polls
+    # where the label appears/disappears as the ETA text's own width
+    # changes over the run's lifetime -- no special handling needed here
+    # for that: main.py's unified shape tracker (frozenset of element
+    # ids on whatever was last actually drawn) already detects any shape
+    # change and clears first, generically, not just at tier boundaries.
+    label = _eta_label(eta_text)
+    if label is not None:
+        elements.append({
+            "id": "eta_label", "type": "text", "text": label, "font": "small",
+            "color": RUNNING_LABEL_COLOR,
+            "x": RUNNING_NUMERAL_X + _text_width_px(eta_text) + RUNNING_LABEL_GAP_PX,
+            "y": RUNNING_LABEL_Y, "timeout": timeout_s,
+        })
+    return elements
 
 
 # --- API-quota overlay frames -----------------------------------------------------

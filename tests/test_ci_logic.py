@@ -11,8 +11,10 @@ from ci_status.logic import (
     _pr_or_branch, select_running_run, compute_median_duration_minutes,
     _format_eta_text, _progress_width, _build_running_title,
     parse_rate_limit, _quota_headroom, _quota_used_width,
+    resolve_repo_list, _eta_label, RUNNING_NUMERAL_X, RUNNING_LABEL_GAP_PX,
 )
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS, PRIORITY_ALERT
+from calendar_countdown.logic import _text_width_px
 
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=timezone.utc)
 
@@ -278,8 +280,13 @@ def test_overlay_ci_badge_shape():
     assert payload["led"] is None
 
     by_id = _by_id(payload["elements"])
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "eta"}
-    assert [e["id"] for e in payload["elements"]] == ["bg", "title", "track", "track_fill", "eta"]
+    # v1.5.1: a fitting remain-estimate ETA ("~11m" here) picks up the
+    # "eta_label" element too -- see test_eta_label_* below for the full
+    # fit-decision and grammar-guard coverage.
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "eta", "eta_label"}
+    assert [e["id"] for e in payload["elements"]] == \
+        ["bg", "title", "track", "track_fill", "eta", "eta_label"]
+    assert by_id["eta_label"]["text"] == "remain"
 
     bg = by_id["bg"]
     assert bg["fill"] == "gradient_v" and bg["border_width"] == 0
@@ -299,6 +306,17 @@ def test_overlay_ci_badge_shape():
     eta = by_id["eta"]
     assert eta["font"] == "large" and eta["y"] == 5   # numeral-floor rule: large font
     assert eta["text"] == _format_eta_text(run_, 14, NOW)
+
+def test_overlay_ci_badge_shape_no_history_has_no_label():
+    # No median history -> "3m in" (elapsed, not a remaining estimate) --
+    # the label's grammar guard excludes this form, so the baseline
+    # 5-element shape (no "eta_label") is what actually draws.
+    run_ = running_run(name="tests", pr_number=42, started_min_ago=3)
+    info = running_info(run=run_, median_minutes=None)
+    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    by_id = _by_id(payload["elements"])
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "eta"}
+    assert by_id["eta"]["text"] == "3m in"
 
 def test_overlay_ci_badge_title_scrolls_when_long():
     run_ = running_run(name="a-very-long-workflow-name-that-will-not-fit", pr_number=12345, started_min_ago=1)
@@ -464,3 +482,130 @@ def test_payload_no_overlay_falls_through_to_quiet_or_green_as_before():
     assert build_ci_payload([RepoState("o/r", [], [])], False, 180, overlay=None) is None
     payload = build_ci_payload([RepoState("o/r", [], [])], True, 180, overlay=None)
     assert payload["priority"] == PRIORITY_ALERT
+
+
+# --- resolve_repo_list (v1.5.1 account-wide watching) -----------------------------
+
+def _account_repo(full_name, pushed_days_ago=1, archived=False):
+    pushed = (NOW - timedelta(days=pushed_days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"full_name": full_name, "archived": archived, "pushed_at": pushed}
+
+def test_resolve_repo_list_account_mode_off_is_just_repos_minus_exclude():
+    result = resolve_repo_list(["o/a", "o/b"], ["o/b"], False,
+                               [_account_repo("o/c")], 30, NOW)
+    assert result == ["o/a"]   # account_repos ignored entirely when the mode is off
+
+def test_resolve_repo_list_unions_explicit_and_discovered():
+    account = [_account_repo("o/discovered")]
+    result = resolve_repo_list(["o/explicit"], [], True, account, 30, NOW)
+    assert result == ["o/discovered", "o/explicit"]
+
+def test_resolve_repo_list_excludes_apply_in_account_mode():
+    account = [_account_repo("o/a"), _account_repo("o/b")]
+    result = resolve_repo_list([], ["o/b"], True, account, 30, NOW)
+    assert result == ["o/a"]
+
+def test_resolve_repo_list_filters_out_stale_pushed_repos():
+    account = [_account_repo("o/fresh", pushed_days_ago=5),
+              _account_repo("o/stale", pushed_days_ago=45)]
+    result = resolve_repo_list([], [], True, account, active_within_days=30, now=NOW)
+    assert result == ["o/fresh"]
+
+def test_resolve_repo_list_active_within_days_boundary_is_inclusive():
+    # Exactly at the cutoff (pushed_at == now - active_within_days) IS
+    # included -- the exclusion test is `pushed < cutoff` (strict), so the
+    # boundary instant itself counts as "within the window."
+    account = [_account_repo("o/exact", pushed_days_ago=30)]
+    result = resolve_repo_list([], [], True, account, active_within_days=30, now=NOW)
+    assert result == ["o/exact"]
+
+    # One second past the boundary is excluded.
+    just_over = {"full_name": "o/just_over", "archived": False,
+                "pushed_at": (NOW - timedelta(days=30, seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    result2 = resolve_repo_list([], [], True, [just_over], active_within_days=30, now=NOW)
+    assert result2 == []
+
+def test_resolve_repo_list_explicit_repos_never_filtered_by_staleness():
+    # o/explicit was pushed 400 days ago -- would fail the active-window
+    # filter if it were subject to it, but it's in `repos`, not discovered.
+    account = [_account_repo("o/explicit", pushed_days_ago=400)]
+    result = resolve_repo_list(["o/explicit"], [], True, account, active_within_days=30, now=NOW)
+    assert result == ["o/explicit"]
+
+def test_resolve_repo_list_archived_repos_excluded():
+    account = [_account_repo("o/live"), _account_repo("o/dead", archived=True)]
+    result = resolve_repo_list([], [], True, account, 30, NOW)
+    assert result == ["o/live"]
+
+def test_resolve_repo_list_none_account_repos_falls_back_to_repos_only():
+    # e.g. discovery hasn't succeeded yet and there's no cached list.
+    result = resolve_repo_list(["o/a"], [], True, None, 30, NOW)
+    assert result == ["o/a"]
+
+def test_resolve_repo_list_malformed_pushed_at_skipped_not_crashed():
+    account = [{"full_name": "o/bad", "archived": False, "pushed_at": "not-a-date"},
+              _account_repo("o/good")]
+    result = resolve_repo_list([], [], True, account, 30, NOW)
+    assert result == ["o/good"]
+
+def test_resolve_repo_list_dedupes_explicit_and_discovered_overlap():
+    account = [_account_repo("o/both")]
+    result = resolve_repo_list(["o/both"], [], True, account, 30, NOW)
+    assert result == ["o/both"]   # not ["o/both", "o/both"]
+
+def test_resolve_repo_list_sorted_deterministic_order():
+    account = [_account_repo("z/last"), _account_repo("a/first")]
+    result = resolve_repo_list(["m/middle"], [], True, account, 30, NOW)
+    assert result == ["a/first", "m/middle", "z/last"]
+
+
+# --- _eta_label: fit decision + grammar guard (v1.5.1 ETA label) -----------------
+
+def test_eta_label_remain_fits_short_eta():
+    # "~59m" measures 29px; remain (35px) + 3px gap = 38 > budget(68) is
+    # false only relative to eta width, i.e. 29+3+35=67 <= 68 -- fits.
+    assert _text_width_px("~59m") == 29
+    assert _eta_label("~59m") == "remain"
+
+def test_eta_label_falls_back_to_left_when_remain_does_not_fit():
+    # "~1h00m" measures 40px -- remain would need 40+3+35=78 > 68 (doesn't
+    # fit), but left needs only 40+3+20=63 <= 68 (fits).
+    assert _text_width_px("~1h00m") == 40
+    assert _eta_label("~1h00m") == "left"
+
+def test_eta_label_omitted_when_neither_fits():
+    # Synthetic, deliberately-wide input -- _format_eta_text/_format_countdown
+    # never actually produce a string this wide in practice (the h+mm full
+    # form is itself capped by CD_TEXT_MAX_WIDTH and falls back to an
+    # hour-only form well before reaching 45px), but _eta_label is a pure
+    # function of its string argument and must degrade safely (omit, not
+    # crash or draw an overflowing label) if it's ever fed one anyway --
+    # this is the defensive "neither fits" boundary the brief asked for.
+    synthetic = "~23h59m"
+    assert _text_width_px(synthetic) == 49   # > 45 (the "only left fits" ceiling)
+    assert _eta_label(synthetic) is None
+
+def test_eta_label_excluded_on_soon():
+    assert _eta_label("soon") is None
+
+def test_eta_label_excluded_on_no_history_elapsed_form():
+    assert _eta_label("3m in") is None
+    assert _eta_label("1h05m in") is None   # longer elapsed form, still excluded
+
+def test_eta_label_x_position_follows_eta_text_width():
+    run_ = running_run(name="tests", pr_number=42, started_min_ago=1)
+    info = running_info(run=run_, median_minutes=60)   # eta = 59m -> "~59m", label fits
+    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    by_id = _by_id(payload["elements"])
+    eta_text = by_id["eta"]["text"]
+    assert by_id["eta_label"]["x"] == RUNNING_NUMERAL_X + _text_width_px(eta_text) + RUNNING_LABEL_GAP_PX
+    assert by_id["eta_label"]["font"] == "small"
+    assert by_id["eta_label"]["y"] == 9
+
+def test_eta_label_falls_back_to_left_end_to_end_through_build_overlay_payload():
+    run_ = running_run(name="tests", pr_number=42, started_min_ago=0)
+    info = running_info(run=run_, median_minutes=60)   # eta = 60m -> "~1h00m"
+    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    by_id = _by_id(payload["elements"])
+    assert by_id["eta"]["text"] == "~1h00m"
+    assert by_id["eta_label"]["text"] == "left"

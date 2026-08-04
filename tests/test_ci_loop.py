@@ -6,7 +6,8 @@ from unittest.mock import Mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 from busybar.client import DrawResult
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS
-from ci_status.main import run_once, next_poll_seconds
+from ci_status.logic import RepoState
+from ci_status.main import run_once, next_poll_seconds, config_requires_repos
 
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=timezone.utc)
 CFG = {"ci_status": {"poll_seconds": 120, "repos": ["o/r"],
@@ -419,3 +420,178 @@ def test_next_poll_seconds_checks_across_all_configured_repos():
     cfg = {**CFG_RUNNING["ci_status"], "repos": ["o/r1", "o/r2"]}
     running_cache = {"o/r1": [], "o/r2": [_running_run()]}
     assert next_poll_seconds(cfg, running_cache) == 20
+
+
+# --- account-wide repo watching (v1.5.1) -----------------------------------------
+
+CFG_ACCOUNT = {"ci_status": {**CFG_RUNNING["ci_status"], "watch_account_repos": True,
+                             "repos": [], "repos_exclude": [], "active_within_days": 30,
+                             "repo_refresh_minutes": 60}}
+
+def _account_repo(full_name, pushed_days_ago=1, archived=False):
+    pushed = (NOW - timedelta(days=pushed_days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"full_name": full_name, "archived": archived, "pushed_at": pushed}
+
+def test_account_mode_polls_discovered_repos():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_account_repos.return_value = [_account_repo("o/discovered")]
+    poller.fetch_runs.return_value = [_run("success")]
+    repo_cache: dict = {}
+    run_once(client, poller, CFG_ACCOUNT, NOW, {}, dry_run=False, repo_cache=repo_cache)
+    poller.fetch_runs.assert_called_once_with("o/discovered")
+
+def test_account_mode_off_never_calls_discovery():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    repo_cache: dict = {}
+    cfg = {"ci_status": {**CFG_RUNNING["ci_status"], "watch_account_repos": False}}
+    run_once(client, poller, cfg, NOW, {}, dry_run=False, repo_cache=repo_cache)
+    poller.fetch_account_repos.assert_not_called()
+
+def test_repo_cache_omitted_falls_back_to_pre_v1_5_1_behavior():
+    # No repo_cache passed at all -- exactly cfg["ci_status"]["repos"] is
+    # polled, discovery never runs, even with watch_account_repos true.
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    cfg = {"ci_status": {**CFG_ACCOUNT["ci_status"], "repos": ["o/explicit"]}}
+    run_once(client, poller, cfg, NOW, {}, dry_run=False)
+    poller.fetch_account_repos.assert_not_called()
+    poller.fetch_runs.assert_called_once_with("o/explicit")
+
+
+# --- account repo list refresh timing ---------------------------------------------
+
+def test_stale_repo_cache_re_enumerates():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_account_repos.return_value = [_account_repo("o/a")]
+    poller.fetch_runs.return_value = [_run("success")]
+    repo_cache: dict = {"repos": [_account_repo("o/old")],
+                        "fetched_at": NOW - timedelta(minutes=61)}   # older than 60min default
+    run_once(client, poller, CFG_ACCOUNT, NOW, {}, dry_run=False, repo_cache=repo_cache)
+    poller.fetch_account_repos.assert_called_once()
+    assert repo_cache["fetched_at"] == NOW
+
+def test_fresh_repo_cache_does_not_re_enumerate():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    repo_cache: dict = {"repos": [_account_repo("o/a")], "fetched_at": NOW - timedelta(minutes=5)}
+    run_once(client, poller, CFG_ACCOUNT, NOW, {}, dry_run=False, repo_cache=repo_cache)
+    poller.fetch_account_repos.assert_not_called()
+    poller.fetch_runs.assert_called_once_with("o/a")   # still uses the cached list
+
+def test_enumeration_failure_keeps_previous_list():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_account_repos.return_value = None   # enumeration fails this poll
+    poller.fetch_runs.return_value = [_run("success")]
+    repo_cache: dict = {"repos": [_account_repo("o/previously_known")],
+                        "fetched_at": NOW - timedelta(minutes=61)}
+    run_once(client, poller, CFG_ACCOUNT, NOW, {}, dry_run=False, repo_cache=repo_cache)
+    # Still watching the previously-cached repo -- never fell back to empty.
+    poller.fetch_runs.assert_called_once_with("o/previously_known")
+    assert repo_cache["repos"] == [_account_repo("o/previously_known")]
+
+def test_enumeration_failure_with_no_prior_list_logs_warning_and_watches_nothing(caplog):
+    client = Mock()
+    poller = Mock()
+    poller.fetch_account_repos.return_value = None
+    repo_cache: dict = {}   # never successfully populated
+    import logging
+    with caplog.at_level(logging.WARNING, logger="ci_status"):
+        run_once(client, poller, CFG_ACCOUNT, NOW, {}, dry_run=False, repo_cache=repo_cache)
+    poller.fetch_runs.assert_not_called()
+    assert any("enumeration failed" in rec.message for rec in caplog.records)
+
+
+# --- state_cache / running_cache pruning for dropped repos -----------------------
+
+def test_state_cache_pruned_when_repo_excluded():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    cfg = {"ci_status": {**CFG_ACCOUNT["ci_status"], "repos_exclude": ["o/gone"]}}
+    poller.fetch_account_repos.return_value = [_account_repo("o/gone"), _account_repo("o/stays")]
+    state_cache = {"o/gone": RepoState("o/gone", ["tests"], [])}   # stale alert from before
+    repo_cache: dict = {}
+    run_once(client, poller, cfg, NOW, state_cache, dry_run=False, repo_cache=repo_cache)
+    assert "o/gone" not in state_cache
+    assert "o/stays" in state_cache
+
+def test_running_cache_pruned_when_repo_ages_out():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    poller.fetch_running_runs.return_value = []
+    poller.fetch_median_eta.return_value = None
+    poller.fetch_account_repos.return_value = [_account_repo("o/fresh", pushed_days_ago=1)]
+    running_cache = {"o/aged_out": [_running_run()]}   # from a repo no longer in the window
+    repo_cache: dict = {}
+    run_once(client, poller, CFG_ACCOUNT, NOW, {}, dry_run=False,
+            running_cache=running_cache, repo_cache=repo_cache)
+    assert "o/aged_out" not in running_cache
+
+def test_dropped_repo_forgets_poller_etag_state():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    cfg = {"ci_status": {**CFG_ACCOUNT["ci_status"], "repos_exclude": ["o/gone"]}}
+    poller.fetch_account_repos.return_value = [_account_repo("o/stays")]
+    state_cache = {"o/gone": RepoState("o/gone", [], [])}
+    repo_cache: dict = {}
+    run_once(client, poller, cfg, NOW, state_cache, dry_run=False, repo_cache=repo_cache)
+    poller.forget_repo.assert_called_once_with("o/gone")
+
+def test_no_pruning_when_effective_list_is_unchanged():
+    # Sanity check: the pruning step must not evict a repo that's still
+    # in the effective list just because it was cached from an earlier poll.
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    state_cache = {"o/r": RepoState("o/r", ["tests"], [])}
+    run_once(client, poller, CFG_RUNNING, NOW, state_cache, dry_run=False)
+    assert "o/r" in state_cache
+    poller.forget_repo.assert_not_called()
+
+
+# --- next_poll_seconds sees auto-discovered repos ---------------------------------
+
+def test_next_poll_seconds_shortens_for_auto_discovered_repo_not_in_explicit_repos():
+    # o/discovered was never in cfg_ci["repos"] at all -- next_poll_seconds
+    # must still see it via running_cache's own keys, not cfg_ci["repos"].
+    running_cache = {"o/discovered": [_running_run()]}
+    assert next_poll_seconds(CFG_ACCOUNT["ci_status"], running_cache) == 20
+
+def test_next_poll_seconds_reverts_when_all_running_cache_entries_empty():
+    running_cache = {"o/a": [], "o/b": []}
+    assert next_poll_seconds(CFG_RUNNING["ci_status"], running_cache) == 120
+
+
+# --- config_requires_repos: main()'s startup validation, extracted for testability
+
+def test_config_requires_repos_errors_when_empty_and_account_mode_off():
+    cfg = {"ci_status": {"repos": [], "watch_account_repos": False}}
+    err = config_requires_repos(cfg)
+    assert err is not None
+    assert "No repos configured" in err
+
+def test_config_requires_repos_ok_when_empty_but_account_mode_on():
+    cfg = {"ci_status": {"repos": [], "watch_account_repos": True}}
+    assert config_requires_repos(cfg) is None
+
+def test_config_requires_repos_ok_when_nonempty_and_account_mode_off():
+    cfg = {"ci_status": {"repos": ["o/r"], "watch_account_repos": False}}
+    assert config_requires_repos(cfg) is None
+
+def test_config_requires_repos_ok_when_watch_account_repos_key_absent():
+    # Backward compat: an old-style cfg dict without the v1.5.1 key at
+    # all (predates .get's default) must not crash, and behaves like
+    # watch_account_repos=False.
+    cfg = {"ci_status": {"repos": ["o/r"]}}
+    assert config_requires_repos(cfg) is None
+    cfg_empty = {"ci_status": {"repos": []}}
+    assert config_requires_repos(cfg_empty) is not None

@@ -18,7 +18,7 @@ from busybar.display import OVERLAY_DWELL_SECONDS, overlay_gap_elapsed
 from .logic import (
     RepoState, RunningInfo, QuotaInfo,
     build_ci_payload, build_overlay_payload, evaluate_runs,
-    overlay_frame_sequence, parse_rate_limit, select_running_run,
+    overlay_frame_sequence, parse_rate_limit, resolve_repo_list, select_running_run,
 )
 
 APP = "ci_status"
@@ -26,6 +26,31 @@ log = logging.getLogger(APP)
 
 QUOTA_LABELS = {"graphql": "GITHUB GRAPHQL", "core": "GITHUB REST"}
 QUOTA_STALE_SECONDS = 300  # never show rate_limit data older than 5 minutes
+
+
+def _refresh_account_repos(poller, repo_cache: dict | None, now: datetime,
+                           repo_refresh_minutes: int) -> list[dict] | None:
+    """Re-enumerate the account's owned repos (v1.5.1) when `repo_cache`
+    is stale or has never been populated, keeping the previous list on an
+    enumeration failure -- never crash, never silently fall back to an
+    empty watch list (an empty result from `fetch_account_repos` is
+    indistinguishable from "genuinely zero repos," so `None` is the only
+    signal treated as "keep what we had"; see that method's docstring).
+    Mirrors `_refresh_quota`'s cache-freshness pattern.
+    """
+    if repo_cache is None:
+        return None
+    fetched_at = repo_cache.get("fetched_at")
+    stale = fetched_at is None or (now - fetched_at).total_seconds() > repo_refresh_minutes * 60
+    if stale:
+        fetched = poller.fetch_account_repos()
+        if fetched is not None:
+            repo_cache["repos"] = fetched
+            repo_cache["fetched_at"] = now
+        elif repo_cache.get("repos") is None:
+            log.warning("account repo enumeration failed and no previous list is "
+                       "cached yet -- watch_account_repos contributes nothing this poll")
+    return repo_cache.get("repos")
 
 
 def _refresh_quota(poller, quota_cache: dict | None, now: datetime) -> dict[str, QuotaInfo] | None:
@@ -61,13 +86,30 @@ def run_once(client, poller, cfg: dict, now: datetime,
              state_cache: dict[str, RepoState], dry_run: bool,
              running_cache: dict[str, list[dict]] | None = None,
              overlay_state: dict | None = None,
-             quota_cache: dict | None = None) -> str:
-    """`running_cache`, `overlay_state`, and `quota_cache`, when passed, are
-    caller-owned dicts this function mutates in place (mirroring
-    `state_cache`'s existing pattern) so `main()` can hold one instance of
-    each across loop iterations while `run_once` itself stays a pure
-    function of its arguments plus those dicts. Omitting `running_cache`
-    (the default) skips running-job/overlay detection entirely.
+             quota_cache: dict | None = None,
+             repo_cache: dict | None = None) -> str:
+    """`running_cache`, `overlay_state`, `quota_cache`, and `repo_cache`,
+    when passed, are caller-owned dicts this function mutates in place
+    (mirroring `state_cache`'s existing pattern) so `main()` can hold one
+    instance of each across loop iterations while `run_once` itself stays
+    a pure function of its arguments plus those dicts. Omitting
+    `running_cache` (the default) skips running-job/overlay detection
+    entirely; omitting `repo_cache` (the default) skips account-wide
+    discovery entirely and falls back to the pre-v1.5.1 behavior of
+    polling exactly `cfg["ci_status"]["repos"]` every cycle.
+
+    Account-wide watching (v1.5.1): when `repo_cache` is given, the
+    effective repo list for this poll is resolved fresh each call via
+    `resolve_repo_list` (cheap -- it's a set operation over already-cached
+    data, not a network call) from `repos`/`repos_exclude`/
+    `watch_account_repos`/`active_within_days`, re-enumerating the
+    account's repos via `_refresh_account_repos` only when that cache is
+    older than `repo_refresh_minutes` (or empty). Any repo present in
+    `state_cache`/`running_cache` but absent from the freshly-resolved
+    list -- excluded, aged out of the active window, or deleted upstream
+    -- has its cached state dropped (and the poller's own per-repo ETag
+    slots forgotten via `forget_repo`) so a stale failure/stuck alert or
+    running badge can't linger for a repo that's no longer being watched.
 
     Overlay rotation: while a run is active (and no failure/stuck alert
     preempts it), the overlay tier draws one frame per dwell slot, cycling
@@ -109,7 +151,29 @@ def run_once(client, poller, cfg: dict, now: datetime,
     """
     c = cfg["ci_status"]
     timeout_s = int(c["poll_seconds"] * 1.5)
-    for repo in c["repos"]:
+
+    if repo_cache is not None:
+        account_repos = (_refresh_account_repos(poller, repo_cache, now,
+                                                 c.get("repo_refresh_minutes", 60))
+                         if c.get("watch_account_repos") else None)
+        effective_repos = resolve_repo_list(
+            c["repos"], c.get("repos_exclude", []), bool(c.get("watch_account_repos")),
+            account_repos, c.get("active_within_days", 30), now)
+    else:
+        effective_repos = c["repos"]
+
+    # Drop cached state for any repo that left the effective list this
+    # poll (excluded, aged out, deleted upstream) so a stale alert or
+    # running badge can't linger for a repo no longer being watched.
+    for repo in set(state_cache) - set(effective_repos):
+        state_cache.pop(repo, None)
+        poller.forget_repo(repo)
+    if running_cache is not None:
+        for repo in set(running_cache) - set(effective_repos):
+            running_cache.pop(repo, None)
+            poller.forget_repo(repo)
+
+    for repo in effective_repos:
         runs = poller.fetch_runs(repo)
         if runs is not None:  # None = 304/no-change/error -> keep cached state
             state_cache[repo] = evaluate_runs(repo, runs, now,
@@ -126,7 +190,7 @@ def run_once(client, poller, cfg: dict, now: datetime,
     # so callers/tests using an older, fully-spelled-out cfg dict that predates
     # this key (and never pass running_cache) don't KeyError.
     if running_cache is not None and c["show_running"]:
-        for repo in c["repos"]:
+        for repo in effective_repos:
             running_runs = poller.fetch_running_runs(repo)
             if running_runs is not None:  # None = 304/no-change/error -> keep cached
                 running_cache[repo] = running_runs
@@ -209,13 +273,34 @@ def run_once(client, poller, cfg: dict, now: datetime,
 
 
 def next_poll_seconds(cfg_ci: dict, running_cache: dict[str, list[dict]]) -> int:
-    """Cadence switch: `running_poll_seconds` while any configured repo has
-    a currently-running run, `poll_seconds` otherwise. A pure function of
-    `running_cache`'s post-`run_once` state so it's testable without
-    mocking `time.sleep`.
+    """Cadence switch: `running_poll_seconds` while any *currently
+    watched* repo has a running run, `poll_seconds` otherwise. Checks
+    every key `running_cache` actually holds (not `cfg_ci["repos"]`) --
+    account-wide watching (v1.5.1) means the set of repos with entries in
+    `running_cache` can include auto-discovered repos that were never in
+    the explicit `repos` list at all; iterating `cfg_ci["repos"]` would
+    silently miss an active run on any of those and never shorten the
+    poll interval for it. A pure function of `running_cache`'s
+    post-`run_once` state so it's testable without mocking `time.sleep`.
     """
-    any_running = any(running_cache.get(repo) for repo in cfg_ci["repos"])
+    any_running = any(running_cache.values())
     return cfg_ci["running_poll_seconds"] if any_running else cfg_ci["poll_seconds"]
+
+
+def config_requires_repos(cfg: dict) -> str | None:
+    """Validates that this config gives ci_status *something* to watch --
+    either an explicit `repos` list, or `watch_account_repos = true`
+    (which discovers repos at runtime, so an empty `repos` list is valid
+    in that mode -- see v1.5.1's account-wide watching). Returns the
+    error message to log if neither is satisfied, else None. Pulled out
+    of main() as a pure function of `cfg` so this validation is testable
+    without exercising the rest of main()'s side effects (argparse,
+    logging setup, gh auth, device connection).
+    """
+    if not cfg["ci_status"]["repos"] and not cfg["ci_status"].get("watch_account_repos"):
+        return ("No repos configured. Copy config.example.toml to config.toml "
+               "and set [ci_status] repos, or set watch_account_repos = true.")
+    return None
 
 
 def main() -> int:
@@ -226,9 +311,9 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cfg = load_config()
-    if not cfg["ci_status"]["repos"]:
-        log.error("No repos configured. Copy config.example.toml to config.toml "
-                  "and set [ci_status] repos.")
+    error = config_requires_repos(cfg)
+    if error is not None:
+        log.error(error)
         return 1
     from .github import RestPoller, get_token
     try:
@@ -243,11 +328,13 @@ def main() -> int:
     running_cache: dict[str, list[dict]] = {}
     overlay_state: dict = {}
     quota_cache: dict = {}
+    repo_cache: dict = {}
     backoff = 5
     while True:
         summary = run_once(client, poller, cfg, datetime.now(timezone.utc),
                            state_cache, args.dry_run, running_cache=running_cache,
-                           overlay_state=overlay_state, quota_cache=quota_cache)
+                           overlay_state=overlay_state, quota_cache=quota_cache,
+                           repo_cache=repo_cache)
         log.info(summary)
         if args.once:
             return 0

@@ -51,9 +51,11 @@ show_running = true            # show a badge while a run is in progress (defaul
 running_poll_seconds = 20      # poll interval while a run is active (default: 20)
 show_quota = true              # GraphQL/REST quota frames join the overlay rotation while a
                                 # run is active (default: true; no effect if show_running is false)
+watch_account_repos = false    # auto-discover and watch every repo you own (default: false) --
+                                # see "Account-wide watching" below before enabling
 ```
 
-At minimum, set `repos` to the repositories you want to monitor (e.g., `["owner/repo1", "owner/repo2"]`).
+At minimum, set `repos` to the repositories you want to monitor (e.g., `["owner/repo1", "owner/repo2"]`) -- unless you enable `watch_account_repos` instead (see below), in which case `repos` is optional and just adds always-included repos on top of whatever's auto-discovered.
 
 ### 3. Test in Foreground
 
@@ -75,12 +77,26 @@ Once the foreground test completes, your `config.toml` is in place and GitHub au
 | Key | Type | Default | Purpose |
 |---|---|---|---|
 | `poll_seconds` | integer | 120 | Polling interval in seconds |
-| `repos` | array of strings | — | GitHub repositories to monitor in `owner/repo` format (required) |
+| `repos` | array of strings | — | GitHub repositories to monitor in `owner/repo` format. Required unless `watch_account_repos` is true, in which case these are always-included repos layered on top of auto-discovery (never filtered by `active_within_days`, since you named them explicitly). |
 | `show_green` | boolean | false | Display successful/green workflow status (default: off to reduce noise) |
 | `stale_queued_minutes` | integer | (disabled) | Alert if a workflow run has been queued for N minutes without starting (optional; useful to catch offline self-hosted runners) |
 | `show_running` | boolean | true | Show the running-CI badge while a run is `in_progress` (across all configured repos; most-recently-started wins, `+N` if others are also running) |
 | `running_poll_seconds` | integer | 20 | Poll interval while a run is active (shortened from `poll_seconds`) |
 | `show_quota` | boolean | true | Join two GitHub API quota frames (GraphQL, REST) to the overlay rotation while a run is active. No effect if `show_running` is false — the quota frames only ever appear as part of that same rotation. |
+| `watch_account_repos` | boolean | false | Auto-discover and watch every repo you own, in addition to `repos`. See "Account-wide watching" below. |
+| `repos_exclude` | array of strings | `[]` | Repos to never watch, regardless of mode — silences a specific repo without leaving account mode (or, less commonly, without editing `repos`). Applied last, unconditionally; a no-op when empty. |
+| `active_within_days` | integer | 30 | In account mode, only auto-discovered repos pushed within this many days are watched (caps request volume on large accounts). Repos in `repos` are never subject to this filter. |
+| `repo_refresh_minutes` | integer | 60 | How often the account's repo list is re-enumerated. A newly created (or newly pushed-to, if previously outside the active window) repo is picked up within this interval, not instantly. |
+
+## Account-wide watching
+
+By default this integration watches exactly the repos listed in `repos`. Setting `watch_account_repos = true` switches to a broader mode: the watch list becomes every repo you own (`GET /user/repos?affiliation=owner`, so this does **not** pick up repos you merely have collaborator/org-member access to, only ones under your own account) that's been pushed to within `active_within_days` days, **union** `repos` (always included, never filtered by recency), **minus** `repos_exclude`. New repos are picked up automatically — no config edit needed — within `repo_refresh_minutes` of their creation or of a first push that puts them back inside the active window.
+
+**Private repos are included, and that's intentional.** Discovery has no way to filter private vs. public — it watches everything you own that's active. This is fine for this integration's threat model: both the resulting config state (the discovered list itself, cached in memory) and the physical display are local to your own device and your own account's token. But the practical consequence is real: **a private repo's name can render on the physical display** (in the running badge's title, or in a failure/stuck alert's `repo:workflow` text) exactly like a public one would. If the device sits somewhere visible to people who shouldn't know a private repo exists, either keep `watch_account_repos` off and list repos explicitly, or add sensitive ones to `repos_exclude`.
+
+**Quota math.** With N repos in the effective watch list, each poll cycle costs N REST requests to `.../actions/runs` (steady-state, these return `304` and cost nothing against your quota — see "Design: REST-only, Quota-Efficient" above) at `poll_seconds` cadence (default every 120s, so N requests every 2 minutes = up to `N * 30` requests/hour, all free in the steady state), plus N more to the running-runs endpoint whenever `show_running` is on, at `running_poll_seconds` cadence while any run is active. Account-wide discovery itself adds one more request per `repo_refresh_minutes` (default hourly = 1 request/hour, also ETag-cached on its first page — see `RestPoller.fetch_account_repos`'s docstring). None of this touches your real GitHub REST quota unless workflow state is actually changing, since 304s are free; the practical cap that matters is request *volume* (GitHub does rate-limit request rate, not just quota), which is why `active_within_days` exists — it keeps N bounded to your actually-active repos instead of every repo you've ever created.
+
+**Caveat: `active_within_days` filters on `pushed_at`, a repo-level field — it has no idea about *schedule*-triggered workflow runs.** A repo whose CI only ever runs on a cron schedule (no pushes) will fall out of the active window and stop being watched even while its scheduled runs keep firing, because nothing about a scheduled run touches `pushed_at`. If you rely on schedule-triggered CI on a repo that doesn't otherwise see regular pushes, add it to `repos` explicitly (explicit repos are never subject to the active-window filter) rather than relying on account-wide discovery to keep watching it.
 
 ## Display Priority Tiers
 
@@ -122,6 +138,13 @@ per dwell slot (`OVERLAY_DWELL_SECONDS`, 10s), before repeating:
    successful-run history yet to estimate from); and a thin progress line
    tracking elapsed time against the workflow's typical duration (median
    of its last 5 successful runs, cached for the life of the process).
+   When there's room, a small muted `remain` (or `left`, if `remain`
+   doesn't fit) is appended right after the ETA — e.g. `~57m remain` or
+   `~1h01m left` — never on `soon` (already imminent) or the no-history
+   `3m in` form (that's elapsed time, not a remaining estimate, so a
+   remaining-time label would be wrong, not just superfluous). Whether it
+   fits at all, and which word if so, is a width-based decision (see
+   `ci_status/logic.py`'s `_eta_label`); nothing to configure.
 2. **GraphQL quota** (`show_quota`): title ribbon `GITHUB GRAPHQL`, a track bar
    showing the fraction of the bucket used, and two numerals — percentage
    *remaining* on the left, reset-in on the right (e.g. `18%` / `42m`).

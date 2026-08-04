@@ -904,3 +904,220 @@ has no effect when `show_running` is false, since the quota frames only
 ever appear as part of the running badge's own rotation. `calendar_countdown`'s
 `poll_seconds` default changed from 60 to 10 (see the tuning table above);
 existing configs that set `poll_seconds` explicitly are unaffected.
+
+## 2026-08-03 — v1.5.1 account-wide repo watching
+
+**Status:** Implemented, branch `dev/claude/account-wide-v1.5.1` off `main`
+(which by this point already includes the full v1.5 revision above, merged
+via PR #9). Not pushed.
+
+New feature: `ci_status` can watch every repo the operator owns instead of
+a fixed, manually-maintained `repos` list, with automatic pickup of newly
+created (or newly re-activated) repos -- no config edit or restart needed.
+
+### Config additions
+
+`[ci_status]` gains: `watch_account_repos = false` (default off -- the
+operator enables it locally, not shipped as a default, since it changes
+what gets polled/displayed without an explicit repo list), `repos_exclude
+= []`, `active_within_days = 30`, `repo_refresh_minutes = 60`.
+
+### Discovery (`RestPoller.fetch_account_repos`, `ci_status/github.py`)
+
+`GET /user/repos?affiliation=owner&sort=pushed&per_page=100`, paginated up
+to a 1000-repo cap (10 pages). Only page 1 carries a conditional-request
+(ETag) slot -- a deliberate choice: `sort=pushed` puts the most-recently-
+active repos first, so the common case (a single-page account) gets a free
+`304` whenever nothing relevant changed, while paying for pages 2+ on
+every re-enumeration (itself only every `repo_refresh_minutes`, not every
+poll) is an acceptable rare cost for >100-repo accounts. It also sidesteps
+a correctness trap: reusing a cached page-2+ result on a page-1 304 could
+miss a `pushed_at` update to a repo that moved within page 2 without
+crossing into page 1 -- so pages 2+ are always fetched fresh when needed,
+never cached across calls.
+
+Returns `None` (not an empty list) on a 304 or any failure at any page --
+an empty list is indistinguishable from "this account genuinely owns zero
+repos," which would silently stop watching everything. The caller
+(`main._refresh_account_repos`) treats `None` as "keep the previous
+cached list," logging a warning only when there is no previous list to
+fall back on yet.
+
+### List resolution (`resolve_repo_list`, `ci_status/logic.py`)
+
+Pure function: `repos` (explicit list, always included, never filtered by
+recency) **union** auto-discovered account repos filtered to
+non-archived + `pushed_at` within `active_within_days` **minus**
+`repos_exclude` (applied unconditionally in both modes, always a no-op
+when empty). Returns a sorted, deduplicated list -- the raw
+`pushed`-sort order from discovery isn't meaningful to callers.
+
+Caveat, documented in the README too: `pushed_at` is a repo-level field
+with no notion of schedule-triggered workflow runs. A repo whose CI only
+fires on a cron schedule (no pushes) ages out of `active_within_days` and
+stops being watched even while its scheduled runs keep firing, since
+nothing about a scheduled run touches `pushed_at`. Such a repo must be
+named explicitly in `repos` to stay watched indefinitely.
+
+### `run_once` integration (`ci_status/main.py`)
+
+New optional `repo_cache` parameter (same caller-owned-mutable-dict
+pattern as `running_cache`/`overlay_state`/`quota_cache`; omitting it
+skips account-wide discovery entirely and preserves the exact pre-v1.5.1
+behavior of polling `cfg["ci_status"]["repos"]` verbatim). Each poll
+resolves the effective repo list fresh (cheap -- a set operation over
+already-cached data, not a network call) via `resolve_repo_list`, calling
+`_refresh_account_repos` (mirrors `_refresh_quota`'s freshness-cache
+pattern) only when `watch_account_repos` is on and the cache is stale.
+
+Any repo present in `state_cache`/`running_cache` from a previous poll but
+absent from the freshly-resolved list -- excluded, aged out, or deleted
+upstream -- has its cached state dropped, and the poller's own per-repo
+ETag slots forgotten (`RestPoller.forget_repo`, pops both `_etags` and
+`_running_etags`), so a stale failure/stuck alert or running badge can't
+linger for a repo no longer being watched, and a repo that's later
+re-added starts with a clean conditional-request slate.
+
+Two related fixes needed for account-wide watching to actually work
+end-to-end, not just compile: `main()`'s "no repos configured" validation
+previously required a non-empty `repos` list unconditionally, which would
+have rejected a valid `watch_account_repos = true` / `repos = []`
+configuration outright -- now it only errors when *both* are empty/off.
+`next_poll_seconds` previously iterated `cfg_ci["repos"]` to check for an
+active run; since `running_cache`'s keys can now include auto-discovered
+repos never present in `repos` at all, that would have silently failed to
+shorten the poll interval for an active run on any auto-discovered repo,
+defeating a chunk of the alternation feature for exactly the repos this
+feature exists to add. Fixed to check `running_cache.values()` directly.
+
+### Quota math and the private-repo-name caveat
+
+See the README's "Account-wide watching" section for the full quota-cost
+breakdown (N watched repos x `poll_seconds` cadence, all free in the
+304 steady state; +1 request/`repo_refresh_minutes` for enumeration
+itself, also ETag-cached on its first page) and the explicit note that
+discovery includes private repos by design (no way to filter public vs.
+private from the API call used, and it's fine for this integration's
+local-only threat model) -- with the practical consequence that a private
+repo's name can render on the physical display exactly like a public
+one's.
+
+### Verification
+
+Tests: `resolve_repo_list` (union/exclude/active-window filtering,
+explicit repos never filtered, empty/`None` account_repos, dedup +
+deterministic sort), `fetch_account_repos` (single-page pass-through,
+pagination across multiple pages, 304 handling, failure returns `None`
+not `[]`, `forget_repo` clearing both ETag dicts), `_refresh_account_repos`
+timing (stale cache re-fetches, fresh cache doesn't, failure keeps the
+previous list), `state_cache`/`running_cache` pruning for repos dropped
+from the effective list, `next_poll_seconds` checking auto-discovered
+repos, config defaults. Full suite run verbatim in the implementation
+report.
+
+Live check: `--once --dry-run` against a **local throwaway config** (not
+the operator's real `config.toml`) with `watch_account_repos` temporarily
+`true`, confirming real discovery + resolution end-to-end against the
+live GitHub API. Discovered-repo count and public-repo names are in the
+implementation report; private repo names are redacted there (`<private-N>`)
+since reports may be quoted in public PRs, even though the display itself
+has no such redaction (see the caveat above).
+
+## 2026-08-03 — v1.5.1 running-badge ETA label ("remain" / "left")
+
+**Status:** Implemented, same branch (`dev/claude/account-wide-v1.5.1`).
+Additive, orthogonal to the account-wide watching feature above -- both
+landed on this branch but touch unrelated code paths (this one is
+entirely within the running badge's own render function).
+
+Next to the ETA numeral on the running badge, a small muted label is
+appended when it fits: `remain` preferred, `left` as a fallback, omitted
+entirely if neither fits. Grammar guard: applies only to remaining-
+estimate ETA forms (`~4m`, `~1h05m`, `~10h`, ...) -- never `soon` or the
+no-history elapsed form (`3m in`), since a label reads as nonsense or
+outright wrong on either of those. The guard is a single prefix check
+(`eta_text.startswith("~")`), reliable because every remaining-estimate
+form `_format_eta_text` produces is `~`-prefixed by construction and
+neither of the other two forms ever is.
+
+### Fit decision (`_eta_label`, `ci_status/logic.py`)
+
+Reuses `calendar_countdown.logic.GLYPH_ADVANCE_PX`/`_text_width_px` (the
+existing large-font per-glyph width table, extended -- see below) to
+measure `eta_text`'s own rendered width, then checks whether
+`eta_width + RUNNING_LABEL_GAP_PX + width(label)` fits within
+`RUNNING_LABEL_BUDGET_PX` (68px: `PANEL_WIDTH - RUNNING_NUMERAL_X - 2`,
+the same 2px-right-margin convention as `OVERLAY_TITLE_WIDTH`), trying
+`"remain"` first, then `"left"`.
+
+A deliberate, documented modeling choice: the label itself renders in the
+**small** font, not `large`, but its width is estimated through the
+large-font table anyway. On-device calibration: `"remain"` measures 22px
+in its real small font vs. 35px as estimated via the large-font table;
+`"left"` measures 11px vs. 20px. The large-font table always
+overestimates a small-font string's width on this device, so reusing it
+is safe for a fits/doesn't-fit decision (the failure mode is an
+occasionally-omitted label that would have visually fit, never a clipped
+one) -- and it means no second, small-font-specific glyph table was
+needed.
+
+`GLYPH_ADVANCE_PX` gained nine entries for this feature: `~` (the
+remaining-estimate prefix) plus every letter needed to measure `"remain"`
+and `"left"` through the same table (`r`, `a`, `e`, `i`, `n`, `l`, `f`,
+`t`; `m` already existed). Measured on-device via the same successive-
+prefix rightmost-ink-column differencing technique the original digit
+table's comment documents -- self-validated by re-measuring `"0"` through
+this exact technique and reproducing the table's existing value (7px)
+with no adjustment needed.
+
+### Geometry
+
+`RUNNING_LABEL_Y = 9` (small font) puts the label's own ink at rows
+11-15, baseline-aligned with the large ETA numeral's ink (rows 7-15,
+`OVERLAY_NUMERAL_Y = 5`) via the calendar's established "+2px ink-offset"
+model (a small-font element at `y=Y` inks starting at row `Y+2`) --
+confirmed on-device, not just derived. `RUNNING_LABEL_COLOR = "#8FA3B3FF"`,
+a muted gray-blue, deliberately desaturated and dimmer than
+`RUNNING_NUMERAL_COLOR`, extending the same title/numeral brightness
+hierarchy one step further; confirmed legible against
+`RUNNING_BG_GRADIENT` on-device.
+
+### Shape tracking
+
+Adding `eta_label` changes the running badge's own element-id shape
+(`{bg, title, track, track_fill, eta}` -> `{..., eta_label}`) whenever the
+ETA text's width crosses a fit boundary between polls (e.g. counting down
+from `~1h00m`, which only fits `left`, into `~59m`, which fits `remain`,
+or losing the label entirely as the ETA widens). No new code was needed
+in `main.py` for this: the unified shape tracker added in the prior
+revision (a generic `frozenset(e["id"] for e in payload["elements"])`
+comparison, not a hardcoded badge/quota mapping) already detects any
+element-id-set change on any draw to `APP` and clears first -- this is
+exactly the generalization that fix was for.
+
+### Verification
+
+Tests (`tests/test_ci_logic.py`): fit-decision boundaries using real
+`_format_countdown` output at the exact measured widths (`"~59m"` = 29px
+fits `remain`; `"~1h00m"` = 40px only fits `left`; a synthetic
+`"~23h59m"` = 49px, wider than any real `_format_eta_text` output can
+reach today, fits neither -- included specifically to exercise that
+branch defensively), both exclusion forms (`"soon"`, `"3m in"` and a
+longer no-history form), the label element's `x` position tying back to
+the measured eta width, and both running-badge shape variants (with and
+without the label) via `build_overlay_payload`. `test_glyph_advance_table_
+covers_every_countdown_glyph` (`test_calendar_logic.py`) relaxed from
+exact-set equality to a subset check, since the table now carries more
+than `_format_countdown` alone needs.
+
+On-device: both fit outcomes captured through the ink-overlap + buffer
+gate (title rows 0-4, eta rows 7-15, label rows 11-15, no ink in the row-5
+buffer for any of the three text elements, no label ink in columns 0-1 or
+column 71/the right edge -- confirming no clip). Drawn to `preview` at
+priority 25, not the payload's own `PRIORITY_OVERLAY` (21): the live
+`ci_status` LaunchAgent was genuinely active during this session (a
+private repo's live agent activity) and draws at priority 21 too, so a
+same-priority `preview` draw was observed being rejected outright (the
+same equal-priority-different-`application_name` firmware behavior the
+v1.5 probes found) until the priority was raised, matching the precedent
+already set by the original v1.5 badge-variant verification script.

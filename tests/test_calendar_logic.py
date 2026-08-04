@@ -191,8 +191,11 @@ def test_countdown_full_form_overflow_is_a_real_per_string_measurement():
 def test_glyph_advance_table_covers_every_countdown_glyph():
     # Every character _format_countdown can ever emit (digits, 'h', 'm')
     # must have a table entry, or _text_width_px raises KeyError at draw
-    # time instead of failing a test.
-    assert set(GLYPH_ADVANCE_PX) == set("0123456789hm")
+    # time instead of failing a test. (v1.5.1 extended the table further,
+    # with "~" plus the letters ci_status's running-badge ETA label
+    # feature needs -- see GLYPH_ADVANCE_PX's own comment -- so this is a
+    # subset check now, not exact equality.)
+    assert set("0123456789hm").issubset(set(GLYPH_ADVANCE_PX))
 
 
 # --- build_elements: upcoming event ------------------------------------------
