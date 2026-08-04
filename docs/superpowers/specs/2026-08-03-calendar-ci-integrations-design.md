@@ -1460,3 +1460,154 @@ operator directly ear-verified the corrected `.snd` call as part of
 reporting the original bug, which is stronger evidence than a fresh
 scripted probe could add (a scripted probe can only confirm HTTP `200`
 again, exactly the signal already shown not to prove audibility).
+
+## 2026-08-04 — v1.6 cloud transport fallback
+
+**Status:** Implemented, branch `dev/claude/cloud-transport-v1.6` off
+`main` (top of `main` at branch time: PR #13, the chirp-`.snd` fix). Not
+pushed. **No live cloud verification performed this round** — the
+operator hadn't provisioned a real `cloud_token` yet; see the README's
+"Post-merge live-probe checklist" for what runs once one exists.
+
+Operator-approved feature, based on `scratchpad/busy-cloud-api-research.md`
+(source citations: `busy-app/busylib-py` on GitHub, docs.busy.app, and the
+live cloud OpenAPI spec at `api.busy.app/busybar/openapi.yaml`). BUSY
+exposes a cloud relay in addition to the device's local HTTP API — same
+endpoint surface, mounted under `/busybar/...` instead of `/api/...`, bearer-
+token authenticated, synchronous (the relay bridges the HTTP call over MQTT
+to the device and holds the connection until it replies, so callers see the
+same 200/409 semantics as local — no async/poll pattern to add). One
+confirmed gap: `/api/status/ws` (continuous status streaming) has no cloud
+equivalent — local-only by construction, not something this round could
+paper over.
+
+### `BusyBarClient` transport layer (`src/busybar/client.py`)
+
+Single-class transport-flag design, mirroring busylib-py's own pattern
+(one class, a mode flag branching request construction) rather than a
+class hierarchy — matches this codebase's existing single-`BusyBarClient`
+shape and needed no changes to `DrawResult`'s enum members or to any
+consumer's call to `draw`/`clear`/`status`/`get_busy`/`set_busy_simple`/
+`play_audio`; the fallback lives entirely inside `_request`.
+
+New constructor kwargs: `cloud_token` (default `""`, disables cloud
+fallback entirely when empty), `cloud_base_url` (default
+`"https://api.busy.app/busybar"`), `transport` (`"auto"` | `"local"` |
+`"cloud"`, default `"auto"`), `cloud_timeout` (fixed `(5, 15)`, not
+config-exposed — longer than local's `(3, 5)` since a cloud round-trip
+crosses the public internet and bridges over MQTT to the device rather
+than a direct LAN hop).
+
+- **`"local"`**: unchanged pre-v1.6 behavior exactly — `_request` calls
+  local only, never falls back, regardless of `cloud_token`.
+- **`"cloud"`**: forced — `_request` calls cloud only, never attempts
+  local. For deliberately exercising/debugging the cloud path (e.g. the
+  live-probe checklist below).
+- **`"auto"`** (default): local-first-with-cloud-fallback.
+  `active_transport` (`"local"` | `"cloud"`) tracks which transport last
+  succeeded. On a fresh/healthy client, every call tries local first with
+  the existing `(3, 5)` timeout; on a `requests.RequestException` AND a
+  non-empty `cloud_token`, the SAME request (same method, path, body) is
+  retried against `cloud_base_url` with `cloud_timeout` and an
+  `Authorization: Bearer <cloud_token>` header. A successful cloud call
+  transitions `active_transport` to `"cloud"` (logged once at INFO,
+  transition only — not on every request while already degraded).
+  - **Local-recovery probe** (`LOCAL_RETRY_SECONDS = 60`): while
+    degraded (`active_transport == "cloud"`), `_request` skips the local
+    attempt entirely and goes straight to cloud until
+    `LOCAL_RETRY_SECONDS` have elapsed since the last local failure, at
+    which point the next call tries local first again as a recovery
+    probe. Doing this inline per-request (no background prober thread)
+    is cheap specifically because a down local device fails fast
+    (connection refused/timeout, well under even the `(3, 5)` local
+    timeout) — the occasional 60s-interval probe costs little even if
+    local is still down, and if the probe itself fails, the client falls
+    through to cloud for that same request and resets the degraded timer
+    to the probe's own failure time (so the next probe is another full
+    window out, not immediately retried).
+  - **Path mapping**: local paths are `/api/<endpoint>`; per the research
+    doc, cloud mirrors them 1:1 under `/busybar/<endpoint>` relative to
+    the cloud host. Since `cloud_base_url`'s documented default already
+    carries that `/busybar` segment, `_cloud_path` simply strips the
+    local `/api` prefix and lets `cloud_base_url` supply the rest (e.g.
+    local `/api/display/draw` → cloud tail `/display/draw` → full URL
+    `https://api.busy.app/busybar/display/draw`).
+  - **`DrawResult.UNREACHABLE` redefinition**: now means both local AND
+    cloud (when configured) failed for this call — previously it only
+    ever meant local failed, since there was no other transport. When
+    `cloud_token` is empty, behavior is unchanged from pre-v1.6: a local
+    failure alone is `UNREACHABLE`, no cloud attempt is made at all.
+
+**Base-URL discrepancy, deliberately left unresolved this round.**
+busylib-py's own hardcoded default is `https://proxy.busy.app` — a
+different host entirely from this codebase's `https://api.busy.app/busybar`
+default. The research doc flags this as unresolved; this round follows the
+operator's explicit instruction to default to `api.busy.app` here and defer
+resolution to the post-merge live probe (README checklist item 3) rather
+than guessing which is authoritative without a real token to test against.
+
+**Security: `cloud_token` is never logged, at any level including DEBUG.**
+Only transport *transitions* are logged (INFO), and those log lines are
+static strings with no header/token interpolation — grep confirms no
+f-string, `%s`, or `.format()` call anywhere in `client.py` ever
+interpolates `cloud_token` or a header dict into a log call. A dedicated
+`caplog`-based test (`test_cloud_token_never_appears_in_log_output`)
+exercises both the degrade and the both-transports-fail paths and asserts
+the placeholder token string never appears in any captured log record's
+formatted message or args.
+
+### Config (`src/busybar/config.py`, `config.example.toml`)
+
+New `[device]` keys, added to `DEFAULTS["device"]` and mirrored in
+`config.example.toml`: `cloud_token = ""`, `cloud_base_url =
+"https://api.busy.app/busybar"`, `transport = "auto"`. Key names were
+chosen to match `BusyBarClient`'s constructor kwargs exactly, so both
+integration call sites (`calendar_countdown/main.py`,
+`ci_status/main.py`) simplify from `BusyBarClient(host=cfg["device"]
+["host"])` to `BusyBarClient(**cfg["device"])` — a single point of
+plumbing rather than adding three more explicit keyword arguments at each
+call site, and automatically future-proof against a v1.7 adding a fourth
+`[device]` key.
+
+### Verification
+
+`TZ=UTC uv run pytest -v`: 337 passed (323 at the start of this branch's
+work, after the chirp-`.snd` fix line). New coverage (`tests/test_client.py`):
+auto-mode fallback on local failure (asserts both the local call and the
+subsequent cloud call's exact URL), no fallback when `cloud_token` is
+empty, `UNREACHABLE` requiring both transports to fail, forced `"local"`
+never attempting cloud even on failure, forced `"cloud"` always going
+straight to cloud, the cloud request's exact shape (Bearer header,
+`cloud_timeout`, base URL), the `/api` → `/busybar` path mapping, three
+recovery-probe timing tests (skip-local within the window, probe-and-
+recover once the window elapses, probe-fails-so-stays-cloud-and-resets-
+timer), a fresh-client sanity check that the skip logic never fires before
+any degradation, and the token-never-logged `caplog` test. New coverage
+(`tests/test_config.py`): the three new `[device]` defaults, and two
+config.example.toml parity tests (device section value-for-value matches
+`DEFAULTS["device"]`, and `cloud_token` in the shipped example is
+literally `""` — not a placeholder that merely looks non-empty).
+
+### Docs
+
+README gained a "Cloud transport" section: token creation walkthrough
+(cloud.busy.app → API tokens tab → "BUSY Bar" scope), config placement
+(explicitly: the real token lives only in git-ignored `config.toml`,
+never `config.example.toml`, never committed), rotation guidance
+(revocation is immediate and irreversible — create the replacement before
+revoking the old one), the status-WS cloud gap, and the post-merge
+live-probe checklist (forced-cloud draw probe, cadence headroom check at
+the 10s ambient-redraw cadence, base-URL ambiguity resolution) —
+duplicated in condensed form above so both the report and the operator-
+facing docs carry it.
+
+### Deferred to the operator (explicit — not an oversight)
+
+No live cloud verification was performed or attempted this round, per
+the coordinator's explicit instruction: the operator had not yet inserted
+a real `cloud_token`. All 12 new `test_client.py` tests and both new
+`test_config.py` tests use `requests` mocks and a literal
+placeholder-string token (`"test-placeholder-token-do-not-use"`) — no
+network call was made to any `busy.app` host during this round's work.
+The three-item live-probe checklist above is the explicit handoff for
+the controller/operator pass that runs once a token exists.

@@ -366,7 +366,7 @@ def main() -> int:
     except RuntimeError as exc:
         log.error(str(exc))
         return 1
-    client = BusyBarClient(host=cfg["device"]["host"])
+    client = BusyBarClient(**cfg["device"])
     client.clear(APP)  # drop any stale elements from a previous process (type collisions 400)
 
     state_cache: dict[str, RepoState] = {}

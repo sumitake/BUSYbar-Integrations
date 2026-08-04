@@ -4,7 +4,17 @@ import tomllib
 from pathlib import Path
 
 DEFAULTS: dict = {
-    "device": {"host": "10.0.4.20"},
+    "device": {
+        "host": "10.0.4.20",
+        # Cloud transport fallback (v1.6) -- see README's "Cloud
+        # transport" section before setting these. An empty cloud_token
+        # (the shipped default) disables cloud fallback entirely in
+        # "auto" mode; keys here MUST match BusyBarClient's constructor
+        # kwarg names exactly since call sites pass **cfg["device"].
+        "cloud_token": "",
+        "cloud_base_url": "https://api.busy.app/busybar",
+        "transport": "auto",  # "auto" | "local" | "cloud" (forced)
+    },
     "calendar_countdown": {
         # 10s matches busybar.display.AMBIENT_REDRAW_SECONDS -- the ambient
         # tier's redraw contract, tuned (after on-device re-measurement

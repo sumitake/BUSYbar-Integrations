@@ -1,9 +1,16 @@
+import tomllib
 from pathlib import Path
-from busybar.config import load_config
+from busybar.config import DEFAULTS, load_config
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def test_defaults_when_no_file(tmp_path):
     cfg = load_config(tmp_path / "missing.toml")
     assert cfg["device"]["host"] == "10.0.4.20"
+    # v1.6 cloud transport fallback -- disabled out of the box.
+    assert cfg["device"]["cloud_token"] == ""
+    assert cfg["device"]["cloud_base_url"] == "https://api.busy.app/busybar"
+    assert cfg["device"]["transport"] == "auto"
     assert cfg["calendar_countdown"]["poll_seconds"] == 10  # v1.5 ambient-tier default
     assert cfg["ci_status"]["repos"] == []
     assert cfg["ci_status"]["show_running"] is True
@@ -39,3 +46,24 @@ def test_returned_config_mutation_does_not_corrupt_defaults(tmp_path):
     cfg2 = load_config(tmp_path / "missing.toml")
     assert cfg2["ci_status"]["repos"] == []
     assert cfg2["calendar_countdown"]["poll_seconds"] == 10
+
+
+# --- config.example.toml parity (v1.6) --------------------------------------
+# config.example.toml's own header claims "All keys optional; defaults
+# shown" -- these tests hold that claim to account for the [device] table
+# specifically, since it's the one this round touches and the one where a
+# drifted example (e.g. a non-empty placeholder token) would be a real
+# hygiene problem, not just documentation staleness.
+
+def test_example_toml_device_section_matches_defaults():
+    with open(REPO_ROOT / "config.example.toml", "rb") as fh:
+        example = tomllib.load(fh)
+    assert example["device"] == DEFAULTS["device"]
+
+def test_example_toml_cloud_token_is_empty_placeholder_not_a_real_looking_token():
+    with open(REPO_ROOT / "config.example.toml", "rb") as fh:
+        example = tomllib.load(fh)
+    # Guards against ever accidentally shipping a real-looking credential
+    # in the committed example file -- the real token belongs only in the
+    # git-ignored config.toml.
+    assert example["device"]["cloud_token"] == ""
