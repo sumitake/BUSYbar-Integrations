@@ -1,4 +1,5 @@
 import logging
+import time
 from enum import Enum
 
 import requests
@@ -57,7 +58,35 @@ class BusyBarClient:
         return resp.json() if resp is not None and resp.status_code == 200 else None
 
     def set_busy_simple(self, time_left_ms: int) -> bool:
-        body = {"type": "SIMPLE", "card_id": NULL_CARD_ID,
-                "time_left_ms": time_left_ms, "is_paused": False}
+        """PUT /api/busy/snapshot to start a SIMPLE BUSY session (used by
+        calendar_countdown's auto_busy=true feature).
+
+        The device's /openapi.yaml documents BusySnapshot as the
+        discriminated snapshot variant merged (via allOf) with a required
+        top-level `busy_bar_settings`, sent flat -- that is the shape this
+        method sent before this fix. Empirically, against a live device,
+        that flat body gets HTTP 400 "Failed to parse snapshot" every
+        time. The shape the firmware actually accepts mirrors what
+        get_busy() (GET, unaffected by this bug) returns: the snapshot
+        variant nested under a "snapshot" key, sibling to a top-level
+        "snapshot_timestamp_ms" -- and, on this write path, WITHOUT
+        `busy_bar_settings` at all, despite the spec marking it required.
+        Confirmed on-device: the nested body with no `busy_bar_settings`
+        returns 200 and the session actually starts (visible in a
+        subsequent get_busy() snapshot).
+
+        `snapshot_timestamp_ms` must be a genuinely current timestamp, not
+        a stale or placeholder value -- also confirmed on-device: PUTting
+        this same nested body with a stale `snapshot_timestamp_ms` (e.g.
+        one copied from a prior GET) still returns HTTP 200, but the
+        write silently no-ops and the busy state does not actually
+        change. Always send `time.time()`-derived "now", never a fixed
+        or cached value.
+        """
+        body = {
+            "snapshot": {"type": "SIMPLE", "card_id": NULL_CARD_ID,
+                        "time_left_ms": time_left_ms, "is_paused": False},
+            "snapshot_timestamp_ms": int(time.time() * 1000),
+        }
         resp = self._request("PUT", "/api/busy/snapshot", json=body)
         return resp is not None and resp.status_code == 200
