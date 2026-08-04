@@ -115,7 +115,13 @@ def main() -> int:
 
     cfg = load_config()
     client = BusyBarClient(host=cfg["device"]["host"])
-    client.clear(APP)  # drop any stale elements from a previous process (type collisions 400)
+    # Drop any stale elements from a previous process. This also protects a
+    # restart onto this version against the v1.3 -> v1.3.1 id/type change:
+    # the native "countdown" element was replaced by a "cd_text" text
+    # element (see logic.py), and the draw endpoint's id-reuse-type-change
+    # quirk means a leftover "countdown"-typed element from an older deploy
+    # could otherwise serve stale pixel data under a colliding id.
+    client.clear(APP)
     fetch = lambda hours: eventkit.fetch_events(hours, cfg["calendar_countdown"]["calendars"])
 
     backoff = 5
