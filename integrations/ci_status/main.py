@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from busybar.client import BusyBarClient, DrawResult
-from busybar.config import load_config
+from busybar.config import device_kwargs, load_config
 from busybar.display import OVERLAY_DWELL_SECONDS, overlay_gap_elapsed
 
 from .logic import (
@@ -366,7 +366,7 @@ def main() -> int:
     except RuntimeError as exc:
         log.error(str(exc))
         return 1
-    client = BusyBarClient(host=cfg["device"]["host"])
+    client = BusyBarClient(**device_kwargs(cfg))
     client.clear(APP)  # drop any stale elements from a previous process (type collisions 400)
 
     state_cache: dict[str, RepoState] = {}

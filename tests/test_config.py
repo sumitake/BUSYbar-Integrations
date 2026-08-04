@@ -1,9 +1,17 @@
+import logging
+import tomllib
 from pathlib import Path
-from busybar.config import load_config
+from busybar.config import DEFAULTS, device_kwargs, load_config
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def test_defaults_when_no_file(tmp_path):
     cfg = load_config(tmp_path / "missing.toml")
     assert cfg["device"]["host"] == "10.0.4.20"
+    # v1.6 cloud transport fallback -- disabled out of the box.
+    assert cfg["device"]["cloud_token"] == ""
+    assert cfg["device"]["cloud_base_url"] == "https://api.busy.app/busybar"
+    assert cfg["device"]["transport"] == "auto"
     assert cfg["calendar_countdown"]["poll_seconds"] == 10  # v1.5 ambient-tier default
     assert cfg["ci_status"]["repos"] == []
     assert cfg["ci_status"]["show_running"] is True
@@ -39,3 +47,68 @@ def test_returned_config_mutation_does_not_corrupt_defaults(tmp_path):
     cfg2 = load_config(tmp_path / "missing.toml")
     assert cfg2["ci_status"]["repos"] == []
     assert cfg2["calendar_countdown"]["poll_seconds"] == 10
+
+
+# --- config.example.toml parity (v1.6) --------------------------------------
+# config.example.toml's own header claims "All keys optional; defaults
+# shown" -- these tests hold that claim to account for the [device] table
+# specifically, since it's the one this round touches and the one where a
+# drifted example (e.g. a non-empty placeholder token) would be a real
+# hygiene problem, not just documentation staleness.
+
+def test_example_toml_device_section_matches_defaults():
+    with open(REPO_ROOT / "config.example.toml", "rb") as fh:
+        example = tomllib.load(fh)
+    assert example["device"] == DEFAULTS["device"]
+
+def test_example_toml_cloud_token_is_empty_placeholder_not_a_real_looking_token():
+    with open(REPO_ROOT / "config.example.toml", "rb") as fh:
+        example = tomllib.load(fh)
+    # Guards against ever accidentally shipping a real-looking credential
+    # in the committed example file -- the real token belongs only in the
+    # git-ignored config.toml.
+    assert example["device"]["cloud_token"] == ""
+
+
+# --- device_kwargs() unknown-key guard (final-gate review, v1.6) -----------
+# Both integration call sites splat cfg["device"] into BusyBarClient's
+# constructor. Splatting the raw dict would TypeError on any unknown/typo'd
+# [device] key (a silent-ignore -> crash regression from pre-v1.6, where
+# only host= was ever passed explicitly) -- device_kwargs() must filter to
+# known kwargs and warn, not crash.
+
+def test_device_kwargs_passes_through_all_known_keys():
+    cfg = {"device": {"host": "192.0.2.1", "cloud_token": "x",
+                      "cloud_base_url": "https://cloud.example.test",
+                      "transport": "local"}}
+    assert device_kwargs(cfg) == cfg["device"]
+
+def test_device_kwargs_drops_unknown_key_without_crashing(caplog):
+    cfg = {"device": {"host": "192.0.2.1", "coud_token": "typo'd-key"}}
+    caplog.set_level(logging.WARNING, logger="busybar.config")
+    result = device_kwargs(cfg)
+    assert result == {"host": "192.0.2.1"}  # unknown key silently dropped, not crashed
+    assert "coud_token" in caplog.text
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+def test_device_kwargs_result_never_crashes_busybarclient_construction():
+    from busybar.client import BusyBarClient
+    cfg = {"device": {"host": "192.0.2.1", "cloud_token": "x", "bogus_extra_key": 123}}
+    # This is the actual regression this guard exists for: a typo'd or
+    # unrecognized [device] key must not raise TypeError when splatted.
+    client = BusyBarClient(**device_kwargs(cfg))
+    assert client.base == "http://192.0.2.1"
+
+def test_device_kwargs_logs_one_warning_per_unknown_key(caplog):
+    cfg = {"device": {"host": "192.0.2.1", "bogus_one": 1, "bogus_two": 2}}
+    caplog.set_level(logging.WARNING, logger="busybar.config")
+    device_kwargs(cfg)
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2
+    assert any("bogus_one" in r.getMessage() for r in warnings)
+    assert any("bogus_two" in r.getMessage() for r in warnings)
+
+def test_device_kwargs_no_warnings_when_all_keys_known(caplog):
+    caplog.set_level(logging.WARNING, logger="busybar.config")
+    device_kwargs({"device": dict(DEFAULTS["device"])})
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]

@@ -3,6 +3,27 @@
 [device]
 host = "10.0.4.20"          # USB-Ethernet default; set your LAN IP for Wi-Fi
 
+# Cloud transport fallback (v1.6, optional). When cloud_token is set,
+# BusyBarClient automatically falls back to BUSY's cloud relay if the
+# local device becomes unreachable (USB unplugged, Wi-Fi drop, etc.), and
+# recovers back to local automatically once the device is reachable
+# again. Leave cloud_token empty (the default) to disable cloud fallback
+# entirely -- behavior is then identical to pre-v1.6.
+#
+# Mint a token at https://cloud.busy.app -> "API tokens" tab -> create a
+# token with the "BUSY Bar" scope (full device control, tied to exactly
+# one linked device -- no separate device id needed here). Revoking a
+# token from the dashboard takes effect immediately and cannot be undone;
+# create the replacement token first if you're rotating.
+#
+# The real token belongs ONLY in your git-ignored config.toml -- never
+# here, and never committed anywhere. See README.md's "Cloud transport"
+# section for the full walkthrough.
+cloud_token = ""
+cloud_base_url = "https://api.busy.app/busybar"
+transport = "auto"          # "auto" (local, fall back to cloud) | "local" | "cloud" (forced --
+                              # mainly for deliberately testing the cloud path)
+
 [calendar_countdown]
 poll_seconds = 10            # ambient-tier redraw cadence (default: 10) -- matches the running-CI
                               # overlay's 10s dwell gap so this app's redraws reliably land inside

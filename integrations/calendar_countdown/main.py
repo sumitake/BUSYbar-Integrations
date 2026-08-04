@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 
 from busybar.client import BusyBarClient, DrawResult
-from busybar.config import load_config
+from busybar.config import device_kwargs, load_config
 from busybar.display import PRIORITY_AMBIENT, ambient_timeout
 
 from .logic import (ascii_safe, build_elements, select_active_event,
@@ -215,7 +215,7 @@ def main() -> int:
     ordering_warning = check_threshold_ordering(cfg["calendar_countdown"])
     if ordering_warning is not None:
         log.warning(ordering_warning)
-    client = BusyBarClient(host=cfg["device"]["host"])
+    client = BusyBarClient(**device_kwargs(cfg))
     # Drop any stale elements from a previous process. This also protects a
     # restart onto this version against every id change made across the
     # v1.3 -> v1.3.1 -> v1.4 line: v1.3.1 replaced the native "countdown"
