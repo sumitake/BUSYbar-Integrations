@@ -1,5 +1,10 @@
 # BUSY Bar Integrations
 
+[![ci](https://github.com/sumitake/busybar-integrations/actions/workflows/ci.yml/badge.svg)](https://github.com/sumitake/busybar-integrations/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/sumitake/busybar-integrations/actions/workflows/codeql.yml/badge.svg)](https://github.com/sumitake/busybar-integrations/actions/workflows/codeql.yml)
+[![secret-scan](https://github.com/sumitake/busybar-integrations/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/sumitake/busybar-integrations/actions/workflows/secret-scan.yml)
+[![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](LICENSE)
+
 Local-API integrations for the BUSY Bar — a 72×16 LED status display on USB or LAN.
 
 ## Requirements
