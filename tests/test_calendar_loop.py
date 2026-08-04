@@ -243,6 +243,96 @@ def test_run_once_in_progress_stays_baseline_no_led():
     assert client.draw.call_args.kwargs["led_notification_color"] is None
 
 
+# --- v1.5.2 LED stuck-on fix: guaranteed off-transition, both repro shapes -------
+#
+# Critical review finding: omitting led_notification_color is unverified as
+# a way to turn off a previously-lit LED (no status endpoint exposes LED
+# state, and the device's own OpenAPI doc -- already wrong once about
+# priority arbitration -- only claims omission means "won't blink", not
+# "turns off a lit one"). resolve_led_value sends an EXPLICIT off value on
+# every on->off transition instead, tracked via state["led_on"], covering
+# both the normal in_progress transition and the "event vanishes without
+# ever reaching in_progress" edge case the review specifically named
+# (all-day filtering, or an event shorter than one poll interval).
+
+def test_run_once_led_off_explicit_on_normal_in_progress_transition():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    state: dict = {}
+    imminent = make_event(0.5)   # inside imminent_minutes(1) -- LED on
+    run_once(client, lambda hours: [imminent], CFG, NOW, dry_run=False, state=state)
+    assert client.draw.call_args.kwargs["led_notification_color"] == IMMINENT_LED_COLOR
+    assert state["led_on"] is True
+
+    # Next poll: the same event has started (in_progress=True) -- LED must
+    # turn off via an EXPLICIT value, not just an omitted field.
+    started = CalEvent(imminent.title, imminent.start, imminent.start + timedelta(minutes=30), False)
+    later = imminent.start + timedelta(seconds=1)
+    run_once(client, lambda hours: [started], CFG, later, dry_run=False, state=state)
+    led_sent = client.draw.call_args.kwargs["led_notification_color"]
+    assert led_sent is not None and led_sent != IMMINENT_LED_COLOR   # an explicit off value
+    assert state["led_on"] is False
+
+    # A further poll, still in_progress: LED already off and staying off
+    # -- the field can be safely omitted now (nothing to turn off).
+    run_once(client, lambda hours: [started], CFG, later + timedelta(seconds=10), dry_run=False, state=state)
+    assert client.draw.call_args.kwargs["led_notification_color"] is None
+
+def test_run_once_led_off_explicit_when_event_vanishes_without_in_progress():
+    # Repro shape 1 (the review's specific concern): the event disappears
+    # entirely on the next poll -- filtered out (e.g. all-day toggling) or
+    # simply shorter than one poll interval -- WITHOUT ever passing
+    # through in_progress=True. The "no upcoming event" path is the only
+    # other place besides the normal draw that can carry the LED field,
+    # via an explicit flush draw before clear().
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    state: dict = {}
+    imminent = make_event(0.5)
+    run_once(client, lambda hours: [imminent], CFG, NOW, dry_run=False, state=state)
+    assert state["led_on"] is True
+    client.draw.reset_mock()
+
+    later = NOW + timedelta(seconds=5)
+    summary = run_once(client, lambda hours: [], CFG, later, dry_run=False, state=state)
+    assert "cleared" in summary
+    # An explicit LED-off flush draw must have happened (a real draw()
+    # call carrying the off value), separate from -- and before -- clear().
+    client.draw.assert_called_once()
+    flush_kwargs = client.draw.call_args.kwargs
+    assert flush_kwargs["led_notification_color"] is not None
+    assert flush_kwargs["led_notification_color"] != IMMINENT_LED_COLOR
+    client.clear.assert_called_once_with("calendar_countdown")
+    assert state["led_on"] is False
+
+def test_run_once_no_led_flush_when_led_was_already_off_and_event_vanishes():
+    # No spurious flush draw when the LED wasn't on to begin with.
+    client = Mock()
+    state: dict = {}
+    run_once(client, lambda hours: [make_event(40)], CFG, NOW, dry_run=False, state=state)   # normal, no LED
+    assert state.get("led_on", False) is False
+    client.draw.reset_mock(); client.clear.reset_mock()
+
+    run_once(client, lambda hours: [], CFG, NOW, dry_run=False, state=state)
+    client.draw.assert_not_called()   # no flush needed
+    client.clear.assert_called_once_with("calendar_countdown")
+
+def test_run_once_led_flush_retries_next_poll_if_it_fails():
+    client = Mock()
+    state: dict = {}
+    client.draw.return_value = DrawResult.DRAWN
+    imminent = make_event(0.5)
+    run_once(client, lambda hours: [imminent], CFG, NOW, dry_run=False, state=state)
+    assert state["led_on"] is True
+
+    client.draw.return_value = DrawResult.REJECTED   # the flush attempt fails
+    later = NOW + timedelta(seconds=5)
+    run_once(client, lambda hours: [], CFG, later, dry_run=False, state=state)
+    assert state["led_on"] is True   # not committed -- must retry
+
+    client.draw.return_value = DrawResult.DRAWN
+    run_once(client, lambda hours: [], CFG, later + timedelta(seconds=5), dry_run=False, state=state)
+    assert state["led_on"] is False   # retried and landed
+
+
 # --- v1.5.2 chirp, end to end through run_once ------------------------------------
 
 def test_run_once_chirps_exactly_once_on_start_transition():

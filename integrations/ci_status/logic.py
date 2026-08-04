@@ -734,7 +734,7 @@ def compute_alert_fingerprint(states: list[RepoState]) -> frozenset:
            | frozenset((s.repo, name, "stuck") for s in states for name in s.stuck))
 
 
-def update_snooze(alert_fingerprint: frozenset, busy_active: bool, now: datetime,
+def update_snooze(alert_fingerprint: frozenset, busy_active: bool | None, now: datetime,
                   snooze_minutes: int, snooze_state: dict) -> tuple[bool, bool]:
     """Advances the snooze state machine by one poll and returns
     `(suppress_alert, suppress_led)` for THIS poll. `snooze_state` is a
@@ -787,8 +787,30 @@ def update_snooze(alert_fingerprint: frozenset, busy_active: bool, now: datetime
     `session_was_active` -- but polling is deliberately gated (see
     main.run_once) to skip `get_busy()` entirely when idle (no alert, no
     snooze state), which means there can be gaps where `session_was_active`
-    wasn't being updated. On the first poll after such a gap (or the very
-    first poll of a fresh process), `session_was_active` defaults to
+    wasn't being updated.
+
+    **Critical correctness point (fixed after an initial version got this
+    wrong -- see the regression tests): `session_was_active` is committed
+    ONLY on a poll where `get_busy()` was ACTUALLY called this cycle**,
+    signaled by `busy_active` being a real `bool` rather than `None`.
+    `main.run_once` passes `None` for `busy_active` whenever polling was
+    gated off (idle: no alert, no existing snooze state). An earlier
+    version unconditionally wrote `busy_active` every call, including a
+    dummy `False` for gated-off polls -- which meant a sequence of idle
+    polls (no alert yet) would stamp `session_was_active = False`
+    regardless of the device's ACTUAL state; if a session then started
+    while STILL idle (unobserved, since nothing was polling), and only
+    THEN did an alert appear (triggering the first real `get_busy()` call,
+    correctly observing `busy_active=True`), the stale `False` from the
+    dummy writes would read as "was NOT active a moment ago, now IS
+    active" -- a spurious transition -- and silently start a pending
+    snooze for a failure the operator never acknowledged. Committing only
+    on an actual poll (leaving `session_was_active` untouched otherwise)
+    closes this: an unobserved period leaves the value at whatever it was
+    (or its default) rather than being corrupted by an unpolled guess.
+
+    On the first EVER poll of a fresh process, or the first poll after any
+    gap where `session_was_active` was never committed, it defaults to
     `True` -- not `False` -- so an as-yet-unobserved busy session is
     assumed to possibly PRE-DATE the alert rather than assumed absent:
     the conservative direction is to require an actually-OBSERVED
@@ -808,7 +830,8 @@ def update_snooze(alert_fingerprint: frozenset, busy_active: bool, now: datetime
     this codebase).
     """
     was_active = snooze_state.get("session_was_active", True)
-    snooze_state["session_was_active"] = busy_active
+    if busy_active is not None:
+        snooze_state["session_was_active"] = busy_active
 
     if snooze_minutes <= 0:
         snooze_state.pop("fingerprint", None)
@@ -832,7 +855,15 @@ def update_snooze(alert_fingerprint: frozenset, busy_active: bool, now: datetime
         return False, False
 
     if snooze_until is None:
-        if busy_active:
+        # Defensive: main.run_once's polling gate guarantees busy_active
+        # is a real bool (not None) whenever pending_fp is set (a pending
+        # snooze always keeps polling -- see should_poll_busy), so this
+        # should never actually see None here. If it somehow did anyway,
+        # treat "unknown" the same as "still active" (stay pending rather
+        # than prematurely starting the timed snooze on an unpolled
+        # guess) -- the same conservative direction as everywhere else in
+        # this function.
+        if busy_active is None or busy_active:
             return False, True
         snooze_state["snooze_until"] = now + timedelta(minutes=snooze_minutes)
         return True, False

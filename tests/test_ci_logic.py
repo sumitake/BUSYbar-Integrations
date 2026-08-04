@@ -672,6 +672,69 @@ def test_update_snooze_genuine_transition_establishes_pending():
     assert state["fingerprint"] == FP_A
     assert "snooze_until" not in state
 
+# --- Critical regression: unpolled (None) cycles must never corrupt
+# session_was_active -- reviewer-reproduced bug. An earlier version wrote
+# busy_active unconditionally every call, including a dummy False for
+# gated-off (idle) polls; a run of idle polls would stamp
+# session_was_active=False regardless of the device's real state, so a
+# session that started (unobserved) during that idle stretch and was
+# already running by the time an alert first appeared would be
+# misread as a fresh transition and silently snoozed -- an
+# unacknowledged failure. Fixed: busy_active=None means "not polled this
+# cycle" and must NOT be committed.
+
+def test_update_snooze_unpolled_cycles_do_not_corrupt_session_was_active():
+    state = {}
+    # Simulates several idle polls where get_busy() was never called
+    # (main.run_once passes None in this case).
+    update_snooze(EMPTY_FP, None, NOW, 30, state)
+    update_snooze(EMPTY_FP, None, NOW, 30, state)
+    update_snooze(EMPTY_FP, None, NOW, 30, state)
+    assert state.get("session_was_active", True) is True   # untouched, still the conservative default
+
+def test_update_snooze_session_predating_alert_does_not_snooze_reviewer_scenario():
+    # The exact reviewer-reported scenario: idle polls (unpolled, None) ->
+    # a session starts DURING that unpolled stretch (never observed) ->
+    # an alert appears, triggering the first real poll, which correctly
+    # observes busy_active=True -- but this must NOT be read as a fresh
+    # transition, since the session predates the alert and the operator
+    # never acknowledged it.
+    state = {}
+    update_snooze(EMPTY_FP, None, NOW, 30, state)   # idle poll 1, unpolled
+    update_snooze(EMPTY_FP, None, NOW, 30, state)   # idle poll 2, unpolled
+    # Session starts here, still unobserved (no alert yet, still not polling).
+    t1 = NOW + timedelta(seconds=30)
+    result = update_snooze(FP_A, True, t1, 30, state)   # alert appears -- first real poll
+    assert result == (False, False)   # must NOT pend -- no acknowledged transition observed
+    assert "fingerprint" not in state
+
+def test_update_snooze_mirror_alert_first_then_session_starts_while_polled():
+    # The mirror case (still correct, unaffected by the fix): the alert
+    # appears FIRST (triggering real polling immediately), observes
+    # inactive, and only THEN does the session start while polling
+    # continues -- a genuine, fully-observed transition, so pending
+    # DOES start, exactly as designed.
+    state = {}
+    update_snooze(FP_A, False, NOW, 30, state)   # alert showing, polled, session inactive
+    t1 = NOW + timedelta(seconds=10)
+    result = update_snooze(FP_A, True, t1, 30, state)   # still polled -- session starts
+    assert result == (False, True)
+    assert state["fingerprint"] == FP_A
+
+def test_update_snooze_none_after_established_pending_defensive_stays_pending():
+    # Defensive case documented in update_snooze: main.run_once's own
+    # gating guarantees busy_active is never None while a fingerprint is
+    # pending (a pending snooze always keeps polling), but the function
+    # itself treats an (unexpected) None here as "stay pending" rather
+    # than risk prematurely starting the timed snooze on an unpolled guess.
+    state = {}
+    update_snooze(FP_A, False, NOW, 30, state)
+    update_snooze(FP_A, True, NOW, 30, state)   # now pending on FP_A
+    assert state.get("snooze_until") is None
+    result = update_snooze(FP_A, None, NOW, 30, state)
+    assert result == (False, True)   # still pending, not prematurely timed
+    assert "snooze_until" not in state
+
 def test_update_snooze_stays_pending_while_session_continues():
     state = {}
     update_snooze(FP_A, False, NOW, 30, state)

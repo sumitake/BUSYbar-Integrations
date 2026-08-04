@@ -685,6 +685,60 @@ def test_snooze_get_busy_not_called_when_idle():
     run_once(client, poller, CFG_SNOOZE, NOW, {}, dry_run=False, snooze_state=snooze_state)
     client.get_busy.assert_not_called()
 
+def test_snooze_reviewer_reproduced_scenario_session_predates_alert_no_snooze():
+    # Critical regression, full loop level: idle polls (green, get_busy
+    # gated off -> None passed to update_snooze) while a session is
+    # ALREADY active (unobserved, since nothing is polling yet) -- then a
+    # failure appears, triggering the first real get_busy() poll, which
+    # correctly observes the session as active. This must NOT be read as
+    # a fresh transition (the session predates the alert; the operator
+    # never acknowledged this specific failure) -- no pending, no
+    # suppression, the alert draws normally with its normal LED.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    # If get_busy() were ever (wrongly) called during the idle polls, this
+    # would make it look like a fresh transition -- it must simply never
+    # be consulted during those polls at all (see should_poll_busy gating).
+    client.get_busy.return_value = _busy(True)
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]   # green -- idle
+    state_cache: dict = {}
+    snooze_state: dict = {}
+
+    run_once(client, poller, CFG_SNOOZE, NOW, state_cache, dry_run=False, snooze_state=snooze_state)
+    t1 = NOW + timedelta(seconds=10)
+    run_once(client, poller, CFG_SNOOZE, t1, state_cache, dry_run=False, snooze_state=snooze_state)
+    client.get_busy.assert_not_called()   # confirmed never polled while idle
+
+    # A session is "already active" the whole time (per client.get_busy's
+    # mocked return value) -- unobserved so far. Now a failure appears.
+    poller.fetch_runs.return_value = [_run("failure")]
+    t2 = t1 + timedelta(seconds=10)
+    s3 = run_once(client, poller, CFG_SNOOZE, t2, state_cache, dry_run=False, snooze_state=snooze_state)
+    client.get_busy.assert_called_once()   # first real poll, triggered by the alert appearing
+    assert "FAIL" in s3
+    assert "fingerprint" not in snooze_state   # must NOT have pended
+    assert client.draw.call_args.kwargs["led_notification_color"] == "#FF0000FF"   # normal LED, not suppressed
+
+def test_snooze_mirror_alert_first_then_session_starts_while_polled_loop_level():
+    # Mirror case, full loop level: alert appears first (polling begins
+    # immediately, observes inactive), then a session starts while still
+    # polling -- a genuinely observed transition, so pending DOES start.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    state_cache: dict = {}
+    snooze_state: dict = {}
+
+    client.get_busy.return_value = _busy(False)
+    run_once(client, poller, CFG_SNOOZE, NOW, state_cache, dry_run=False, snooze_state=snooze_state)
+    assert "fingerprint" not in snooze_state
+
+    client.get_busy.return_value = _busy(True)
+    t1 = NOW + timedelta(seconds=10)
+    run_once(client, poller, CFG_SNOOZE, t1, state_cache, dry_run=False, snooze_state=snooze_state)
+    assert snooze_state.get("fingerprint") is not None   # pending established, as designed
+    assert client.draw.call_args.kwargs["led_notification_color"] is None   # LED suppressed while pending
+
 def test_snooze_get_busy_called_when_alert_showing():
     client = Mock(); client.draw.return_value = DrawResult.DRAWN
     client.get_busy.return_value = _busy(False)

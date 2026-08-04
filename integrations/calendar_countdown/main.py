@@ -13,12 +13,13 @@ from datetime import datetime, timezone
 
 from busybar.client import BusyBarClient, DrawResult
 from busybar.config import load_config
-from busybar.display import ambient_timeout
+from busybar.display import PRIORITY_AMBIENT, ambient_timeout
 
 from .logic import (ascii_safe, build_elements, select_active_event,
                     select_next_event, _minutes_left, select_priority,
-                    select_led, should_chirp, commit_chirped,
-                    next_sleep_seconds, CHIRP_STOCK_PATH)
+                    select_led, resolve_led_value, LED_OFF_ELEMENTS, LED_OFF_COLOR,
+                    should_chirp, commit_chirped,
+                    next_sleep_seconds, CHIRP_STOCK_PATH, check_threshold_ordering)
 
 APP = "calendar_countdown"
 HEARTBEAT_SECONDS = 600
@@ -32,10 +33,17 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
     across calls (main() passes one shared dict across loop iterations;
     tests calling run_once standalone can omit it), plus (v1.5.2) the
     next known event's start time (`next_start`, for the T-0 sleep-
-    shortening in main()'s loop) and the chirp edge-detection bookkeeping
-    (`seen_upcoming`/`chirped`, maintained by should_chirp/commit_chirped
-    -- see calendar_countdown.logic for the full escalation-ladder and
-    chirp design).
+    shortening in main()'s loop), the chirp edge-detection bookkeeping
+    (`seen_upcoming`/`chirped`, maintained by should_chirp/commit_chirped),
+    and `led_on` -- whether the LED is believed to currently be lit,
+    committed only after a confirmed successful send (see
+    resolve_led_value's docstring). This last one matters on EVERY path
+    that can draw or otherwise signal the device, including the "no
+    upcoming event" path below: an event that vanishes without ever
+    passing through `in_progress=True` (filtered out, or shorter than one
+    poll interval) must still resolve its LED to an explicit off, not
+    silently strand it lit. See calendar_countdown.logic for the full
+    escalation-ladder, LED, and chirp design.
 
     The upcoming and in-progress layouts use different element id sets
     (`time` vs `ends`) and the device's draw endpoint upserts by id rather
@@ -72,6 +80,23 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
 
     if event is None:
         if not dry_run:
+            # LED-off flush (v1.5.2): the event vanished (filtered out, or
+            # was shorter than one poll interval) without ever passing
+            # through the normal draw path below, which is the only other
+            # place that would otherwise send an explicit LED-off. There's
+            # nothing to draw, but if the LED is believed to still be lit
+            # from an earlier poll, it must still be explicitly turned off
+            # -- clear() alone can't carry the LED field (it's a bare
+            # DELETE, no body), so a minimal placeholder draw carries it
+            # instead. See LED_OFF_ELEMENTS/resolve_led_value's docstrings.
+            if state is not None and state.get("led_on"):
+                led_off_result = client.draw(APP, elements=LED_OFF_ELEMENTS,
+                                             priority=PRIORITY_AMBIENT,
+                                             led_notification_color=LED_OFF_COLOR)
+                if led_off_result == DrawResult.DRAWN:
+                    state["led_on"] = False
+                # else: leave led_on=True so the next poll retries the
+                # off-transition rather than assuming it landed.
             client.clear(APP)
         if state is not None:
             state["in_progress"] = None
@@ -117,7 +142,9 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
     elements = build_elements(event, now, c, timeout_s, in_progress)
     minutes_left = _minutes_left(event, now, in_progress)
     priority = select_priority(minutes_left, c["approach_minutes"], c["notice_minutes"], in_progress)
-    led = select_led(minutes_left, c["imminent_minutes"], in_progress)
+    led_should_be_on = select_led(minutes_left, c["imminent_minutes"], in_progress)
+    led_was_on = state.get("led_on", False) if state is not None else False
+    led = resolve_led_value(led_should_be_on, led_was_on)
     result = client.draw(APP, elements=elements, priority=priority, led_notification_color=led)
     if state is not None and result == DrawResult.DRAWN:
         # Only commit the transition once it actually lands on the device.
@@ -128,6 +155,10 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
         # otherwise let stale elements from the old layout persist
         # unbounded (no further poll would ever re-attempt the clear).
         state["in_progress"] = in_progress
+        # Same discipline for the LED: only believe it's in the intended
+        # state once this exact draw (carrying that exact led value) is
+        # confirmed to have landed.
+        state["led_on"] = led_should_be_on
     return f"drew {label} -> {result.value}"
 
 
@@ -168,6 +199,9 @@ def main() -> int:
         return 0
 
     cfg = load_config()
+    ordering_warning = check_threshold_ordering(cfg["calendar_countdown"])
+    if ordering_warning is not None:
+        log.warning(ordering_warning)
     client = BusyBarClient(host=cfg["device"]["host"])
     # Drop any stale elements from a previous process. This also protects a
     # restart onto this version against every id change made across the

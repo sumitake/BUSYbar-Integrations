@@ -207,7 +207,13 @@ def run_once(client, poller, cfg: dict, now: datetime,
             busy = client.get_busy() or {}
             busy_active = busy.get("type") not in (None, "NOT_STARTED")
         else:
-            busy_active = False
+            # None, not False -- "not polled this cycle," distinct from a
+            # confirmed-inactive observation. update_snooze only commits
+            # its session_was_active tracking when given a real bool; see
+            # its docstring for the exact bug a dummy False here caused
+            # (a false-positive auto-snooze for a session that predated
+            # the alert).
+            busy_active = None
         suppress_alert, suppress_led = update_snooze(
             alert_fingerprint, busy_active, now, snooze_minutes, snooze_state)
 

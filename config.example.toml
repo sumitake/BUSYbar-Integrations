@@ -19,7 +19,9 @@ auto_busy = false
 # climbs busybar/display.py's shared priority ladder so it can no longer be
 # silently buried, first by the overlay-tier CI badge/quota rotation, then
 # by a persistent CI failure/stuck alert. See calendar_countdown/README.md's
-# "Escalation ladder" section before tuning.
+# "Escalation ladder" section before tuning. ASSUMED ORDERING (logged as a
+# one-time startup warning if violated -- see check_threshold_ordering):
+# approach_minutes > notice_minutes > warn_minutes >= imminent_minutes.
 approach_minutes = 30        # inside this (outside notice_minutes): priority rises above the
                               # overlay tier (PRIORITY_AMBIENT_RAISED) -- normal palette, unchanged
 imminent_minutes = 1         # inside this (and not yet started): LED blinks on every draw

@@ -258,7 +258,9 @@ def _minutes_left(event: CalEvent, now: datetime, in_progress: bool) -> float:
 # busybar.display's docstrings for the full priority-tier contracts and
 # the eviction/409 interplay this creates with ci_status's own alert
 # (worked through in the spec doc's v1.5.2 section), and IMMINENT_LED_COLOR
-# below for the session-safe final-minute signal that rides alongside it.
+# below for the final-minute LED signal that rides alongside it -- ASSUMED
+# (not verified) to survive a session's panel-level eviction; see
+# busybar.display.PRIORITY_AMBIENT_URGENT's docstring for the caveat.
 #
 # Deliberately NOT elevated while in_progress: once a meeting has started
 # you already know about it (you're either in it or conspicuously not) --
@@ -267,6 +269,66 @@ def _minutes_left(event: CalEvent, now: datetime, in_progress: bool) -> float:
 # for an in-progress (or normal, un-approaching) event exactly as it did
 # before this feature existed.
 IMMINENT_LED_COLOR = "#E24B4AFF"
+
+LED_OFF_COLOR = "#00000000"
+# ^ Explicit LED-off value (zero alpha, matching this device's
+# #RRGGBBAA convention elsewhere -- e.g. RectangleElement's own
+# transparent-fill default). Whether OMITTING led_notification_color
+# entirely turns a previously-set LED off, or whether the LED is
+# "sticky" until explicitly changed, is NOT verifiable through this
+# API (no endpoint exposes current LED state, and the device's own
+# OpenAPI doc -- already shown wrong about priority arbitration
+# elsewhere in this codebase -- claims omission means "will not
+# blink," which isn't the same claim as "turns off a currently-lit
+# LED"). Sending this explicit off value on every on->off transition is
+# the hypothesis-agnostic safe choice: correct whether omission alone
+# would have worked or not, at the cost of one redundant field on the
+# rare poll where a transition actually happens. See resolve_led_value.
+LED_OFF_ELEMENTS = [{
+    "id": "led_off_flush", "type": "rectangle", "x": 0, "y": 0,
+    "width": 1, "height": 1, "fill": "solid", "fill_colors": ["#00000000"],
+    "border_width": 0, "timeout": 5,
+}]
+# ^ A minimal (1x1, fully transparent, 5s self-expiring) placeholder
+# element -- the draw endpoint's `elements` field requires at least one
+# entry (minItems: 1 in the device's own schema), so there is no way to
+# send a bare led_notification_color with no visible element at all.
+# Used only on the "no upcoming event" path (main.run_once), where
+# there is otherwise nothing to draw but the LED may still need an
+# explicit off transition -- invisible against any background, and
+# self-expires quickly regardless.
+
+
+def resolve_led_value(led_should_be_on: bool, led_was_on: bool) -> str | None:
+    """The actual `led_notification_color` to send THIS draw, combining
+    "should the LED be on right now" (select_led) with the caller's own
+    tracked previous-poll LED state. Returns `IMMINENT_LED_COLOR` while
+    the LED should be on; `LED_OFF_COLOR` (explicit, not just an omitted
+    field) on the exact poll where the LED transitions from on to off --
+    see LED_OFF_COLOR's own docstring for why omission alone isn't
+    trusted; `None` (omit the field) once already off and staying off,
+    since there's nothing to turn off and omitting is the more compact
+    request.
+
+    This is intentionally the ONLY place that decides between
+    IMMINENT_LED_COLOR / LED_OFF_COLOR / None -- main.run_once must call
+    this for every path that can draw or otherwise signal the device
+    (the normal event draw, AND the "no upcoming event" path via
+    LED_OFF_ELEMENTS), tracking `led_was_on` in its own caller-owned
+    state dict, committed only after a confirmed successful send (the
+    same DRAWN-gated-commit discipline used throughout this codebase) --
+    a vanishing event (an all-day filter, an event shorter than one poll
+    interval) must still resolve to an explicit off, not silently skip
+    the transition just because there's no "normal" draw to piggyback it
+    on.
+    """
+    if led_should_be_on:
+        return IMMINENT_LED_COLOR
+    if led_was_on:
+        return LED_OFF_COLOR
+    return None
+
+
 CHIRP_STOCK_PATH = "shared/calendar_event_starts.wav"
 # ^ A firmware-shipped stock sound (see BusyBarClient.play_audio), not a
 # generated/uploaded asset -- confirmed via a live on-device probe (POST
@@ -275,6 +337,52 @@ CHIRP_STOCK_PATH = "shared/calendar_event_starts.wav"
 # needed for the v1.5.2 chirp; see the spec doc's v1.5.2 section for the
 # probe transcript and why the naming ("calendar event starts") is an
 # exact semantic match for the T-0 chirp this feature fires.
+
+
+def check_threshold_ordering(cfg: dict) -> str | None:
+    """Sanity-checks the escalation ladder's ASSUMED ordering:
+    `approach_minutes > notice_minutes > warn_minutes >= imminent_minutes`.
+    Returns a warning message naming the first violated invariant (or
+    `None` if the config is sane) -- the caller (main()) should log this
+    ONCE at startup, not every poll.
+
+    A violated ordering doesn't crash anything -- select_priority and
+    select_led each evaluate their own thresholds independently and will
+    still produce SOME answer -- but the ladder's intended meaning
+    ("closer to the event = more urgent") breaks down in ways that are
+    easy to misconfigure by accident. Concretely: `select_priority` checks
+    `<= notice_minutes` before `<= approach_minutes`, so if
+    `approach_minutes <= notice_minutes`, the "approach" tier
+    (PRIORITY_AMBIENT_RAISED) becomes a dead branch that's never actually
+    reached -- anything inside `approach_minutes` is already inside
+    `notice_minutes` too and matches that check first. Similarly
+    `notice_minutes <= warn_minutes` would make the NOTICE/amber visual
+    state (`_state_for`) unreachable, and `warn_minutes < imminent_minutes`
+    would mean the LED's imminent window extends beyond the red WARNING
+    state that's supposed to contain it.
+    """
+    approach = cfg.get("approach_minutes")
+    notice = cfg.get("notice_minutes")
+    warn = cfg.get("warn_minutes")
+    imminent = cfg.get("imminent_minutes")
+    if None in (approach, notice, warn, imminent):
+        return None   # an old-style cfg dict missing v1.5.2 keys -- nothing to check
+    if approach <= notice:
+        return (f"[calendar_countdown] approach_minutes ({approach}) should be greater than "
+               f"notice_minutes ({notice}) -- the escalation ladder assumes approach_minutes > "
+               f"notice_minutes > warn_minutes >= imminent_minutes; as configured, the 'approach' "
+               f"priority tier (PRIORITY_AMBIENT_RAISED) may never actually be reached.")
+    if notice <= warn:
+        return (f"[calendar_countdown] notice_minutes ({notice}) should be greater than "
+               f"warn_minutes ({warn}) -- the escalation ladder assumes approach_minutes > "
+               f"notice_minutes > warn_minutes >= imminent_minutes; as configured, the NOTICE "
+               f"(amber) visual state may never actually be reached.")
+    if warn < imminent:
+        return (f"[calendar_countdown] warn_minutes ({warn}) should be >= imminent_minutes "
+               f"({imminent}) -- the escalation ladder assumes approach_minutes > notice_minutes > "
+               f"warn_minutes >= imminent_minutes; as configured, the LED's imminent window "
+               f"extends beyond the red WARNING state meant to contain it.")
+    return None
 
 
 def select_priority(minutes_left: float, approach_minutes: int, notice_minutes: int,
@@ -310,36 +418,54 @@ def select_priority(minutes_left: float, approach_minutes: int, notice_minutes: 
     return PRIORITY_AMBIENT
 
 
-def select_led(minutes_left: float, imminent_minutes: int, in_progress: bool) -> str | None:
-    """`led_notification_color` for this poll's draw, or `None`. Fires on
-    every draw from `imminent_minutes` before start until the event
-    actually starts -- a continuous blink through the final window, not a
-    one-shot -- and stops the instant `in_progress` is true (no LED once
-    the event has started; the LED's job is to announce the imminent
-    start, not to keep announcing an event already underway). Independent
-    of `select_priority`: the LED is a separate hardware channel from the
-    drawn elements' priority arbitration entirely, and per
-    PRIORITY_AMBIENT_URGENT's docstring is the one signal that still gets
-    through even when a BUSY/CUSTOM session (PRIORITY_SESSION, 90) owns
-    the whole panel.
+def select_led(minutes_left: float, imminent_minutes: int, in_progress: bool) -> bool:
+    """Whether the LED should be on RIGHT NOW, purely a function of the
+    current moment -- True on every poll from `imminent_minutes` before
+    start until the event actually starts (a continuous blink through the
+    final window, not a one-shot), False the instant `in_progress` is
+    true (no LED once the event has started; the LED's job is to announce
+    the imminent start, not to keep announcing an event already
+    underway). Independent of `select_priority`: the LED is a separate
+    hardware channel from the drawn elements' priority arbitration
+    entirely, and per PRIORITY_AMBIENT_URGENT's docstring is assumed to
+    still get through even when a BUSY/CUSTOM session (PRIORITY_SESSION,
+    90) owns the whole panel -- unverified beyond the request payload
+    itself; see that docstring's caveat.
+
+    Deliberately does NOT decide the actual `led_notification_color`
+    value to send -- that also depends on whether the LED was already on
+    last poll (see resolve_led_value), which this function has no
+    knowledge of and shouldn't need to: it answers "should it be on now,"
+    the caller (resolve_led_value, called from main.run_once) answers
+    "what do I need to SEND to make that true, given what was sent
+    before."
     """
-    if in_progress:
-        return None
-    if minutes_left <= imminent_minutes:
-        return IMMINENT_LED_COLOR
-    return None
+    return not in_progress and minutes_left <= imminent_minutes
+
+
+def _chirp_key(event: CalEvent) -> tuple[datetime, str]:
+    """The identity should_chirp/commit_chirped track an event by:
+    `(start, ascii-safe title)`, not `start` alone. Two distinct events
+    that happen to share the exact same start timestamp (all-day events
+    sharing midnight, or two calendars both firing something at the same
+    moment) would otherwise collide on a single set entry -- one event's
+    "seen upcoming" or "chirped" marker would incorrectly apply to the
+    other. `ascii_safe` matches the same sanitization already applied to
+    titles elsewhere in this module, so the key is stable regardless of
+    non-ASCII characters in the raw title."""
+    return (event.start, ascii_safe(event.title))
 
 
 def _prune_chirp_state(chirp_state: dict, now: datetime, max_age_hours: int = 24) -> None:
-    """Drops event-start timestamps older than `max_age_hours` from both
-    tracked sets, so a long-running process's chirp bookkeeping doesn't
-    grow without bound over weeks/months of uptime. Called on every
-    should_chirp check; cheap (a couple of set comprehensions over what
-    is in practice a small number of distinct events)."""
+    """Drops entries whose start timestamp is older than `max_age_hours`
+    from both tracked sets, so a long-running process's chirp bookkeeping
+    doesn't grow without bound over weeks/months of uptime. Called on
+    every should_chirp check; cheap (a couple of set comprehensions over
+    what is in practice a small number of distinct events)."""
     cutoff = now - timedelta(hours=max_age_hours)
     for key in ("seen_upcoming", "chirped"):
         if key in chirp_state:
-            chirp_state[key] = {s for s in chirp_state[key] if s >= cutoff}
+            chirp_state[key] = {k for k in chirp_state[key] if k[0] >= cutoff}
 
 
 def should_chirp(event: CalEvent, in_progress: bool, now: datetime,
@@ -347,19 +473,20 @@ def should_chirp(event: CalEvent, in_progress: bool, now: datetime,
     """True exactly on the poll where THIS PROCESS observes `event`
     transition from upcoming to started -- edge detection, not level
     detection. `chirp_state` is a caller-owned dict (same pattern as every
-    other cache in this codebase) tracking two sets: "seen_upcoming"
-    (event start timestamps this process has observed with
-    in_progress=False at some earlier poll) and "chirped" (event starts
-    already fired for). Every call records `event` into "seen_upcoming"
-    when it's not yet in progress, REGARDLESS of `chirp_enabled` -- so the
-    bookkeeping stays accurate even if chirp is toggled on mid-run. The
-    True/False decision itself only fires when: `chirp_enabled`,
-    `in_progress` is true THIS poll, `event.start` was previously seen
-    upcoming, and it hasn't already been chirped.
+    other cache in this codebase) tracking two sets keyed by
+    `_chirp_key(event)` (`(start, ascii-safe title)`, not `start` alone --
+    see that function's docstring for why): "seen_upcoming" (events this
+    process has observed with in_progress=False at some earlier poll) and
+    "chirped" (events already fired for). Every call records `event` into
+    "seen_upcoming" when it's not yet in progress, REGARDLESS of
+    `chirp_enabled` -- so the bookkeeping stays accurate even if chirp is
+    toggled on mid-run. The True/False decision itself only fires when:
+    `chirp_enabled`, `in_progress` is true THIS poll, `event`'s key was
+    previously seen upcoming, and it hasn't already been chirped.
 
     This is the mechanism behind two required behaviors: (1) a process
     that starts up mid-event (in_progress=True on the very first poll it
-    ever sees for that event) never added that event's start to
+    ever sees for that event) never added that event's key to
     "seen_upcoming", so the transition is never detected and no chirp
     fires for it -- restarting during an event's final minute, or any
     time after it started, does not produce a spurious chirp. (2) a
@@ -375,21 +502,21 @@ def should_chirp(event: CalEvent, in_progress: bool, now: datetime,
     display state).
     """
     _prune_chirp_state(chirp_state, now)
-    start = event.start
+    key = _chirp_key(event)
     if not in_progress:
-        chirp_state.setdefault("seen_upcoming", set()).add(start)
+        chirp_state.setdefault("seen_upcoming", set()).add(key)
         return False
     if not chirp_enabled:
         return False
     seen_upcoming = chirp_state.get("seen_upcoming", set())
     chirped = chirp_state.get("chirped", set())
-    return start in seen_upcoming and start not in chirped
+    return key in seen_upcoming and key not in chirped
 
 
 def commit_chirped(event: CalEvent, chirp_state: dict) -> None:
     """Marks `event` as chirped -- call only after confirming the actual
     `client.play_audio` call succeeded (see should_chirp's docstring)."""
-    chirp_state.setdefault("chirped", set()).add(event.start)
+    chirp_state.setdefault("chirped", set()).add(_chirp_key(event))
 
 
 def next_sleep_seconds(poll_seconds: float, seconds_until_start: float | None) -> float:

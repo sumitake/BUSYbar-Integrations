@@ -135,16 +135,24 @@ calendar_countdown.logic.select_priority) -- deliberately NOT while
 merely in_progress, since once a meeting has started you already know
 about it; the elevation exists to catch your attention BEFORE it starts.
 
-**The LED is the session-safe channel.** A BUSY/CUSTOM session at
+**The LED is ASSUMED to be the session-safe channel -- unverified,
+requires operator observation.** A BUSY/CUSTOM session at
 PRIORITY_SESSION (90) still outranks this tier for the *panel*, so an
 urgent-ambient draw's `elements` can be evicted the same way an alert's
-can. `led_notification_color`, however, is a separate hardware channel
-from the drawn elements/z-order arbitration entirely -- it is not
-subject to the same priority eviction, so it is the one signal that gets
-through even when a session owns the whole screen. Use it for anything
-that must be noticeable regardless of what else currently has the panel
-(calendar_countdown sets it during its final-minute LED window --
-`imminent_minutes` -- for exactly this reason).
+can. The device's own API schema describes `led_notification_color` as a
+separate field from the drawn elements, and probing what's actually
+checkable from this codebase (the 409 rejection response body, whether
+any status endpoint exposes current LED state) turned up nothing that
+either confirms or refutes whether it survives the same priority
+eviction that evicts the elements -- there is no LED-state-observable
+endpoint anywhere in the device's API, and this claim can only be
+settled by a human actually watching the physical LED during a live
+session test. Until that observation happens, treat "the LED gets
+through a session" as a design assumption this codebase acts on (see
+calendar_countdown, which sets the LED during its final-minute window --
+`imminent_minutes` -- specifically because a session might otherwise
+hide it), not a verified fact. See calendar_countdown's README for a
+short recipe to verify this on the actual hardware.
 """
 
 PRIORITY_SESSION = 90
