@@ -77,6 +77,7 @@ def main() -> int:
 
     cfg = load_config()
     client = BusyBarClient(host=cfg["device"]["host"])
+    client.clear(APP)  # drop any stale elements from a previous process (type collisions 400)
     fetch = lambda hours: eventkit.fetch_events(hours, cfg["calendar_countdown"]["calendars"])
 
     backoff = 5

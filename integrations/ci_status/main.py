@@ -60,6 +60,7 @@ def main() -> int:
         log.error(str(exc))
         return 1
     client = BusyBarClient(host=cfg["device"]["host"])
+    client.clear(APP)  # drop any stale elements from a previous process (type collisions 400)
 
     state_cache: dict[str, RepoState] = {}
     backoff = 5
