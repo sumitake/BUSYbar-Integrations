@@ -30,6 +30,7 @@ def test_draws_countdown_for_upcoming_event():
     kwargs = client.draw.call_args.kwargs
     assert kwargs["priority"] == 20
     by_id = {el["id"]: el for el in kwargs["elements"]}
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "time_card", "time", "divider", "cd_card", "countdown"}
     assert by_id["countdown"]["timestamp"] == str(int(make_event(23).start.timestamp()))
     assert by_id["title"]["text"] == "Standup"
     assert "drew" in summary
@@ -42,9 +43,10 @@ def test_draws_in_progress_event_targeting_active_over_upcoming():
     summary = run_once(client, lambda hours: [active, upcoming], CFG, NOW, dry_run=False)
     kwargs = client.draw.call_args.kwargs
     by_id = {el["id"]: el for el in kwargs["elements"]}
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "ends", "divider", "cd_card", "countdown"}
     assert by_id["title"]["text"] == "Active"
     assert by_id["countdown"]["timestamp"] == str(int(active.end.timestamp()))
-    assert "time" not in by_id
+    assert "time" not in by_id and "time_card" not in by_id
     assert "drew" in summary
 
 def test_clears_when_no_event():
@@ -59,3 +61,70 @@ def test_dry_run_never_touches_device():
     client.draw.assert_not_called()
     client.clear.assert_not_called()
     assert "DRY-RUN" in summary
+
+
+# --- state-transition clearing ------------------------------------------------
+#
+# The upcoming and in-progress layouts use different element id sets
+# (time_card+time vs ends) and the device's draw endpoint upserts by id
+# rather than replacing an app's whole element set (confirmed on-device: a
+# stale opaque time_card rendered behind the new "ends" text for ~30s after
+# a transition, until captured/fixed -- see display-v1.3-report.md). `state`
+# lets run_once clear only at the transition, not every poll.
+
+def test_no_clear_on_first_draw_with_fresh_state():
+    client = Mock()
+    client.draw.return_value = DrawResult.DRAWN
+    state = {}
+    run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
+    client.clear.assert_not_called()
+    assert state["in_progress"] is False
+
+def test_no_clear_across_polls_with_same_state():
+    client = Mock()
+    client.draw.return_value = DrawResult.DRAWN
+    state = {}
+    run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
+    run_once(client, lambda hours: [make_event(22)], CFG, NOW, dry_run=False, state=state)
+    client.clear.assert_not_called()
+
+def test_clears_on_upcoming_to_in_progress_transition():
+    client = Mock()
+    client.draw.return_value = DrawResult.DRAWN
+    state = {}
+    run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
+    active = make_event(-5, dur_min=30, title="Active")
+    run_once(client, lambda hours: [active], CFG, NOW, dry_run=False, state=state)
+    client.clear.assert_called_once_with("calendar_countdown")
+    assert state["in_progress"] is True
+
+def test_clears_on_in_progress_to_upcoming_transition():
+    client = Mock()
+    client.draw.return_value = DrawResult.DRAWN
+    state = {}
+    active = make_event(-5, dur_min=30, title="Active")
+    run_once(client, lambda hours: [active], CFG, NOW, dry_run=False, state=state)
+    run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
+    client.clear.assert_called_once_with("calendar_countdown")
+
+def test_no_transition_clear_when_state_omitted():
+    # Backward-compatible default: callers (and the other tests above) that
+    # don't pass state see the pre-fix behavior -- no extra clear calls.
+    client = Mock()
+    client.draw.return_value = DrawResult.DRAWN
+    run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False)
+    active = make_event(-5, dur_min=30, title="Active")
+    run_once(client, lambda hours: [active], CFG, NOW, dry_run=False)
+    client.clear.assert_not_called()
+
+def test_state_reset_after_no_event_clear():
+    client = Mock()
+    client.draw.return_value = DrawResult.DRAWN
+    state = {}
+    run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
+    run_once(client, lambda hours: [], CFG, NOW, dry_run=False, state=state)  # clears, resets state
+    assert state["in_progress"] is None
+    client.clear.reset_mock()
+    run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
+    # No stale elements remain after the "no event" clear -- no extra clear needed.
+    client.clear.assert_not_called()
