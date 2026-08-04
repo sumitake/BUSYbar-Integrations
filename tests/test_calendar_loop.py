@@ -356,6 +356,41 @@ def test_run_once_chirps_exactly_once_on_start_transition():
     run_once(client, lambda hours: [started], CFG, later + timedelta(seconds=10), dry_run=False, state=state)
     client.play_audio.assert_not_called()
 
+def test_run_once_chirp_logs_info_on_successful_play(caplog):
+    # v1.5.2.1 observability fix: a "successful" (True-returning) chirp
+    # attempt must leave a log trace -- the silent-.wav bug was doubly
+    # silent (no sound AND no log line) precisely because success wasn't
+    # logged at all, only failures were (in client.play_audio itself).
+    import logging
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    client.play_audio.return_value = True
+    state: dict = {}
+    upcoming = make_event(0.2)
+    run_once(client, lambda hours: [upcoming], CFG, NOW, dry_run=False, state=state)
+    started = CalEvent(upcoming.title, upcoming.start, upcoming.start + timedelta(minutes=30), False)
+    later = upcoming.start + timedelta(seconds=1)
+    with caplog.at_level(logging.INFO, logger="calendar_countdown"):
+        run_once(client, lambda hours: [started], CFG, later, dry_run=False, state=state)
+    matches = [rec.message for rec in caplog.records if "chirp played" in rec.message]
+    assert len(matches) == 1
+    assert CHIRP_STOCK_PATH in matches[0]
+    assert "True" in matches[0]
+
+def test_run_once_chirp_logs_info_on_failed_play(caplog):
+    import logging
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    client.play_audio.return_value = False
+    state: dict = {}
+    upcoming = make_event(0.2)
+    run_once(client, lambda hours: [upcoming], CFG, NOW, dry_run=False, state=state)
+    started = CalEvent(upcoming.title, upcoming.start, upcoming.start + timedelta(minutes=30), False)
+    later = upcoming.start + timedelta(seconds=1)
+    with caplog.at_level(logging.INFO, logger="calendar_countdown"):
+        run_once(client, lambda hours: [started], CFG, later, dry_run=False, state=state)
+    matches = [rec.message for rec in caplog.records if "chirp played" in rec.message]
+    assert len(matches) == 1
+    assert "False" in matches[0]
+
 def test_run_once_chirp_disabled_never_fires():
     client = Mock(); client.draw.return_value = DrawResult.DRAWN
     client.play_audio.return_value = True

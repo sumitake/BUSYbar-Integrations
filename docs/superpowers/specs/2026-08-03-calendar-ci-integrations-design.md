@@ -1379,3 +1379,84 @@ On-device verification, docs, and the report are covered in the
 implementation report for this round; see there for verbatim frame
 captures, the chirp's real playback timestamp, and the snooze end-to-end
 sequence against the live device.
+
+### Correction (`dev/claude/chirp-snd-fix` round): the chirp was silent — `.wav` vs `.snd`, and a deferred, swallowed 200
+
+**The "chirp's real playback timestamp" claim two paragraphs above was
+wrong.** `play_audio` returning `True` at `2026-08-04T06:54:16.622887Z`
+(quoted in this round's report) was real evidence a well-formed request
+reached the device and got a `200` back -- it was NOT evidence of audible
+playback, and in fact nothing was audible. This was caught by the
+operator's own ear-testing after deploy, then root-caused via device
+storage forensics, not by anything observable from this codebase or the
+device's documented API alone.
+
+**Root cause, confirmed both by the operator listening and by a live `GET
+/api/storage/list` of `/ext/apps_assets/shared/sounds` against the real
+device:**
+
+1. **The firmware build pipeline converts `.wav` SOURCE files to `.snd`
+   at packaging time.** The runtime filenames under
+   `/ext/apps_assets/shared/sounds/` are `calendar_event_starts.snd`,
+   `calendar_reminder_ends.snd`, `volume_change.snd` -- never `.wav`.
+   Neither the firmware source tree (which stores `.wav` sources) nor the
+   OpenAPI spec (which never mentions the conversion at all) reveals
+   this; the ONLY way to find the real runtime filename is a live storage
+   listing against the actual device, not a source-tree grep or a spec
+   read. This is the same category of "the documented/source-visible
+   description doesn't match runtime reality" as Finding 1 and Finding 2
+   in the "Probe findings" section above -- those two live in
+   `busybar/display.py`'s module docstring since they're display-priority
+   facts; this one (and #2 below) are audio-specific, so their
+   code-adjacent canonical copy is `BusyBarClient.play_audio`'s own
+   docstring in `src/busybar/client.py` instead.
+2. **`POST /api/audio/play` returns `200` BEFORE the actual file open.**
+   Playback is queued behind a short amp holdoff (confirmed ~100ms); an
+   open failure at holdoff-fire (e.g. because the filename doesn't exist
+   at runtime) is logged device-side only and otherwise swallowed --
+   nothing about the failure crosses back over the HTTP response. A
+   wrong `stock_path` is therefore indistinguishable from a correct one
+   at every software layer available to this codebase: the request is
+   well-formed, the response is `200`, `play_audio` returns `True`, and
+   the calling code (this project's own `should_chirp`/`commit_chirped`
+   logic) correctly commits the chirp as delivered -- with no sound at
+   all. This is a genuinely new class of firmware-doc gap for this
+   project: not "the doc's *description* of a rule is wrong" (Finding 1)
+   or "an *observable* transition is undocumented" (Finding 2), but "the
+   API's own success signal is emitted before the operation it describes
+   has actually been attempted," making software-only verification of
+   this endpoint structurally impossible.
+
+**Operator ear-test matrix (the evidence that actually resolved this):**
+
+| stock_path / asset | Audible? |
+|---|---|
+| `shared/calendar_event_starts.wav` (the original, wrong extension) | **No** |
+| An uploaded `.wav` asset (via `path`, not `stock_path`) | Yes |
+| `shared/calendar_event_starts.snd` (corrected) | Yes |
+
+The middle row is worth noting on its own: an *uploaded* `.wav` asset
+plays fine (the upload pipeline evidently doesn't need the same `.snd`
+conversion, or handles it transparently) -- the `.wav`-is-silent problem
+is specific to referencing a *stock* asset by its (wrong, pre-conversion)
+filename, not a general "this firmware can't play `.wav` audio" claim.
+
+**Fix:** `CHIRP_STOCK_PATH` corrected to
+`"shared/calendar_event_starts.snd"`. `BusyBarClient.play_audio`'s
+docstring now documents both the `.wav`→`.snd` runtime conversion and the
+deferred/swallowed-`200` caveat explicitly, with the operator instruction
+to verify any future stock filename against a live storage listing rather
+than the source tree or the OpenAPI spec. The chirp call site
+(`calendar_countdown/main.py`) now logs at `INFO` on *every* chirp
+attempt, success or failure (`"chirp played (%s) -> %s"`) -- the original
+bug was doubly silent (no sound AND no log line, since only failures were
+previously logged, in `play_audio` itself), which is why it took storage
+forensics rather than a log check to diagnose. A regression test pins
+`CHIRP_STOCK_PATH.endswith(".snd")` directly so a future edit can't
+silently reintroduce `.wav`.
+
+No further on-device round was performed for this fix specifically: the
+operator directly ear-verified the corrected `.snd` call as part of
+reporting the original bug, which is stronger evidence than a fresh
+scripted probe could add (a scripted probe can only confirm HTTP `200`
+again, exactly the signal already shown not to prove audibility).
