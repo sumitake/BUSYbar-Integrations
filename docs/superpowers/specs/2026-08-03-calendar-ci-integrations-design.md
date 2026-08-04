@@ -263,12 +263,18 @@ Added to `[calendar_countdown]`: `notice_minutes = 15`,
 
 ## 2026-08-03 — v1.3 "Color Horizon" display redesign
 
-**Status:** Implemented (branch `dev/claude/display-v1.3`).
+**Status:** Implemented (branch `dev/claude/display-v1.3.1`). **Corrected
+2026-08-03** after the first pass's production render came out mashed --
+see "Correction: font ink offset + native countdown replaced with text"
+below. The element table, state palette, and firmware-findings subsections
+in this entry describe the corrected (current) design; the original pass's
+`align="top_right"` native-countdown approach was live only briefly and is
+superseded.
 
 Replaces v1.1's "progress accent bar + title row" with a denser, full-panel
 card layout: a gradient background that itself signals urgency, a
 horizontal drain track under the title, and a two-card bottom row (a large
-digital-clock-style start time, or an "ENDS" label, alongside a native
+digital-clock-style start time, or an "ENDS" label, alongside a large
 countdown). Config keys, `logic.build_elements` signature, and
 `main.run_once`'s public contract (dry-run behavior, summary strings ending
 in the `DrawResult` value, priority 20, `timeout = 1.5 * poll_seconds`) are
@@ -297,19 +303,19 @@ always drawn.
 | id | type | geometry | notes |
 |---|---|---|---|
 | `bg` | rectangle | x0 y0 72×16 | `fill=gradient_v`, per-state colors, `border_width=0` |
-| `title` | text | x1 y0 w70, font `small` | `ascii_safe` title, per-state color; scrolls (`scroll_rate=2000`, 800ms start/repeat delay) only if it doesn't fit |
+| `title` | text | x1 **y=-2** w70, font `small` | `ascii_safe(title).upper()`, per-state color; scrolls (`scroll_rate=2000`, 800ms start/repeat delay) only if it doesn't fit; ink lands rows 0-4 (see ink-offset table below) |
 | `track` | rectangle | x0 y5 72×1 | fixed `#24193BFF` groove, solid, `border_width=0` |
 | `track_fill` | rectangle | x0 y5 w×1 | `w = round(72 * minutes_left / progress_window_minutes)` clamped `[1,72]`; `gradient_h` per-state (in-progress: solid `#24D6C5FF`, always full width -- no drain) |
 | `time_card` (upcoming only) | rectangle | x0 y6 34×10 r1 | fixed `#062238FF` solid |
-| `time` (upcoming only) | text | x1 y6, font `extra_large` | fixed `#8DDEFFFF`, local `HH:MM` of event start |
-| `ends` (in-progress only) | text | x3 y8, font `bold` | fixed `#8CFFF4FF`, literal `"ENDS"`, no card behind it |
+| `time` (upcoming only) | text | x1 **y=4**, font `extra_large` | fixed `#8DDEFFFF`, local `HH:MM` of event start; ink lands rows 6-15, exactly filling `time_card` |
+| `ends` (in-progress only) | text | x3 **y=6**, font `bold` | fixed `#8CFFF4FF`, literal `"ENDS"`, no card behind it; ink lands rows 8-14 |
 | `divider` | rectangle | x34 y6 2×10 | per-state solid, `border_width=0` |
 | `cd_card` | rectangle | x36 y6 36×10 r1 | per-state solid, `border_width=0` |
-| `countdown` | countdown (native) | y6, `align=top_right` x71 | `timestamp` = event start (upcoming) or end (in-progress) as string; `direction=time_left`, `show_hours=when_non_zero`; per-state digit color; right-anchored in `cd_card` via the firmware `align` field (see gotcha below) |
+| `cd_text` | text | **x38 y4**, font `extra_large` | per-state digit color; text from `_format_countdown(minutes_left)` (see below); ink lands rows 6-15, matching `cd_card`; no `align` field |
 
 ### State palette
 
-| State | Threshold | `bg` gradient | `title` | `track_fill` gradient | `divider` | `cd_card` | `countdown` digits |
+| State | Threshold | `bg` gradient | `title` | `track_fill` gradient | `divider` | `cd_card` | `cd_text` digits |
 |---|---|---|---|---|---|---|---|
 | `normal` | `minutes_left > notice_minutes` | `#160A2EFF` → `#03040DFF` | `#FFD166FF` | `#1ED6FFFF` → `#5CFFB1FF` | `#643B8FFF` | `#062A22FF` | `#6BFFD0FF` |
 | `notice` | `minutes_left <= notice_minutes` | `#291300FF` → `#070301FF` | `#FFE3A3FF` | `#FF9F1CFF` → `#FFE66DFF` | `#C37A0CFF` | `#3A2000FF` | `#FFC247FF` |
@@ -322,34 +328,102 @@ true), matching v1.1's `_urgency_color` boundary semantics. `in_progress` is
 orthogonal to the other three -- it overrides threshold evaluation entirely
 rather than being reached through it.
 
+### `cd_text` countdown format (`_format_countdown`)
+
+Minutes-granular, floored (not rounded): `<M>m` under 60 minutes (e.g.
+`"54m"`), `<H>h<MM>m` at/above 1 hour (e.g. `"1h05m"`, minutes zero-padded),
+and `<H>h` only (minutes dropped) at 10+ hours (e.g. `"12h"`). The 10-hour
+cutover is required, not cosmetic: the full `<H>h<MM>m` form at 2-digit
+hours is 6 glyphs (e.g. `"12h00m"`), measured on-device at ~37px in the
+`extra_large` font -- 1px wider than the ~34px available between `cd_text`'s
+x and the panel's right edge, so it would clip. Below 10 hours the full form
+is at most 5 glyphs (`"9h59m"` ≈ 31px), which fits comfortably.
+
 ### Firmware findings from on-device verification
 
-- **`align="top_right"` is reliable on firmware 1.1.1.** The countdown
-  element's `align` field (part of the shared `DisplayElement` schema, not
-  documented against `CountdownElement` specifically) right-anchors the
-  element's bounding box at the given `(x, y)`. Verified by drawing both a
-  7-character (`H:MM:SS`) and a 4-character (`M:SS`) countdown with
-  `align="top_right", x=71, y=6`: the rendered right edge stayed at the same
-  column (x≈69) in both captures while the left edge moved, confirming true
-  right-anchoring rather than a fixed left position. Used in place of the
-  spec's fixed-`x=40` fallback; `COUNTDOWN_FALLBACK_X` remains defined in
-  `logic.py` (unused) documenting the approved fallback if a future firmware
-  regresses this.
 - **`RectangleElement`'s default 1px white border** (same v1.1 gotcha)
   applies to every rectangle in this layout -- `bg`, `track`, `track_fill`,
   `time_card`, `divider`, and `cd_card` all set `border_width=0` explicitly.
-- **New: the draw endpoint upserts elements by id within an
-  `application_name`; it does not replace that app's whole element set.**
-  Found by drawing the upcoming layout (ids include `time_card`+`time`),
-  then drawing the in-progress layout (ids include `ends` instead) without
-  an explicit clear in between: the previous draw's opaque `time_card` and
-  `time` digits remained rendered, visible behind the new `ends` text, until
-  their own `timeout` expired. `clearDisplay` (`DELETE
+- **The draw endpoint upserts elements by id within an `application_name`;
+  it does not replace that app's whole element set.** Found by drawing the
+  upcoming layout (ids include `time_card`+`time`), then drawing the
+  in-progress layout (ids include `ends` instead) without an explicit clear
+  in between: the previous draw's opaque `time_card` and `time` digits
+  remained rendered, visible behind the new `ends` text, until their own
+  `timeout` expired. `clearDisplay` (`DELETE
   /api/display/draw?application_name=...`) does fully remove an app's
   elements -- confirmed by clearing and observing the panel fall through to
   whatever lower-priority app was already drawing underneath. Fixed in
   `main.run_once` via an optional `state` dict that remembers the previous
   `in_progress` value across polls and calls `client.clear(APP)` only at the
   upcoming ⟷ in-progress transition (not on every poll, which would flicker
-  the display). See `tests/test_calendar_loop.py` state-transition tests and
-  the implementation report for the before/after captures.
+  the display). **Corroborated by a second, narrower instance of the same
+  upsert quirk found during the v1.3.1 correction pass**: redrawing
+  `track_fill` under the *same* id but with a shorter `fill_colors` array
+  (2-color `gradient_h` → 1-color `solid`, exactly the shape change at the
+  upcoming ⟷ in-progress boundary) without a clear left the second gradient
+  stop's color bleeding through at the old array index, even though `fill`
+  itself and `fill_colors[0]` updated correctly. A fresh `clear()` before
+  the draw eliminated it. The existing `state`-gated transition clear
+  already covers this case (it fires at exactly this boundary), so no
+  additional code change was needed -- confirmed by reproducing the artifact
+  with a raw sequential draw (no clear) and then confirming it disappears
+  with a clear inserted, matching what `main.run_once` actually does in
+  production.
+
+### Correction: font ink offset + native countdown replaced with text
+
+The first v1.3 pass shipped and immediately mashed the live render: the
+title collided with the drain track, and `ends` clipped at the panel's
+bottom edge. Root-caused via fresh live-frame captures and fresh-id
+firmware probes:
+
+1. **Every font renders its ink ~2px below the element's `y`.** Confirmed
+   uniformly across the `small`, `extra_large`, and `bold` fonts used in
+   this layout (also independently corroborated by the firmware's own font
+   registry: `small`→`FONT_BUSY_REGULAR_5` (5px), `extra_large`→
+   `FONT_BUSY_BOLD_10` (10px bold), `bold`→`FONT_BUSY_BOLD_7` (7px) --
+   ink-row heights measured on-device match these pixel heights exactly).
+   The `y` values in the element table above are already offset-corrected
+   so ink lands where the geometry implies:
+
+   | Element | Font | Requested `y` | Ink rows | Height |
+   |---|---|---|---|---|
+   | `title` | `small` (5px) | `-2` | 0-4 | 5px |
+   | `time` / `cd_text` | `extra_large` (10px bold) | `4` | 6-15 | 10px |
+   | `ends` | `bold` (7px) | `6` | 8-14 | 7px |
+
+2. **The native `countdown` element's digits render only 5px tall**, in
+   both `MM:SS` and `H:MM:SS` modes -- confirmed with fresh-id on-device
+   probes. The original pass's "10px" figure was a stale controller
+   measurement corrupted by the firmware's id-reuse-type-change quirk (an
+   id whose element `type` changes between draws, `countdown`→something
+   else, can serve stale pixel data from the previous type). Since large
+   numerals are the operator's core requirement, the native `countdown`
+   element is unusable here regardless of the ink-offset fix. Replaced with
+   a plain `text` element (`cd_text`, `extra_large` font, 10px) formatted
+   each poll by `_format_countdown` (above) -- this also removes the
+   `align="top_right"` right-anchoring used in the first pass entirely
+   (`align` re-anchors screen-relative, not card-relative, and was
+   implicated in the mash), in favor of a fixed left position (`x=38`)
+   within `cd_card`.
+3. **Title is now rendered uppercase** (`.upper()` after `ascii_safe`),
+   which kills descenders (g, y, p, j, q) -- descenders are exactly what
+   pushed the title's ink into the track row before the offset fix, so
+   uppercasing gives extra headroom against a repeat.
+4. **id hygiene:** the countdown element was renamed from `countdown` to
+   `cd_text` specifically because its `type` changed (`countdown`→`text`);
+   reusing the old id across a type change is the same quirk that corrupted
+   the "10px" measurement in finding 2. `main()`'s startup `client.clear(APP)`
+   additionally protects a process restart against any lingering
+   `countdown`-typed element left by an older deploy.
+
+**Verification for this correction round** used a programmatic overlap
+check (not just visual inspection) against live frame captures for all four
+states, with the title `"Gym pyjama day"` (uppercases to `"GYM PYJAMA DAY"`,
+deliberately chosen for descenders + length): for each state, scan the
+captured frame for pixels matching each text element's exact color and
+assert the rows where that color appears fall entirely within the
+element's expected row band (`title` ⊆ rows 0-4, `time`/`ends`/`cd_text` ⊆
+rows 6-15, no element's ink row set includes row 5, the track). See the
+implementation report for the verbatim check output and captures.

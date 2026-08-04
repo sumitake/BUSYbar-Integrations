@@ -2,13 +2,13 @@
 
 ## What It Does
 
-This integration polls your macOS calendar for upcoming events and displays a live countdown card on the busybar device: a full-panel gradient background that itself signals urgency, a title row, a horizontal drain track, a large start-time (or "ENDS") card, and a native on-device countdown timer that ticks every second between polls.
+This integration polls your macOS calendar for upcoming events and displays a live countdown card on the busybar device: a full-panel gradient background that itself signals urgency, an uppercase title row, a horizontal drain track, a large start-time (or "ENDS") card, and a large countdown re-rendered each poll.
 
 - **Color Horizon background** — the whole panel is a top-to-bottom gradient whose colors shift with urgency: deep violet when the event is far off, warm orange approaching `notice_minutes`, red approaching `warn_minutes`, and teal while the event is in progress. Urgency reads at a glance before you even look at the countdown.
-- **Title row** — the event title in a small font across the top. Long titles scroll; short ones sit static.
+- **Title row** — the event title, uppercased, in a small font across the top. Long titles scroll; short ones sit static.
 - **Drain track** — a thin horizontal bar under the title fills proportionally to time remaining within `progress_window_minutes` (default 60) and shrinks toward empty as the start time arrives. An in-progress event shows it full-width and steady instead (no drain — the relevant countdown is now "time until it ends").
 - **Time / Ends card** — a large `HH:MM` local start time on a rounded card for an upcoming event, or a bold "ENDS" label once the event has begun.
-- **Countdown card** — a native device countdown, right-anchored in its own rounded card: to the event start while upcoming, or to its end once in progress, so the display keeps ticking without waiting on the next poll.
+- **Countdown card** — a large minutes-granular countdown in its own rounded card: `"54m"` under an hour, `"1h05m"` at/above an hour, `"12h"` (hour-only) at 10+ hours to avoid overflowing the card. Counts to the event start while upcoming, or to its end once in progress; re-rendered each poll rather than ticking natively on-device, so it updates on the same cadence as the rest of the display (`poll_seconds`).
 - **Four states** — `normal`, `notice` (within `notice_minutes` of start), `warning` (within `warn_minutes` of start), and `in_progress`, each with its own background gradient, title color, drain-track gradient, divider color, countdown-card color, and digit color. See the design spec (`docs/superpowers/specs/2026-08-03-calendar-ci-integrations-design.md`) for the full palette table.
 
 The integration looks ahead 12 hours by default and draws at priority 20 on the display. If an active BUSY session exists on the device, the calendar event display is suppressed in favor of the busy state (priority 90).
