@@ -17,8 +17,9 @@ from busybar.display import OVERLAY_DWELL_SECONDS, overlay_gap_elapsed
 
 from .logic import (
     RepoState, RunningInfo, QuotaInfo,
-    build_ci_payload, build_overlay_payload, evaluate_runs,
+    build_ci_payload, build_overlay_payload, compute_alert_fingerprint, evaluate_runs,
     overlay_frame_sequence, parse_rate_limit, resolve_repo_list, select_running_run,
+    update_snooze,
 )
 
 APP = "ci_status"
@@ -87,7 +88,8 @@ def run_once(client, poller, cfg: dict, now: datetime,
              running_cache: dict[str, list[dict]] | None = None,
              overlay_state: dict | None = None,
              quota_cache: dict | None = None,
-             repo_cache: dict | None = None) -> str:
+             repo_cache: dict | None = None,
+             snooze_state: dict | None = None) -> str:
     """`running_cache`, `overlay_state`, `quota_cache`, and `repo_cache`,
     when passed, are caller-owned dicts this function mutates in place
     (mirroring `state_cache`'s existing pattern) so `main()` can hold one
@@ -148,6 +150,14 @@ def run_once(client, poller, cfg: dict, now: datetime,
     prematurely was the root cause of a real bug where the clear-gate saw
     "no shape on record" and wrongly concluded no clear was needed on the
     next transition.
+
+    Alert snooze (v1.5.2, `snooze_state`): omitting it (the default) skips
+    the snooze subsystem entirely -- every poll behaves exactly as if
+    nothing were ever snoozed. When given, see
+    `ci_status.logic.update_snooze`'s docstring for the full state
+    machine; `client.get_busy()` is polled only while there's something
+    to track (an alert currently showing, or an existing pending/timed
+    snooze), never on a fully idle poll.
     """
     c = cfg["ci_status"]
     timeout_s = int(c["poll_seconds"] * 1.5)
@@ -181,6 +191,34 @@ def run_once(client, poller, cfg: dict, now: datetime,
     states = list(state_cache.values())
     has_alert = any(s.failing or s.stuck for s in states)
 
+    # Alert snooze via the device's native start button (v1.5.2) -- see
+    # ci_status.logic.update_snooze's docstring for the full state
+    # machine. get_busy() is polled only while there's something to
+    # track (an alert showing, or an existing pending/timed snooze),
+    # never on a fully idle poll, to keep idle cycles lean.
+    suppress_alert = False
+    suppress_led = False
+    if snooze_state is not None:
+        snooze_minutes = c.get("snooze_minutes", 0)
+        alert_fingerprint = compute_alert_fingerprint(states)
+        should_poll_busy = not dry_run and snooze_minutes > 0 and (
+            bool(alert_fingerprint) or bool(snooze_state.get("fingerprint")))
+        if should_poll_busy:
+            busy = client.get_busy() or {}
+            busy_active = busy.get("type") not in (None, "NOT_STARTED")
+        else:
+            busy_active = False
+        suppress_alert, suppress_led = update_snooze(
+            alert_fingerprint, busy_active, now, snooze_minutes, snooze_state)
+
+    # While snoozed, ci_status behaves as if nothing is failing/stuck at
+    # all for every OTHER precedence purpose too -- "running/quota
+    # rotation and green behavior unaffected" is the explicit design
+    # intent, not just the alert badge's own rendering (build_ci_payload,
+    # below, gets the same suppress_alert). The overlay rotation's own
+    # "an alert takes precedence" check needs the identical view.
+    effective_has_alert = has_alert and not suppress_alert
+
     overlay_payload = None
     frame_index = 0
     stay_silent = False
@@ -196,7 +234,7 @@ def run_once(client, poller, cfg: dict, now: datetime,
                 running_cache[repo] = running_runs
         selected = select_running_run(running_cache)
 
-        if selected is None or has_alert:
+        if selected is None or effective_has_alert:
             # Nothing running, or an alert takes precedence this poll --
             # reset only the ROTATION bookkeeping, so the next run to start
             # always begins at the CI badge. Deliberately do NOT touch
@@ -239,7 +277,8 @@ def run_once(client, poller, cfg: dict, now: datetime,
     if frame_data_unavailable:
         return "overlay frame data unavailable this cycle; skipping (no draw, no clear)"
 
-    payload = build_ci_payload(states, c["show_green"], timeout_s, overlay=overlay_payload)
+    payload = build_ci_payload(states, c["show_green"], timeout_s, overlay=overlay_payload,
+                               suppress_alert=suppress_alert, suppress_led=suppress_led)
     if dry_run:
         return f"DRY-RUN payload: {payload!r}"
     if payload is None:
@@ -329,12 +368,13 @@ def main() -> int:
     overlay_state: dict = {}
     quota_cache: dict = {}
     repo_cache: dict = {}
+    snooze_state: dict = {}
     backoff = 5
     while True:
         summary = run_once(client, poller, cfg, datetime.now(timezone.utc),
                            state_cache, args.dry_run, running_cache=running_cache,
                            overlay_state=overlay_state, quota_cache=quota_cache,
-                           repo_cache=repo_cache)
+                           repo_cache=repo_cache, snooze_state=snooze_state)
         log.info(summary)
         if args.once:
             return 0

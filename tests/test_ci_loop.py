@@ -595,3 +595,234 @@ def test_config_requires_repos_ok_when_watch_account_repos_key_absent():
     assert config_requires_repos(cfg) is None
     cfg_empty = {"ci_status": {"repos": []}}
     assert config_requires_repos(cfg_empty) is not None
+
+
+# --- v1.5.2: REJECTED handling during calendar priority elevation ---------------
+#
+# calendar_countdown can now draw at PRIORITY_AMBIENT_RAISED (25, inside its
+# approach window) or PRIORITY_AMBIENT_URGENT (65, inside its notice/warn
+# window and beyond PRIORITY_ALERT), evicting ci_status's own elements.
+# ci_status's own next redraw attempt at its own priority then gets a 409
+# (DrawResult.REJECTED) while the calendar holds the higher tier -- expected
+# and silent per busybar.client's own DrawResult.REJECTED docstring. These
+# tests confirm ci_status's run_once tolerates that cleanly: no crash, no
+# state/shape committed on a REJECTED draw, and a full recovery once the
+# calendar drops back down and the next draw actually lands.
+
+def test_alert_rejected_during_calendar_elevation_does_not_commit_then_recovers():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    overlay_state: dict = {}
+
+    # Poll 1: calendar is elevated (PRIORITY_AMBIENT_URGENT=65 > alert's 60)
+    # -- the alert draw is rejected.
+    client.draw.return_value = DrawResult.REJECTED
+    summary1 = run_once(client, poller, CFG, NOW, {}, dry_run=False, overlay_state=overlay_state)
+    assert "rejected" in summary1
+    assert "last_shape" not in overlay_state   # nothing committed on a rejected draw
+    assert client.clear.call_count == 0        # no clear attempted for a first-ever draw attempt
+
+    # Poll 2: still elevated -- same shape, still rejected. Must not crash,
+    # must not attempt a clear (no shape change on record to clear from).
+    later = NOW + timedelta(seconds=10)
+    summary2 = run_once(client, poller, CFG, later, {}, dry_run=False, overlay_state=overlay_state)
+    assert "rejected" in summary2
+    assert "last_shape" not in overlay_state
+    assert client.clear.call_count == 0
+
+    # Poll 3: calendar has dropped back down -- the alert draw finally lands.
+    client.draw.return_value = DrawResult.DRAWN
+    later2 = later + timedelta(seconds=10)
+    summary3 = run_once(client, poller, CFG, later2, {}, dry_run=False, overlay_state=overlay_state)
+    assert "drawn" in summary3
+    assert overlay_state["last_shape"] == frozenset({"bg", "ci"})
+
+def test_overlay_dwell_rejected_during_calendar_elevation_resumes_after():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    poller.fetch_running_runs.return_value = [_running_run()]
+    poller.fetch_median_eta.return_value = None
+    overlay_state: dict = {}
+
+    # Poll 1: calendar is in its approach window (PRIORITY_AMBIENT_RAISED=25
+    # > overlay's 21) -- the running-badge dwell draw is rejected.
+    client.draw.return_value = DrawResult.REJECTED
+    summary1 = run_once(client, poller, CFG_RUNNING, NOW, {}, dry_run=False,
+                        running_cache={}, overlay_state=overlay_state)
+    assert "rejected" in summary1
+    assert "last_dwell_end" not in overlay_state   # dwell never actually started
+    assert "last_shape" not in overlay_state
+
+    # Poll 2: calendar has dropped back down -- the SAME dwell slot (never
+    # consumed, since the rejected attempt didn't commit) draws successfully.
+    # This is the "no crash, rotation resumes after" requirement -- an
+    # immediate retry lands, not a wait for a phantom dwell that never
+    # actually rendered anything.
+    client.draw.return_value = DrawResult.DRAWN
+    soon_after = NOW + timedelta(seconds=1)
+    summary2 = run_once(client, poller, CFG_RUNNING, soon_after, {}, dry_run=False,
+                        running_cache={}, overlay_state=overlay_state)
+    assert "drawn" in summary2
+    assert overlay_state.get("last_dwell_end") is not None
+    assert overlay_state["last_shape"] == frozenset({"bg", "title", "track", "track_fill", "eta"})
+    assert client.draw.call_count == 2   # both attempts drew (1st rejected, 2nd landed) -- no crash anywhere
+
+
+# --- alert snooze via the device's native start button (v1.5.2) -----------------
+
+CFG_SNOOZE = {"ci_status": {**CFG["ci_status"], "snooze_minutes": 30}}
+
+def _busy(active: bool) -> dict:
+    return {"type": "SIMPLE" if active else "NOT_STARTED"}
+
+def test_snooze_get_busy_not_called_when_idle():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]   # all green -- no alert
+    snooze_state: dict = {}
+    run_once(client, poller, CFG_SNOOZE, NOW, {}, dry_run=False, snooze_state=snooze_state)
+    client.get_busy.assert_not_called()
+
+def test_snooze_get_busy_called_when_alert_showing():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    client.get_busy.return_value = _busy(False)
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    snooze_state: dict = {}
+    run_once(client, poller, CFG_SNOOZE, NOW, {}, dry_run=False, snooze_state=snooze_state)
+    client.get_busy.assert_called_once()
+
+def test_snooze_get_busy_skipped_when_snooze_minutes_zero():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    snooze_state: dict = {}
+    run_once(client, poller, CFG, NOW, {}, dry_run=False, snooze_state=snooze_state)   # CFG has no snooze_minutes -> 0
+    client.get_busy.assert_not_called()
+
+def test_snooze_full_state_machine_end_to_end_through_run_once():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    snooze_state: dict = {}
+    state_cache: dict = {}
+
+    # Poll 1: alert showing, no session yet -- observe inactive.
+    client.get_busy.return_value = _busy(False)
+    s1 = run_once(client, poller, CFG_SNOOZE, NOW, state_cache, dry_run=False, snooze_state=snooze_state)
+    assert client.draw.call_args.kwargs["led_notification_color"] == "#FF0000FF"
+    assert "FAIL" in s1
+
+    # Poll 2: session starts -- pending. Draw still proceeds (elements as
+    # normal) but LED must be suppressed now.
+    client.get_busy.return_value = _busy(True)
+    t1 = NOW + timedelta(seconds=10)
+    run_once(client, poller, CFG_SNOOZE, t1, state_cache, dry_run=False, snooze_state=snooze_state)
+    assert client.draw.call_args.kwargs["led_notification_color"] is None
+    assert "FAIL" in client.draw.call_args.args[1][1]["text"]   # still the real alert badge
+
+    # Poll 3: session ends -- timed snooze begins. Alert suppressed entirely
+    # (falls through to "all green; cleared" since show_green is False and
+    # no overlay).
+    client.get_busy.return_value = _busy(False)
+    t2 = t1 + timedelta(minutes=2)
+    s3 = run_once(client, poller, CFG_SNOOZE, t2, state_cache, dry_run=False, snooze_state=snooze_state)
+    assert "cleared" in s3
+
+    # Poll 4: still within the 30-minute snooze window, same fingerprint --
+    # stays suppressed.
+    t3 = t2 + timedelta(minutes=10)
+    s4 = run_once(client, poller, CFG_SNOOZE, t3, state_cache, dry_run=False, snooze_state=snooze_state)
+    assert "cleared" in s4
+
+    # Poll 5: snooze expired -- alert resumes (still the same failure).
+    t4 = t2 + timedelta(minutes=31)
+    client.draw.reset_mock()
+    s5 = run_once(client, poller, CFG_SNOOZE, t4, state_cache, dry_run=False, snooze_state=snooze_state)
+    assert "FAIL" in s5
+    assert client.draw.call_args.kwargs["led_notification_color"] == "#FF0000FF"
+
+def test_snooze_fingerprint_change_realerts_during_timed_window():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    state_cache: dict = {}
+    snooze_state: dict = {}
+
+    poller.fetch_runs.return_value = [_run("failure")]
+    client.get_busy.return_value = _busy(False)
+    run_once(client, poller, CFG_SNOOZE, NOW, state_cache, dry_run=False, snooze_state=snooze_state)
+    client.get_busy.return_value = _busy(True)
+    t1 = NOW + timedelta(seconds=10)
+    run_once(client, poller, CFG_SNOOZE, t1, state_cache, dry_run=False, snooze_state=snooze_state)
+    client.get_busy.return_value = _busy(False)
+    t2 = t1 + timedelta(minutes=2)
+    run_once(client, poller, CFG_SNOOZE, t2, state_cache, dry_run=False, snooze_state=snooze_state)
+    assert "fingerprint" in snooze_state   # timed snooze now active for "o/r:tests"
+
+    # A DIFFERENT workflow starts failing while still within the timed
+    # snooze window -- must alert immediately, not stay suppressed.
+    def different_failure(repo):
+        return [{"workflow_id": 2, "name": "lint", "status": "completed",
+                 "conclusion": "failure", "created_at": "2026-08-03T13:30:00Z"}]
+    poller.fetch_runs.side_effect = different_failure
+    t3 = t2 + timedelta(minutes=5)
+    s = run_once(client, poller, CFG_SNOOZE, t3, state_cache, dry_run=False, snooze_state=snooze_state)
+    assert "FAIL" in s
+    assert "lint" in s
+
+def test_snooze_running_and_green_behavior_unaffected_while_suppressed():
+    # While an alert is timed-snoozed, the overlay (running badge)
+    # rotation and quiet-green precedence must behave exactly as if
+    # nothing were failing at all.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    poller.fetch_running_runs.return_value = [_running_run()]
+    poller.fetch_median_eta.return_value = None
+    state_cache: dict = {}
+    snooze_state: dict = {}
+    running_cache: dict = {}
+    overlay_state: dict = {}
+    cfg = {"ci_status": {**CFG_RUNNING["ci_status"], "snooze_minutes": 30}}
+
+    client.get_busy.return_value = _busy(False)
+    run_once(client, poller, cfg, NOW, state_cache, dry_run=False,
+            running_cache=running_cache, overlay_state=overlay_state, snooze_state=snooze_state)
+    client.get_busy.return_value = _busy(True)
+    t1 = NOW + timedelta(seconds=10)
+    run_once(client, poller, cfg, t1, state_cache, dry_run=False,
+            running_cache=running_cache, overlay_state=overlay_state, snooze_state=snooze_state)
+    client.get_busy.return_value = _busy(False)
+    t2 = t1 + timedelta(minutes=2)
+    run_once(client, poller, cfg, t2, state_cache, dry_run=False,
+            running_cache=running_cache, overlay_state=overlay_state, snooze_state=snooze_state)
+
+    # Now timed-snoozed. Poll again after the overlay dwell gap: the
+    # running badge should draw normally (not suppressed by the snoozed
+    # alert) since a run is still active.
+    t3 = t2 + timedelta(seconds=2 * OVERLAY_DWELL_SECONDS + 1)
+    s = run_once(client, poller, cfg, t3, state_cache, dry_run=False,
+                running_cache=running_cache, overlay_state=overlay_state, snooze_state=snooze_state)
+    by_id = {e["id"]: e for e in client.draw.call_args.args[1]}
+    assert "eta" in by_id   # the running badge shape, not the alert's {bg, ci}
+    assert "drawn" in s
+
+def test_snooze_state_omitted_is_fully_backward_compatible():
+    # Omitting snooze_state entirely (the default) must behave exactly as
+    # before this feature existed -- no get_busy call, no suppression.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    run_once(client, poller, CFG_SNOOZE, NOW, {}, dry_run=False)
+    client.get_busy.assert_not_called()
+    assert client.draw.call_args.kwargs["led_notification_color"] == "#FF0000FF"
+
+def test_snooze_dry_run_never_calls_get_busy():
+    client = Mock()
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    snooze_state: dict = {}
+    run_once(client, poller, CFG_SNOOZE, NOW, {}, dry_run=True, snooze_state=snooze_state)
+    client.get_busy.assert_not_called()

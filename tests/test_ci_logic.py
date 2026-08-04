@@ -12,6 +12,7 @@ from ci_status.logic import (
     _format_eta_text, _progress_width, _build_running_title,
     parse_rate_limit, _quota_headroom, _quota_used_width,
     resolve_repo_list, _eta_label, RUNNING_NUMERAL_X, RUNNING_LABEL_GAP_PX,
+    compute_alert_fingerprint, update_snooze,
 )
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS, PRIORITY_ALERT
 from calendar_countdown.logic import _text_width_px
@@ -609,3 +610,147 @@ def test_eta_label_falls_back_to_left_end_to_end_through_build_overlay_payload()
     by_id = _by_id(payload["elements"])
     assert by_id["eta"]["text"] == "~1h00m"
     assert by_id["eta_label"]["text"] == "left"
+
+
+# --- alert snooze via the device's native start button (v1.5.2) -----------------
+
+def test_compute_alert_fingerprint_empty_when_all_green():
+    assert compute_alert_fingerprint([RepoState("o/r", [], [])]) == frozenset()
+
+def test_compute_alert_fingerprint_covers_failing_and_stuck():
+    states = [RepoState("o/r", ["tests"], ["lint"])]
+    fp = compute_alert_fingerprint(states)
+    assert fp == frozenset({("o/r", "tests", "failing"), ("o/r", "lint", "stuck")})
+
+def test_compute_alert_fingerprint_category_change_is_a_different_fingerprint():
+    failing_fp = compute_alert_fingerprint([RepoState("o/r", ["tests"], [])])
+    stuck_fp = compute_alert_fingerprint([RepoState("o/r", [], ["tests"])])
+    assert failing_fp != stuck_fp
+
+def test_compute_alert_fingerprint_multi_repo():
+    states = [RepoState("o/a", ["tests"], []), RepoState("o/b", ["build"], [])]
+    fp = compute_alert_fingerprint(states)
+    assert fp == frozenset({("o/a", "tests", "failing"), ("o/b", "build", "failing")})
+
+
+# --- update_snooze: the full state machine ---------------------------------------
+
+FP_A = frozenset({("o/r", "tests", "failing")})
+FP_B = frozenset({("o/r", "build", "failing")})   # a different fingerprint
+EMPTY_FP = frozenset()
+
+def test_update_snooze_disabled_always_passthrough():
+    state = {}
+    assert update_snooze(FP_A, True, NOW, 0, state) == (False, False)
+    assert state.get("fingerprint") is None
+
+def test_update_snooze_no_alert_no_session_is_a_noop():
+    state = {}
+    assert update_snooze(EMPTY_FP, False, NOW, 30, state) == (False, False)
+    assert "fingerprint" not in state
+
+def test_update_snooze_alert_alone_no_session_no_pending():
+    state = {}
+    assert update_snooze(FP_A, False, NOW, 30, state) == (False, False)
+    assert "fingerprint" not in state
+
+def test_update_snooze_first_ever_poll_with_session_already_active_does_not_pend():
+    # Conservative default: session_was_active defaults to True on a
+    # fresh/never-observed state, so the very first poll (even if
+    # busy_active happens to be True) is never mistaken for a fresh
+    # inactive->active transition -- see update_snooze's docstring.
+    state = {}
+    assert update_snooze(FP_A, True, NOW, 30, state) == (False, False)
+    assert "fingerprint" not in state
+    assert state["session_was_active"] is True
+
+def test_update_snooze_genuine_transition_establishes_pending():
+    state = {}
+    update_snooze(FP_A, False, NOW, 30, state)   # observe inactive first
+    result = update_snooze(FP_A, True, NOW, 30, state)   # now transitions to active
+    assert result == (False, True)   # draw proceeds, LED suppressed
+    assert state["fingerprint"] == FP_A
+    assert "snooze_until" not in state
+
+def test_update_snooze_stays_pending_while_session_continues():
+    state = {}
+    update_snooze(FP_A, False, NOW, 30, state)
+    update_snooze(FP_A, True, NOW, 30, state)
+    later = NOW + timedelta(minutes=2)
+    assert update_snooze(FP_A, True, later, 30, state) == (False, True)
+    assert "snooze_until" not in state
+
+def test_update_snooze_session_end_starts_timed_snooze():
+    state = {}
+    update_snooze(FP_A, False, NOW, 30, state)
+    update_snooze(FP_A, True, NOW, 30, state)
+    session_end = NOW + timedelta(minutes=5)
+    result = update_snooze(FP_A, False, session_end, 30, state)
+    assert result == (True, False)
+    assert state["snooze_until"] == session_end + timedelta(minutes=30)
+
+def test_update_snooze_suppresses_through_the_timed_window():
+    state = {}
+    update_snooze(FP_A, False, NOW, 30, state)
+    update_snooze(FP_A, True, NOW, 30, state)
+    session_end = NOW + timedelta(minutes=5)
+    update_snooze(FP_A, False, session_end, 30, state)
+    mid_snooze = session_end + timedelta(minutes=10)
+    assert update_snooze(FP_A, False, mid_snooze, 30, state) == (True, False)
+
+def test_update_snooze_expires_and_realerts_if_still_failing():
+    state = {}
+    update_snooze(FP_A, False, NOW, 30, state)
+    update_snooze(FP_A, True, NOW, 30, state)
+    session_end = NOW + timedelta(minutes=5)
+    update_snooze(FP_A, False, session_end, 30, state)
+    after_expiry = session_end + timedelta(minutes=31)
+    assert update_snooze(FP_A, False, after_expiry, 30, state) == (False, False)
+    assert "fingerprint" not in state
+
+def test_update_snooze_fingerprint_change_during_pending_reelerts():
+    state = {}
+    update_snooze(FP_A, False, NOW, 30, state)
+    update_snooze(FP_A, True, NOW, 30, state)   # pending on FP_A
+    later = NOW + timedelta(minutes=1)
+    # A different fingerprint appears while still pending on FP_A --
+    # clears the old pending. Session is still active (level, not a fresh
+    # edge for FP_B), so FP_B does NOT get a fresh pending either.
+    result = update_snooze(FP_B, True, later, 30, state)
+    assert result == (False, False)
+    assert "fingerprint" not in state
+
+def test_update_snooze_fingerprint_change_during_timed_snooze_realerts_immediately():
+    state = {}
+    update_snooze(FP_A, False, NOW, 30, state)
+    update_snooze(FP_A, True, NOW, 30, state)
+    session_end = NOW + timedelta(minutes=5)
+    update_snooze(FP_A, False, session_end, 30, state)   # timed snooze on FP_A
+    mid_snooze = session_end + timedelta(minutes=10)
+    # A DIFFERENT failure shows up while FP_A is still timed-snoozed and
+    # no session is running -- must alert immediately, not stay suppressed.
+    result = update_snooze(FP_B, False, mid_snooze, 30, state)
+    assert result == (False, False)
+    assert "fingerprint" not in state
+
+def test_update_snooze_resolved_then_new_clears_snooze():
+    state = {}
+    update_snooze(FP_A, False, NOW, 30, state)
+    update_snooze(FP_A, True, NOW, 30, state)
+    session_end = NOW + timedelta(minutes=5)
+    update_snooze(FP_A, False, session_end, 30, state)   # timed on FP_A
+    mid_snooze = session_end + timedelta(minutes=10)
+    # FP_A resolved entirely (nothing failing) -- also a fingerprint change.
+    result = update_snooze(EMPTY_FP, False, mid_snooze, 30, state)
+    assert result == (False, False)
+    assert "fingerprint" not in state
+
+def test_update_snooze_session_starting_mid_alert_after_continuous_polling():
+    # The "normal" full flow, polled continuously (no gating gaps): alert
+    # appears while no session is running, then a session starts.
+    state = {}
+    assert update_snooze(FP_A, False, NOW, 30, state) == (False, False)
+    t1 = NOW + timedelta(seconds=10)
+    assert update_snooze(FP_A, False, t1, 30, state) == (False, False)   # still no session
+    t2 = t1 + timedelta(seconds=10)
+    assert update_snooze(FP_A, True, t2, 30, state) == (False, True)   # session starts -- pending

@@ -662,7 +662,8 @@ def _badge_elements(text: str, bg_color: str, text_color: str, timeout_s: int) -
 
 
 def build_ci_payload(states: list[RepoState], show_green: bool, timeout_s: int,
-                     overlay: dict | None = None) -> dict | None:
+                     overlay: dict | None = None, suppress_alert: bool = False,
+                     suppress_led: bool = False) -> dict | None:
     """Precedence: failure > stuck > overlay (whichever frame the caller's
     rotation picked -- the running badge or a quota frame) > quiet green >
     nothing. Failure and stuck stay at PRIORITY_ALERT (60, unchanged) and
@@ -672,14 +673,31 @@ def build_ci_payload(states: list[RepoState], show_green: bool, timeout_s: int,
     fully pre-built payload dict from `build_overlay_payload` (already
     carrying its own `priority`/`elements`/`led`) so this function's job is
     purely precedence, not rendering.
+
+    `suppress_alert` (v1.5.2 snooze) skips the failure/stuck branches
+    entirely when true -- the caller (main.run_once, via update_snooze)
+    has decided this exact alert fingerprint is currently snoozed, so
+    precedence falls through to overlay/quiet-green/nothing exactly as if
+    nothing were failing: "running/quota rotation and green behavior
+    unaffected" per the snooze design. `suppress_led` (also v1.5.2) blanks
+    the failure branch's LED specifically, without suppressing the alert
+    draw itself -- used during the snooze-PENDING phase (a BUSY session is
+    active but hasn't ended yet): the alert's own element draw still
+    proceeds as normal (and gets naturally rejected by the session's
+    higher priority, same as always), but the LED -- a separate channel
+    that is NOT gated by the same priority arbitration and would otherwise
+    keep blinking through the session -- is silenced once the operator has
+    visibly acknowledged the alert by starting a session. `suppress_led`
+    has no effect on the stuck branch (its LED is already always `None`).
     """
     failures = [(s.repo, name) for s in states for name in s.failing]
     stuck = [(s.repo, name) for s in states for name in s.stuck]
-    if failures:
+    if failures and not suppress_alert:
         text = "CI FAIL " + " ".join(f"{repo}:{name}" for repo, name in failures)
+        led = None if suppress_led else "#FF0000FF"
         return {"elements": _badge_elements(text, "#A32D2DFF", "#FFFFFFFF", timeout_s),
-                "priority": PRIORITY_ALERT, "led": "#FF0000FF"}
-    if stuck:
+                "priority": PRIORITY_ALERT, "led": led}
+    if stuck and not suppress_alert:
         text = "CI stuck " + " ".join(f"{repo}:{name}" for repo, name in stuck)
         return {"elements": _badge_elements(text, "#BA7517FF", "#0B0B0BFF", timeout_s),
                 "priority": PRIORITY_ALERT, "led": None}
@@ -689,3 +707,139 @@ def build_ci_payload(states: list[RepoState], show_green: bool, timeout_s: int,
         return {"elements": [_text_element("CI ok", "#00FF00FF", timeout_s)],
                 "priority": PRIORITY_ALERT, "led": None}
     return None
+
+
+# --- alert snooze via the device's native start button (v1.5.2) -----------------
+#
+# Raw physical button events aren't API-observable (confirmed: the status
+# WebSocket is screen-only), but the BUSY session it starts is, via
+# client.get_busy(). The snooze rule rides on that: an alert showing at the
+# moment a session starts is treated as "the operator saw it and pressed
+# the button" -- once the session ends, that exact failure/stuck fingerprint
+# is suppressed for `snooze_minutes`. Any change to the fingerprint (a new
+# failure, a different workflow, resolved-then-new) immediately clears the
+# snooze and re-alerts; so does the snooze's own expiry if the same
+# fingerprint is still failing.
+
+def compute_alert_fingerprint(states: list[RepoState]) -> frozenset:
+    """The identity of "what's currently alerting" -- a frozenset of
+    `(repo, workflow, category)` triples, category being "failing" or
+    "stuck" so a repo:workflow pair moving between the two categories
+    counts as a fingerprint change (not silently treated as "the same
+    alert"), matching the snooze rule's "ANY fingerprint change... clear
+    snooze, alert immediately." Empty (falsy) when nothing is failing or
+    stuck.
+    """
+    return (frozenset((s.repo, name, "failing") for s in states for name in s.failing)
+           | frozenset((s.repo, name, "stuck") for s in states for name in s.stuck))
+
+
+def update_snooze(alert_fingerprint: frozenset, busy_active: bool, now: datetime,
+                  snooze_minutes: int, snooze_state: dict) -> tuple[bool, bool]:
+    """Advances the snooze state machine by one poll and returns
+    `(suppress_alert, suppress_led)` for THIS poll. `snooze_state` is a
+    caller-owned dict (same pattern as every other cache in this codebase),
+    mutated in place, with up to three keys: `"session_was_active"`
+    (tracked every call, for edge-detecting the inactive->active
+    transition -- see below), `"fingerprint"` (the alert fingerprint a
+    pending-or-active snooze applies to), and `"snooze_until"` (absent
+    while pending -- session still running -- set to a datetime once the
+    session ends and the timed snooze begins).
+
+    State machine:
+    1. **Pending** starts only on a genuine inactive -> active transition
+       (edge, not level -- see below) while an alert is currently showing:
+       records `fingerprint`, no `snooze_until` yet. Returns
+       `(False, True)` -- the alert draw itself still proceeds as normal
+       (and will be naturally rejected by the session's own higher
+       priority, same as always), but its LED is suppressed, since LED is
+       a separate channel not gated by that same priority arbitration and
+       would otherwise keep blinking through the session the operator just
+       acknowledged.
+    2. While still **pending** (fingerprint unchanged, session still
+       active): keeps returning `(False, True)`.
+    3. The session **ends** (busy_active goes false) while still pending,
+       same fingerprint: sets `snooze_until = now + snooze_minutes` and
+       returns `(True, False)` -- the timed snooze begins this exact poll.
+    4. While **timed** and `now < snooze_until`, same fingerprint:
+       `(True, False)` -- alert suppressed entirely (falls through to
+       overlay/quiet-green/nothing in build_ci_payload), no LED question
+       even arises since the alert branch never runs.
+    5. **Expiry** (`now >= snooze_until`): state clears, `(False, False)`
+       -- back to alerting normally if still failing.
+    6. **Any fingerprint change** at any pending/timed point: immediately
+       clears the fingerprint/snooze_until (but not the
+       `session_was_active` tracking -- see below), falling through to
+       step 1's logic fresh for the new fingerprint (or `(False, False)`
+       if nothing is failing/stuck anymore, or if a session isn't already
+       active for a fresh pending to start against).
+    7. `snooze_minutes <= 0` disables the feature outright: any existing
+       fingerprint/snooze_until is cleared and `(False, False)` always.
+
+    **Edge, not level, and why the default matters.** Requirement 1 is a
+    TRANSITION ("busy snapshot transitions from inactive... to active"),
+    not a level condition ("an alert is showing and a session happens to
+    be active") -- otherwise a session that was ALREADY running before an
+    alert appeared (or before a fingerprint changed mid-session) would be
+    wrongly treated as "you just pressed the button for this," silently
+    snoozing something the operator never actually acknowledged. Detecting
+    the edge needs to know what the PREVIOUS poll observed, tracked via
+    `session_was_active` -- but polling is deliberately gated (see
+    main.run_once) to skip `get_busy()` entirely when idle (no alert, no
+    snooze state), which means there can be gaps where `session_was_active`
+    wasn't being updated. On the first poll after such a gap (or the very
+    first poll of a fresh process), `session_was_active` defaults to
+    `True` -- not `False` -- so an as-yet-unobserved busy session is
+    assumed to possibly PRE-DATE the alert rather than assumed absent:
+    the conservative direction is to require an actually-OBSERVED
+    inactive->active transition before granting pending, at the cost of
+    occasionally missing a legitimate fresh session-start that happens to
+    coincide with polling just resuming (a minor inconvenience -- the
+    operator presses the button again -- versus the alternative of a
+    silent, unintended auto-snooze).
+
+    **Restart safety**: a process restart gets a fresh empty
+    `snooze_state`, so `session_was_active` defaults to `True` on the very
+    first poll regardless of the device's actual state -- the same
+    conservative default above, which also happens to correctly prevent a
+    restart-during-an-already-active-session from being misattributed as
+    a fresh button press. In-memory only; documented as a known limitation
+    (a snooze in effect at restart is lost, same as every other cache in
+    this codebase).
+    """
+    was_active = snooze_state.get("session_was_active", True)
+    snooze_state["session_was_active"] = busy_active
+
+    if snooze_minutes <= 0:
+        snooze_state.pop("fingerprint", None)
+        snooze_state.pop("snooze_until", None)
+        return False, False
+
+    pending_fp = snooze_state.get("fingerprint")
+    snooze_until = snooze_state.get("snooze_until")
+
+    if pending_fp is not None and alert_fingerprint != pending_fp:
+        snooze_state.pop("fingerprint", None)
+        snooze_state.pop("snooze_until", None)
+        pending_fp = None
+        snooze_until = None
+
+    if pending_fp is None:
+        if alert_fingerprint and busy_active and not was_active:
+            snooze_state["fingerprint"] = alert_fingerprint
+            snooze_state.pop("snooze_until", None)
+            return False, True
+        return False, False
+
+    if snooze_until is None:
+        if busy_active:
+            return False, True
+        snooze_state["snooze_until"] = now + timedelta(minutes=snooze_minutes)
+        return True, False
+
+    if now < snooze_until:
+        return True, False
+
+    snooze_state.pop("fingerprint", None)
+    snooze_state.pop("snooze_until", None)
+    return False, False
