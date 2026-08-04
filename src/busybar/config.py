@@ -9,6 +9,8 @@ DEFAULTS: dict = {
         "poll_seconds": 60,
         "lookahead_hours": 12,
         "warn_minutes": 5,
+        "notice_minutes": 15,
+        "progress_window_minutes": 60,
         "include_all_day": False,
         "auto_busy": False,
         "calendars": [],

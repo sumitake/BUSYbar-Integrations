@@ -182,3 +182,81 @@ unauthenticated on the LAN.
 Each integration ships a launchd user LaunchAgent plist (`RunAtLoad`,
 `KeepAlive`) with a documented `launchctl bootstrap` install one-liner; both also
 run fine manually via `uv run`.
+
+## 2026-08-03 — v1.1 display redesign
+
+**Status:** Implemented (branch `dev/claude/display-v1.1`).
+
+Replaces the single scrolling text line with layout **"A + progress accent
+bar"**: a 2px-wide vertical bar (progress-to-event), a top title row
+(time + event title), and a native `countdown` element that ticks on-device
+every second instead of being redrawn on each poll.
+
+### Calendar countdown (`integrations/calendar_countdown/`)
+
+`logic.build_elements(event, now, cfg, timeout_s, in_progress)` replaces the
+old `build_elements(text, warning, timeout_s)` + `format_countdown`. Element
+list, by id:
+
+- **`bar`** — `rectangle`, `x=0`, `width=2`, `fill=solid`, anchored to the
+  bottom (`y = 16 - height`) so it drains downward as the event approaches.
+  Height is `round(16 * minutes_left / progress_window_minutes)` (new config
+  key, default 60), clamped to `[1, 16]`; full height once `minutes_left >=
+  window`. For an in-progress event the bar is always full-height and teal.
+- **`time`** — `tiny` font, gray `#B4B2A9FF`, `HH:MM` of the event start.
+  Present only for an *upcoming* event; omitted for an in-progress one (its
+  start time is no longer the relevant number — the countdown below already
+  targets the end).
+- **`title`** — `small` font, always white regardless of urgency, `ascii_safe`
+  event title. `x` is `26` (right of the time label) for upcoming events or
+  `4` (flush left) when in progress. Scrolls (`scroll_rate=2000`, matching the
+  v1 delays) only if the title is estimated not to fit the remaining width;
+  otherwise static. Fit is estimated at 5px/char for the `small` bitmap font —
+  a conservative constant (`SMALL_FONT_CHAR_PX` in `logic.py`), not a firmware
+  metrics query, so it may occasionally scroll a title that would have just
+  fit.
+- **`countdown`** — native `countdown` element (`direction=time_left`,
+  `show_hours=when_non_zero`, `timestamp` as the required **string** of unix
+  seconds). Targets `event.start` for an upcoming event or `event.end` while
+  in progress. This is what makes the display tick every second without a
+  redraw from the integration.
+
+Urgency color (`bar` + `countdown`, **not** `title`, which stays white):
+white by default, amber `#EF9F27FF` at or below `notice_minutes` (new config
+key, default 15), red `#E24B4AFF` at or below `warn_minutes` (existing,
+default 5). An in-progress event overrides all of this: full teal
+`#1D9E75FF` bar, countdown to `event.end` in teal.
+
+`main.run_once` now calls `select_active_event` unconditionally (previously
+only under `auto_busy`) and prefers an in-progress event over the next
+upcoming one for display purposes — showing "this meeting ends in 12m" is
+more useful than "next meeting starts in 3h" while one is already running.
+`auto_busy` behavior is unchanged. `format_countdown` was removed (its only
+caller, the old single-line renderer, is gone, and no test needed it either).
+
+### CI status (`integrations/ci_status/`)
+
+`logic.build_ci_payload` gains a full-panel background badge behind the
+scrolling text for the two alert states: `rectangle` `x=0 y=0 w=72 h=16
+radius=2 fill=solid`, red `#A32D2DFF` for failures / amber `#BA7517FF` for
+stuck, under bold-font text (white `#FFFFFFFF` on red, black `#0B0B0BFF` on
+amber). `show_green` behavior and LED blink behavior are unchanged (plain
+text, no badge, no LED noise). Failure still wins over stuck when both are
+present (unchanged precedence).
+
+### Firmware gotcha found during on-device verification
+
+`RectangleElement` defaults to `border_width=1` with `border_color=#FFFFFFFF`
+per the OpenAPI spec. For the 2px-wide progress bar this default border alone
+covers the entire element, rendering it solid white regardless of the
+requested `fill_colors` — confirmed by capturing raw frames via
+`GET /api/screen?display=0` (base64 **BGR** pixel data, not RGB — a second,
+tooling-side gotcha in the capture script, not the firmware) and reading back
+actual pixel values. Both the bar and the CI badge background now set
+`"border_width": 0` explicitly; the bar bug was invisible in the request
+payload (looked correct) and only showed up rendered.
+
+### Config (`src/busybar/config.py`, `config.example.toml`)
+
+Added to `[calendar_countdown]`: `notice_minutes = 15`,
+`progress_window_minutes = 60`.

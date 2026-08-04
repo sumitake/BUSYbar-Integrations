@@ -2,9 +2,14 @@
 
 ## What It Does
 
-This integration polls your macOS calendar for upcoming events and displays a live countdown on the busybar device. As each event approaches, the display updates in real time, showing the event time and minutes remaining. For example: `14:00 Standup in 23m`.
+This integration polls your macOS calendar for upcoming events and displays a live countdown on the busybar device: a vertical progress bar that drains as the event approaches, a title row (start time + event title), and a native on-device countdown timer that ticks every second between polls.
 
-The integration looks ahead 12 hours by default, surfaces events within a configurable warning window (5 minutes by default), and draws them at priority 20 on the display. If an active BUSY session exists on the device, the calendar event display is suppressed in favor of the busy state (priority 90).
+- **Progress accent bar** — a thin bar on the left edge fills from the bottom, representing time remaining within `progress_window_minutes` (default 60). It's full height once the event is `progress_window_minutes` or more away, and drains to a 1px sliver as the start time arrives.
+- **Title row** — `HH:MM` start time in a small gray label, with the event title next to it. Long titles scroll; short ones sit static.
+- **Countdown** — a native device countdown to the event start (or, once the event has begun, to its end) so the display keeps ticking without waiting on the next poll.
+- **Urgency color** — the bar and countdown are white by default, turn amber within `notice_minutes` (default 15) of start, and red within `warn_minutes` (default 5). An in-progress event switches to a full teal bar and a countdown to the event's end instead.
+
+The integration looks ahead 12 hours by default and draws at priority 20 on the display. If an active BUSY session exists on the device, the calendar event display is suppressed in favor of the busy state (priority 90).
 
 ## Requirements
 
@@ -50,7 +55,9 @@ Edit `config.toml` and configure the `[calendar_countdown]` section:
 [calendar_countdown]
 poll_seconds = 60              # how often to check the calendar (default: 60)
 lookahead_hours = 12           # how far ahead to scan (default: 12)
-warn_minutes = 5               # show countdown when within N minutes (default: 5)
+warn_minutes = 5               # bar/countdown turn red within N minutes of start (default: 5)
+notice_minutes = 15            # bar/countdown turn amber within N minutes of start (default: 15)
+progress_window_minutes = 60   # progress bar drains from full over this many minutes (default: 60)
 include_all_day = false        # include all-day events (default: false)
 auto_busy = false              # auto-mark as BUSY during events (default: false)
 # calendars = ["Work"]         # optional: list calendar names to limit scope (discover with --list-calendars)
@@ -72,7 +79,9 @@ Verify that the output shows your next upcoming event with the correct countdown
 |---|---|---|---|
 | `poll_seconds` | integer | 60 | Polling interval in seconds |
 | `lookahead_hours` | integer | 12 | Hours into the future to scan for events |
-| `warn_minutes` | integer | 5 | Show countdown when within N minutes of event start |
+| `warn_minutes` | integer | 5 | Bar/countdown turn red when within N minutes of event start |
+| `notice_minutes` | integer | 15 | Bar/countdown turn amber when within N minutes of event start |
+| `progress_window_minutes` | integer | 60 | Progress bar drains from full height over this many minutes before the event start |
 | `include_all_day` | boolean | false | Include all-day events in the display |
 | `auto_busy` | boolean | false | Automatically mark device BUSY during event time |
 | `calendars` | array of strings | (all) | List of calendar names to monitor. Discover available names with `uv run python -m calendar_countdown.main --list-calendars` |
@@ -104,8 +113,8 @@ rm ~/Library/LaunchAgents/com.busybar.calendar-countdown.plist
 
 ## Logs
 
-Stdout and stderr are redirected to `/tmp/busybar-calendar.log`. View recent activity with:
+Stdout and stderr are redirected to `~/Library/Logs/busybar/calendar.log`. View recent activity with:
 
 ```bash
-tail -f /tmp/busybar-calendar.log
+tail -f ~/Library/Logs/busybar/calendar.log
 ```

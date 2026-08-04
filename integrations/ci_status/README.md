@@ -2,7 +2,7 @@
 
 ## What It Does
 
-This integration monitors GitHub Actions workflows across your repositories and displays CI status on the busybar device. When workflows fail, the device shows a red alert. When queued runs become stale (stuck due to offline runners or capacity), the device shows a yellow warning. The integration displays at priority 60, but an active BUSY session (priority 90) will override the display to show a blinking red status LED instead.
+This integration monitors GitHub Actions workflows across your repositories and displays CI status on the busybar device. When workflows fail, the device shows a full-panel red badge (rounded background + bold white text) listing the affected `repo:workflow` pairs. When queued runs become stale (stuck due to offline runners or capacity), the device shows a full-panel amber badge with black text instead. Long lists scroll. The integration displays at priority 60, but an active BUSY session (priority 90) will override the display to show a blinking red status LED instead.
 
 ## Requirements
 
@@ -108,10 +108,10 @@ rm ~/Library/LaunchAgents/com.busybar.ci-status.plist
 
 ## Logs
 
-Stdout and stderr are redirected to `/tmp/busybar-ci.log`. View recent activity with:
+Stdout and stderr are redirected to `~/Library/Logs/busybar/ci.log`. View recent activity with:
 
 ```bash
-tail -f /tmp/busybar-ci.log
+tail -f ~/Library/Logs/busybar/ci.log
 ```
 
 ## GitHub-Hosted and Self-Hosted Runners

@@ -11,13 +11,15 @@ from busybar.client import DrawResult
 TZ = timezone.utc
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=TZ)
 CFG = {"calendar_countdown": {"poll_seconds": 60, "lookahead_hours": 12,
-                              "warn_minutes": 5, "include_all_day": False,
+                              "warn_minutes": 5, "notice_minutes": 15,
+                              "progress_window_minutes": 60,
+                              "include_all_day": False,
                               "auto_busy": False, "calendars": []}}
 
 
-def make_event(offset_min: int) -> CalEvent:
+def make_event(offset_min: int, dur_min: int = 30, title: str = "Standup") -> CalEvent:
     start = NOW + timedelta(minutes=offset_min)
-    return CalEvent("Standup", start, start + timedelta(minutes=30), False)
+    return CalEvent(title, start, start + timedelta(minutes=dur_min), False)
 
 
 def test_draws_countdown_for_upcoming_event():
@@ -27,16 +29,29 @@ def test_draws_countdown_for_upcoming_event():
     client.draw.assert_called_once()
     kwargs = client.draw.call_args.kwargs
     assert kwargs["priority"] == 20
-    assert "Standup in 23m" in kwargs["elements"][0]["text"]
+    by_id = {el["id"]: el for el in kwargs["elements"]}
+    assert by_id["countdown"]["timestamp"] == str(int(make_event(23).start.timestamp()))
+    assert by_id["title"]["text"] == "Standup"
     assert "drew" in summary
 
+def test_draws_in_progress_event_targeting_active_over_upcoming():
+    client = Mock()
+    client.draw.return_value = DrawResult.DRAWN
+    active = make_event(-5, dur_min=30, title="Active")
+    upcoming = make_event(120, title="Later")
+    summary = run_once(client, lambda hours: [active, upcoming], CFG, NOW, dry_run=False)
+    kwargs = client.draw.call_args.kwargs
+    by_id = {el["id"]: el for el in kwargs["elements"]}
+    assert by_id["title"]["text"] == "Active"
+    assert by_id["countdown"]["timestamp"] == str(int(active.end.timestamp()))
+    assert "time" not in by_id
+    assert "drew" in summary
 
 def test_clears_when_no_event():
     client = Mock()
     run_once(client, lambda hours: [], CFG, NOW, dry_run=False)
     client.clear.assert_called_once_with("calendar_countdown")
     client.draw.assert_not_called()
-
 
 def test_dry_run_never_touches_device():
     client = Mock()
