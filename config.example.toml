@@ -17,4 +17,6 @@ auto_busy = false
 poll_seconds = 120
 repos = ["your-user/your-repo"]
 show_green = false
-# stale_queued_minutes = 15 # omit to disable stuck-queue detection
+# stale_queued_minutes = 15  # omit to disable stuck-queue detection
+show_running = true          # show a badge (alternating with the calendar) while a run is in progress
+running_poll_seconds = 20    # poll interval while a run is active (shortened from poll_seconds)

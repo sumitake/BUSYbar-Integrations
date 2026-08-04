@@ -20,6 +20,8 @@ DEFAULTS: dict = {
         "repos": [],
         "show_green": False,
         "stale_queued_minutes": 0,  # 0 = disabled
+        "show_running": True,
+        "running_poll_seconds": 20,
     },
 }
 

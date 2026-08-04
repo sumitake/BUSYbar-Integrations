@@ -6,6 +6,8 @@ def test_defaults_when_no_file(tmp_path):
     assert cfg["device"]["host"] == "10.0.4.20"
     assert cfg["calendar_countdown"]["poll_seconds"] == 60
     assert cfg["ci_status"]["repos"] == []
+    assert cfg["ci_status"]["show_running"] is True
+    assert cfg["ci_status"]["running_poll_seconds"] == 20
 
 def test_file_overrides_defaults(tmp_path):
     p = tmp_path / "config.toml"
