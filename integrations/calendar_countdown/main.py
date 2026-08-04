@@ -13,16 +13,14 @@ from datetime import datetime, timezone
 
 from busybar.client import BusyBarClient, DrawResult
 from busybar.config import load_config
-from busybar.display import PRIORITY_AMBIENT, ambient_timeout
+from busybar.display import ambient_timeout
 
 from .logic import (ascii_safe, build_elements, select_active_event,
-                    select_next_event)
+                    select_next_event, _minutes_left, select_priority,
+                    select_led, should_chirp, commit_chirped,
+                    next_sleep_seconds, CHIRP_STOCK_PATH)
 
 APP = "calendar_countdown"
-# Ambient-tier priority (see busybar.display for the full ladder contract
-# and the two firmware facts it's built on). Was a local PRIORITY=20
-# constant before v1.5's shared display-tier framework.
-PRIORITY = PRIORITY_AMBIENT
 HEARTBEAT_SECONDS = 600
 log = logging.getLogger(APP)
 
@@ -30,9 +28,14 @@ log = logging.getLogger(APP)
 def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
             state: dict | None = None) -> str:
     """Run one poll cycle. `state`, when passed, is a caller-owned dict this
-    function uses to remember the previous draw's `in_progress` value across
-    calls (main() passes one shared dict across loop iterations; tests
-    calling run_once standalone can omit it).
+    function uses to remember the previous draw's `in_progress` value
+    across calls (main() passes one shared dict across loop iterations;
+    tests calling run_once standalone can omit it), plus (v1.5.2) the
+    next known event's start time (`next_start`, for the T-0 sleep-
+    shortening in main()'s loop) and the chirp edge-detection bookkeeping
+    (`seen_upcoming`/`chirped`, maintained by should_chirp/commit_chirped
+    -- see calendar_countdown.logic for the full escalation-ladder and
+    chirp design).
 
     The upcoming and in-progress layouts use different element id sets
     (`time` vs `ends`) and the device's draw endpoint upserts by id rather
@@ -42,7 +45,12 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
     expires (originally found with the v1.3 `time_card`+`time` vs `ends`
     id sets; the same upsert-by-id model applies regardless of which ids
     are in play). `state` lets us clear only at the transition, not on
-    every poll.
+    every poll. Priority changes (v1.5.2's escalation ladder) do NOT need
+    this same clear-on-change treatment: they're the same app_name
+    upserting the same element ids at a new priority number, not a shape
+    change -- see busybar.display's PRIORITY_AMBIENT_URGENT docstring for
+    why a strictly-higher same-app_name draw always succeeds regardless
+    of priority.
     """
     c = cfg["calendar_countdown"]
     timeout_s = ambient_timeout(c["poll_seconds"])
@@ -67,11 +75,32 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
             client.clear(APP)
         if state is not None:
             state["in_progress"] = None
+            state["next_start"] = None
         return "no upcoming event; cleared"
+
+    # Recorded regardless of dry_run: this is pure bookkeeping about what
+    # the calendar says, not a device action, so main()'s sleep-shortening
+    # calculation stays accurate even across dry-run polls.
+    if state is not None:
+        state["next_start"] = None if in_progress else event.start
 
     label = f"{'active' if in_progress else 'upcoming'} {ascii_safe(event.title)!r}"
     if dry_run:
         return f"DRY-RUN would draw: {label} (in_progress={in_progress})"
+
+    # Event-start chirp (v1.5.2): fires on the upcoming -> in_progress
+    # transition edge only -- see should_chirp's docstring for the full
+    # restart-safety and once-per-event reasoning. Placed after the
+    # dry_run return so a dry run never plays real audio or touches the
+    # chirp bookkeeping.
+    if state is not None:
+        if should_chirp(event, in_progress, now, state, c["chirp"]):
+            if client.play_audio(APP, stock_path=CHIRP_STOCK_PATH):
+                commit_chirped(event, state)
+            # else: play_audio already logged the failure; leaving
+            # "chirped" uncommitted means the next poll (still
+            # in_progress, same event) retries rather than silently
+            # skipping the chirp forever.
 
     if state is not None and state.get("in_progress") not in (None, in_progress):
         # clear()'s own success/failure is intentionally not checked here --
@@ -86,7 +115,10 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
         client.clear(APP)
 
     elements = build_elements(event, now, c, timeout_s, in_progress)
-    result = client.draw(APP, elements=elements, priority=PRIORITY)
+    minutes_left = _minutes_left(event, now, in_progress)
+    priority = select_priority(minutes_left, c["approach_minutes"], c["notice_minutes"], in_progress)
+    led = select_led(minutes_left, c["imminent_minutes"], in_progress)
+    result = client.draw(APP, elements=elements, priority=priority, led_notification_color=led)
     if state is not None and result == DrawResult.DRAWN:
         # Only commit the transition once it actually lands on the device.
         # If draw() failed (UNREACHABLE/REJECTED/ERROR), leave `state`
@@ -169,7 +201,13 @@ def main() -> int:
             backoff = min(backoff * 2, 300)
         else:
             backoff = 5
-            time.sleep(cfg["calendar_countdown"]["poll_seconds"])
+            # v1.5.2 T-0 chirp precision: sleep exactly until the next
+            # known event's start, not a full poll interval, when that's
+            # sooner -- see next_sleep_seconds's docstring.
+            next_start = state.get("next_start")
+            seconds_until_start = ((next_start - datetime.now(timezone.utc)).total_seconds()
+                                   if next_start is not None else None)
+            time.sleep(next_sleep_seconds(cfg["calendar_countdown"]["poll_seconds"], seconds_until_start))
 
 
 if __name__ == "__main__":

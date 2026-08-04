@@ -64,6 +64,9 @@ progress_window_minutes = 60   # drain track empties from full over this many mi
 include_all_day = false        # include all-day events (default: false)
 auto_busy = false              # auto-mark as BUSY during events (default: false)
 # calendars = ["Work"]         # optional: list calendar names to limit scope (discover with --list-calendars)
+approach_minutes = 30          # v1.5.2 escalation ladder -- see "Escalation ladder" below
+imminent_minutes = 1           # LED blinks on every draw inside this window
+chirp = true                   # one-time audio chirp exactly at event start; false disables audio
 ```
 
 ### 4. Test Live
@@ -88,6 +91,9 @@ Verify that the output shows your next upcoming event with the correct countdown
 | `include_all_day` | boolean | false | Include all-day events in the display |
 | `auto_busy` | boolean | false | Automatically mark device BUSY during event time |
 | `calendars` | array of strings | (all) | List of calendar names to monitor. Discover available names with `uv run python -m calendar_countdown.main --list-calendars` |
+| `approach_minutes` | integer | 30 | v1.5.2 escalation ladder: inside this window (and outside `notice_minutes`) the draw priority rises above the overlay tier. See "Escalation ladder" below. |
+| `imminent_minutes` | integer | 1 | Inside this window (event not yet started), the LED blinks on every draw. |
+| `chirp` | boolean | true | Play a one-time audio chirp exactly at event start (T-0). Set false to disable audio entirely. |
 
 ## Autostart
 
@@ -135,3 +141,29 @@ This integration draws at the **ambient** tier (`busybar.display.PRIORITY_AMBIEN
 | 10 (current default) | 4 of 6 | 35 / 20 / 10 |
 
 Matching the poll to the dwell gap exactly (10s) did not eliminate the dark gaps entirely -- the two timers still run independently with no cross-process coordination, so recovery timing within a gap varies (observed roughly 2-8s into a given 10s gap) and 2 of the 6 sampled cycles still showed no recovery at all -- but it took the calendar from "never recovers" to "recovers in most cycles." A separate on-device run exercising the full 3-frame overlay rotation (running badge -> GraphQL quota -> REST quota -> repeat) at the same 10s dwell showed the same pattern: the calendar reclaimed 3 of the 4 gap windows sampled. If your setup still shows the panel dark for more than a few seconds at a stretch, that is consistent with this measurement, not a bug; lowering `poll_seconds` further has diminishing returns since the elements' own render/transmit latency puts a floor on how tightly the two timers can align.
+
+## Escalation ladder
+
+An operator-reported UX gap: a persistent CI failure alert (`ci_status`, `PRIORITY_ALERT`) permanently evicted the calendar, hiding an imminent event with no way for the calendar to ever reclaim the screen -- the ambient tier has no dwell/silence contract of its own the way the overlay tier does. v1.5.2's fix is a state-dependent draw priority: as an upcoming event gets closer, the calendar climbs `busybar/display.py`'s shared priority ladder so it can no longer be silently buried, first by the overlay-tier CI badge/quota rotation and then by a genuine alert itself.
+
+| Window | Priority | Palette | LED | Notes |
+|---|---|---|---|---|
+| `normal` (beyond `approach_minutes`) | `PRIORITY_AMBIENT` (20) | normal | off | Baseline, unchanged from before v1.5.2. |
+| `approach` (within `approach_minutes`, outside `notice_minutes`) | `PRIORITY_AMBIENT_RAISED` (25) | normal (unchanged) | off | Strictly above the overlay tier (21) -- the countdown can no longer be silently interrupted by the running-CI badge/quota rotation, but a genuine alert (60) still wins. Purely a priority change; nothing looks different on screen. |
+| `notice` (within `notice_minutes`) | `PRIORITY_AMBIENT_URGENT` (65) | amber | off | Strictly above `PRIORITY_ALERT` (60) -- a persistent CI failure/stuck alert no longer permanently buries an imminent event. |
+| `warn` (within `warn_minutes`) | `PRIORITY_AMBIENT_URGENT` (65) | red | off | Same priority as `notice` -- they differ visually and (below) in LED, not in urgency toward the display arbitration. |
+| *imminent window* (within `imminent_minutes`, part of `warn`) | `PRIORITY_AMBIENT_URGENT` (65) | red (same as `warn`) | **on**, every draw | Not a separate priority tier -- `imminent_minutes` governs only the LED. See "Audio and LED" below. |
+| `in_progress` | `PRIORITY_AMBIENT` (20) | teal | off | Deliberately NOT elevated -- once a meeting has started you already know about it (you're either in it or conspicuously not); the elevation exists to catch your attention *before* an event starts, not to keep fighting for the screen once it has. An alert regains the panel here exactly as it did before this feature existed. |
+
+**The eviction/409 interplay.** `PRIORITY_AMBIENT_URGENT`'s draw succeeding while a `ci_status` alert is showing evicts that alert's elements outright (the firmware evicts, never restores -- see `src/busybar/display.py`'s fact 2). `ci_status` itself doesn't need to know or care: it keeps trying to redraw its alert every poll per its own no-dwell contract, gets a `409` (`DrawResult.REJECTED`) while the calendar holds the higher tier, treats that as expected and silent (nothing new here -- the same handling that already existed for the overlay tier's own dwell gaps), and re-asserts itself the instant the calendar drops back down to `PRIORITY_AMBIENT` -- typically at the calendar's *next* poll after the event starts or leaves its notice window, so the reappearance lands within one `poll_seconds` of the calendar itself, not instantly. In between, the calendar transiently owns the panel -- expected, not a bug, and needs no cross-process coordination.
+
+## Audio and LED (final-minute window)
+
+Independent of the priority ladder above, two more signals fire during the final `imminent_minutes` before an event starts (default: the last 1 minute):
+
+- **LED** (`led_notification_color`) blinks on *every* draw from `imminent_minutes` before start until the event actually starts, then stops (no LED once `in_progress`). The LED is a separate hardware channel from the drawn elements' priority arbitration entirely -- it is the one signal that still gets through even when a BUSY/CUSTOM session (`PRIORITY_SESSION`, 90) owns the whole panel, so it's the session-safe way to still notice an imminent event while in a session.
+- **Chirp**: a short audio tone plays exactly once per event, at the moment it starts (T-0) -- not during the final-minute countdown itself. It uses a firmware-shipped **stock sound** (`shared/calendar_event_starts.wav`), confirmed via a live on-device probe (`POST /api/audio/play` with that `stock_path` returned `200`) before this design was chosen -- no asset generation, upload, or repo-committed audio file is needed or used. Playback always uses whatever volume is currently configured on the device; this integration never reads or sets `/api/audio/volume`. Set `chirp = false` to disable audio entirely.
+
+**Timing precision.** The main loop normally sleeps for a full `poll_seconds` between polls, but when an upcoming event's start is sooner than that, it sleeps exactly until that start instead -- so the poll that detects the transition (and fires the chirp) lands within about a second of the real start time, not up to a full `poll_seconds` late.
+
+**Once-per-event semantics.** The chirp fires on the transition edge only -- the poll where this *process* observes an event go from upcoming to started -- tracked in memory, keyed by the event's own start timestamp. It will not repeat on subsequent polls while the same event stays in progress. **Restart edge case**: this tracking is in-memory only, so a process restart during an event's final minute (or any time after it has already started) does not re-fire the chirp for that event -- the new process never observed it as "upcoming," so the edge is never detected. This is a deliberate tradeoff (documented, not a bug): the alternative (chirping on level-detection alone) would risk a spurious chirp on every restart during an active event.

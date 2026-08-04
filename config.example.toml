@@ -15,6 +15,16 @@ include_all_day = false
 auto_busy = false
 # calendars = ["Work"]      # omit to read all calendars
 
+# v1.5.2 escalation ladder -- as an upcoming event gets closer, the calendar
+# climbs busybar/display.py's shared priority ladder so it can no longer be
+# silently buried, first by the overlay-tier CI badge/quota rotation, then
+# by a persistent CI failure/stuck alert. See calendar_countdown/README.md's
+# "Escalation ladder" section before tuning.
+approach_minutes = 30        # inside this (outside notice_minutes): priority rises above the
+                              # overlay tier (PRIORITY_AMBIENT_RAISED) -- normal palette, unchanged
+imminent_minutes = 1         # inside this (and not yet started): LED blinks on every draw
+chirp = true                 # one-time audio chirp exactly at event start (T-0); false disables audio
+
 [ci_status]
 poll_seconds = 120
 repos = ["your-user/your-repo"]
@@ -33,3 +43,10 @@ watch_account_repos = false
 # repos_exclude = ["your-user/archived-experiment"]  # silence specific repos without leaving account mode
 active_within_days = 30      # only repos pushed within this window are polled
 repo_refresh_minutes = 60    # how often the repo list itself is re-enumerated (new repos picked up within this interval)
+
+# Alert snooze via the device's native start button (v1.5.2). Starting a
+# BUSY session on the device while a CI alert is showing snoozes that exact
+# failure/stuck fingerprint for snooze_minutes once the session ends -- any
+# change (new failure, different workflow, resolved-then-new) re-alerts
+# immediately. See ci_status/README.md's "Snoozing alerts" section.
+snooze_minutes = 30          # 0 disables the feature

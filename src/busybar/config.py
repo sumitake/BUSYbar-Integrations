@@ -23,6 +23,15 @@ DEFAULTS: dict = {
         "include_all_day": False,
         "auto_busy": False,
         "calendars": [],
+        # v1.5.2 escalation ladder -- see busybar/display.py's
+        # PRIORITY_AMBIENT_RAISED/PRIORITY_AMBIENT_URGENT docstrings and
+        # calendar_countdown.logic.select_priority for the full ladder.
+        "approach_minutes": 30,   # <= this and > notice_minutes: PRIORITY_AMBIENT_RAISED
+                                  # (can no longer be silently interrupted by the overlay
+                                  # tier's CI badge/quota rotation)
+        "imminent_minutes": 1,    # <= this (and not in_progress): LED blinks on every draw
+        "chirp": True,            # one-time audio chirp exactly at event start (T-0);
+                                  # set false to disable audio entirely
     },
     "ci_status": {
         "poll_seconds": 120,
@@ -43,6 +52,9 @@ DEFAULTS: dict = {
         "repos_exclude": [],       # silence specific repos without leaving account mode
         "active_within_days": 30,  # only repos pushed within this window are polled
         "repo_refresh_minutes": 60,  # how often the repo list itself is re-enumerated
+        # Alert snooze via the device's native start button (v1.5.2) -- see
+        # ci_status/README.md's "Snoozing alerts" section. 0 disables.
+        "snooze_minutes": 30,
     },
 }
 

@@ -15,7 +15,10 @@ CFG = {"calendar_countdown": {"poll_seconds": 60, "lookahead_hours": 12,
                               "warn_minutes": 5, "notice_minutes": 15,
                               "progress_window_minutes": 60,
                               "include_all_day": False,
-                              "auto_busy": False, "calendars": []}}
+                              "auto_busy": False, "calendars": [],
+                              # v1.5.2 escalation ladder + chirp
+                              "approach_minutes": 30, "imminent_minutes": 1,
+                              "chirp": True}}
 
 
 def make_event(offset_min: int, dur_min: int = 30, title: str = "Standup") -> CalEvent:
@@ -26,7 +29,10 @@ def make_event(offset_min: int, dur_min: int = 30, title: str = "Standup") -> Ca
 def test_draws_countdown_for_upcoming_event():
     client = Mock()
     client.draw.return_value = DrawResult.DRAWN
-    event = make_event(23)
+    # offset > approach_minutes (30) so this stays in the baseline "normal"
+    # priority tier -- see the v1.5.2 escalation-ladder tests below for the
+    # approach/notice/warn priority selection itself.
+    event = make_event(40)
     summary = run_once(client, lambda hours: [event], CFG, NOW, dry_run=False)
     client.draw.assert_called_once()
     kwargs = client.draw.call_args.kwargs
@@ -201,3 +207,133 @@ def test_should_log_info_true_on_heartbeat_even_if_unchanged():
                            seconds_since_heartbeat=600, heartbeat_seconds=600) is True
     assert should_log_info("drew X -> drawn", "drew X -> drawn",
                            seconds_since_heartbeat=599, heartbeat_seconds=600) is False
+
+
+# --- v1.5.2 escalation ladder + LED, end to end through run_once -----------------
+
+from busybar.display import PRIORITY_AMBIENT_RAISED, PRIORITY_AMBIENT_URGENT
+from calendar_countdown.logic import IMMINENT_LED_COLOR, CHIRP_STOCK_PATH
+
+def test_run_once_draws_at_raised_priority_in_approach_window():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    event = make_event(20)   # inside approach_minutes(30), outside notice_minutes(15)
+    run_once(client, lambda hours: [event], CFG, NOW, dry_run=False)
+    assert client.draw.call_args.kwargs["priority"] == PRIORITY_AMBIENT_RAISED
+    assert client.draw.call_args.kwargs["led_notification_color"] is None
+
+def test_run_once_draws_at_urgent_priority_in_notice_window():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    event = make_event(10)   # inside notice_minutes(15)
+    run_once(client, lambda hours: [event], CFG, NOW, dry_run=False)
+    assert client.draw.call_args.kwargs["priority"] == PRIORITY_AMBIENT_URGENT
+    assert client.draw.call_args.kwargs["led_notification_color"] is None
+
+def test_run_once_led_fires_in_imminent_window():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    event = make_event(0.5)   # inside imminent_minutes(1)
+    run_once(client, lambda hours: [event], CFG, NOW, dry_run=False)
+    assert client.draw.call_args.kwargs["priority"] == PRIORITY_AMBIENT_URGENT
+    assert client.draw.call_args.kwargs["led_notification_color"] == IMMINENT_LED_COLOR
+
+def test_run_once_in_progress_stays_baseline_no_led():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    active = make_event(-1, dur_min=30, title="Active")
+    run_once(client, lambda hours: [active], CFG, NOW, dry_run=False)
+    assert client.draw.call_args.kwargs["priority"] == PRIORITY_AMBIENT
+    assert client.draw.call_args.kwargs["led_notification_color"] is None
+
+
+# --- v1.5.2 chirp, end to end through run_once ------------------------------------
+
+def test_run_once_chirps_exactly_once_on_start_transition():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    client.play_audio.return_value = True
+    state: dict = {}
+    upcoming = make_event(0.2)   # about to start
+    run_once(client, lambda hours: [upcoming], CFG, NOW, dry_run=False, state=state)
+    client.play_audio.assert_not_called()   # still upcoming -- no chirp yet
+
+    # Same event's start timestamp must line up for edge detection -- build
+    # the "started" version from the original event's own start directly,
+    # not a fresh make_event() call (which would compute a different start).
+    started = CalEvent(upcoming.title, upcoming.start, upcoming.start + timedelta(minutes=30), False)
+    later = upcoming.start + timedelta(seconds=1)
+    run_once(client, lambda hours: [started], CFG, later, dry_run=False, state=state)
+    client.play_audio.assert_called_once_with("calendar_countdown", stock_path=CHIRP_STOCK_PATH)
+
+    # A further poll, still in_progress, must not re-chirp.
+    client.play_audio.reset_mock()
+    run_once(client, lambda hours: [started], CFG, later + timedelta(seconds=10), dry_run=False, state=state)
+    client.play_audio.assert_not_called()
+
+def test_run_once_chirp_disabled_never_fires():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    client.play_audio.return_value = True
+    cfg = {"calendar_countdown": {**CFG["calendar_countdown"], "chirp": False}}
+    state: dict = {}
+    upcoming = make_event(0.2)
+    run_once(client, lambda hours: [upcoming], cfg, NOW, dry_run=False, state=state)
+    started = CalEvent(upcoming.title, upcoming.start, upcoming.start + timedelta(minutes=30), False)
+    later = upcoming.start + timedelta(seconds=1)
+    run_once(client, lambda hours: [started], cfg, later, dry_run=False, state=state)
+    client.play_audio.assert_not_called()
+
+def test_run_once_restart_mid_event_does_not_chirp():
+    # Fresh state dict (as if the process just started) whose very first
+    # poll already finds the event in_progress -- no chirp, matching
+    # should_chirp's documented restart-safety edge case.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    client.play_audio.return_value = True
+    state: dict = {}
+    active = make_event(-2, dur_min=30, title="Active")
+    run_once(client, lambda hours: [active], CFG, NOW, dry_run=False, state=state)
+    client.play_audio.assert_not_called()
+
+def test_run_once_chirp_retries_next_poll_if_play_fails():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    client.play_audio.return_value = False   # transient failure
+    state: dict = {}
+    upcoming = make_event(0.2)
+    run_once(client, lambda hours: [upcoming], CFG, NOW, dry_run=False, state=state)
+    started = CalEvent(upcoming.title, upcoming.start, upcoming.start + timedelta(minutes=30), False)
+    later = upcoming.start + timedelta(seconds=1)
+    run_once(client, lambda hours: [started], CFG, later, dry_run=False, state=state)
+    assert client.play_audio.call_count == 1
+
+    # Retries on the next poll since the failure wasn't committed.
+    client.play_audio.return_value = True
+    run_once(client, lambda hours: [started], CFG, later + timedelta(seconds=5), dry_run=False, state=state)
+    assert client.play_audio.call_count == 2
+
+def test_run_once_dry_run_never_chirps():
+    client = Mock()
+    state: dict = {}
+    upcoming = make_event(0.2)
+    run_once(client, lambda hours: [upcoming], CFG, NOW, dry_run=True, state=state)
+    started = CalEvent(upcoming.title, upcoming.start, upcoming.start + timedelta(minutes=30), False)
+    later = upcoming.start + timedelta(seconds=1)
+    run_once(client, lambda hours: [started], CFG, later, dry_run=True, state=state)
+    client.play_audio.assert_not_called()
+
+
+# --- state["next_start"] bookkeeping (feeds main()'s sleep-shortening) -----------
+
+def test_run_once_records_next_start_for_upcoming_event():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    state: dict = {}
+    event = make_event(23)
+    run_once(client, lambda hours: [event], CFG, NOW, dry_run=False, state=state)
+    assert state["next_start"] == event.start
+
+def test_run_once_next_start_none_when_in_progress():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    state: dict = {}
+    active = make_event(-5, dur_min=30, title="Active")
+    run_once(client, lambda hours: [active], CFG, NOW, dry_run=False, state=state)
+    assert state["next_start"] is None
+
+def test_run_once_next_start_none_when_no_event():
+    client = Mock()
+    state: dict = {}
+    run_once(client, lambda hours: [], CFG, NOW, dry_run=False, state=state)
+    assert state["next_start"] is None
