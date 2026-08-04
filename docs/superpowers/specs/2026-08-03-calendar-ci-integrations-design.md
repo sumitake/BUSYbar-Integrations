@@ -427,3 +427,128 @@ assert the rows where that color appears fall entirely within the
 element's expected row band (`title` ⊆ rows 0-4, `time`/`ends`/`cd_text` ⊆
 rows 6-15, no element's ink row set includes row 5, the track). See the
 implementation report for the verbatim check output and captures.
+
+## 2026-08-03 — v1.4 "airy" display refinement
+
+**Status:** Implemented (branch `dev/claude/display-v1.4`).
+
+Operator-approved refinement on top of the v1.3.1 correction: more
+breathing room, card surfaces removed entirely, both numerals (`time` and
+`cd_text`) drop from `extra_large` (10px bold) to `large` (9px) so they
+stay equal-sized. `logic.build_elements`'s signature and `main.run_once`'s
+public contract (dry-run behavior, summary strings ending in the
+`DrawResult` value, priority 20, `timeout = 1.5 * poll_seconds`) are
+unchanged. Config keys are unchanged.
+
+### Design principles (operator-set)
+
+These govern this and future display iterations, not just v1.4:
+
+- **Card/panel surfaces are acceptable ONLY with strong luminance contrast**
+  against both the ambient background and their own text: either a
+  near-black surface with bright text, or an inverse chip (bright saturated
+  surface with near-black text, as the `ci_status` failure badge does).
+  Mid-luminance dim fills -- the v1.3.1 cards (`#062238`, `#062A22`, etc.)
+  -- read as glow-mud on emissive LEDs and are prohibited. This is why v1.4
+  removes card surfaces entirely rather than re-tuning their luminance.
+- **Numerals track the countdown's size: both change together, never
+  independently.** `time` and `cd_text` always use the same font (`large`
+  in v1.4); a future size change must move both, not one.
+- **Any geometry change must pass the frame-capture ink-overlap + buffer
+  gate before merge** -- the same programmatic verification methodology
+  used for this section's verification (below), not a visual glance at a
+  single static frame. This directive is itself the direct product of the
+  v1.3 mash: a cursory visual check missed both root causes there.
+
+### Row budget (where the freed rows went)
+
+v1.3.1 (with cards) used all 16 rows edge-to-edge with no deliberate gaps:
+title ink 0-4, track 5, cards+content 6-15. v1.4 removes the cards and
+opens up a genuine blank buffer row, trading density for legibility:
+
+| Rows | v1.3.1 | v1.4 |
+|---|---|---|
+| 0-4 | `title` ink (small, y=0) | `title` ink (small, y=-2) -- same height, shifted up 2px (top-flush) |
+| 5 | `track`/`track_fill` ink (y=5) | **blank buffer** -- deliberate, asserted in tests and on-device |
+| 6 | (inside `time_card`/`cd_card`, y=6) | `track`/`track_fill` ink (moved down to y=6, now edge-to-edge -- the "horizon line") |
+| 7 | (inside cards) | **blank buffer** -- 1px gap between the track and the numerals below |
+| 8-14 | `time`/`cd_text` ink (extra_large, inside cards) / `ends` ink (bold) | `ends` ink (bold, y=6) -- unchanged position from v1.3.1, still coexists numerically with the track's `y` but not its ink (offset places it 2 rows below) |
+| 15 | (inside cards, bottom-flush) | `time`/`cd_text` ink continues to here (large, y=5) -- bottom-flush, deliberate |
+
+Net effect: the panel now has two genuine 1px negative-space rows (5 and
+7) it didn't have before, at the cost of ~1px of numeral height (9px vs
+10px bold) -- the explicit "more breathing room" trade the operator asked
+for.
+
+### Element table (`integrations/calendar_countdown/logic.build_elements`)
+
+No card elements in v1.4. `time` and `ends` are mutually exclusive
+(upcoming vs. in-progress); everything else is always drawn.
+
+| id | type | geometry | notes |
+|---|---|---|---|
+| `bg` | rectangle | x0 y0 72×16 | unchanged from v1.3.1: `fill=gradient_v`, per-state colors, `border_width=0` |
+| `title` | text | x2 y-2 w68, font `small` | uppercased, per-state color, ink rows 0-4; 2px side margins (was x1 w70) |
+| `track` | rectangle | x0 y6 72×1 | fixed `#24193BFF`, solid, edge-to-edge, `border_width=0` (was y5) |
+| `track_fill` | rectangle | x0 y6 w×1 | same drain math and per-state fills as v1.3.1, just moved to y6 |
+| `time` (upcoming only) | text | x2 y5, font `large` | fixed `#8DDEFFFF`, local `HH:MM`, ink rows 7-15, floats on `bg` (no card) |
+| `ends` (in-progress only) | text | x2 y6, font `bold` | fixed `#8CFFF4FF`, literal `"ENDS"`, ink rows 8-14 (position unchanged from v1.3.1; only x moved 3→2) |
+| `divider` | rectangle | x34 y8 2×7 | per-state solid, ink rows 8-14, `border_width=0` (was y6 h10) |
+| `cd_text` | text | x39 y5, font `large` | per-state digit color; `_format_countdown(minutes_left)`; ink rows 7-15, floats on `bg` (no card); no `align` field |
+
+### `cd_text` countdown format -- width check redesigned (important finding)
+
+The v1.3.1 spec's `>=10h -> hour-only` cutoff, re-verified on-device for
+the new `large` font, turned out **unsafe even for single-digit hours**:
+this font's `'1'` glyph measures 5px advance vs 7px for every other digit
+(a ~30% difference measured by on-device glyph differencing -- see
+`GLYPH_ADVANCE_PX` in `logic.py`). Whether a given `"<H>h<MM>m"` string
+fits the 33px budget (`CD_TEXT_MAX_WIDTH = 72 - 39`) therefore depends on
+which actual digits appear, not on the hour count:
+
+| String | Measured width | Fits 33px? |
+|---|---|---|
+| `"1h05m"` | 32px | yes |
+| `"1h59m"` | 32px | yes (hours digit's `'1'` is enough headroom regardless of minutes) |
+| `"9h11m"` | 30px | yes (two `'1'`s in the minutes rescue a non-`'1'` hours digit) |
+| `"2h05m"` | 34px | **no** |
+| `"5h55m"` | 34px | **no** |
+| `"9h59m"` | 34px | **no** |
+| `"0h00m"` | 34px | **no** (not reachable in practice -- hours=0 always uses the `"<M>m"` form) |
+
+`_format_countdown` now computes the full form's actual width via
+`GLYPH_ADVANCE_PX`/`_text_width_px` and falls back to the hour-only `"<H>h"`
+form per-string, rather than on a fixed hour threshold. Two-digit hours
+(10+) fail the same check on their own digits and fall through to
+hour-only with no special case needed -- the v1.3.1 spec's stated behavior
+("10+ hours drop minutes") holds as an emergent outcome, just via a
+different, more accurate mechanism than originally designed. `time`'s own
+budget was also re-checked: `"HH:MM"` (`"00:00"`–`"23:59"`) measures 29px
+against a 32px budget (x2 to the divider at x34) -- comfortable margin, no
+fallback needed there.
+
+### Firmware findings from on-device verification
+
+- Ink-offset model (established in the v1.3.1 correction) holds for the
+  `large` font too: requested `y` + 2px = actual ink start row, confirmed
+  by direct glyph-height measurement (`"1h05m"` at `y=0` measured ink rows
+  2-10, i.e. 9px tall starting 2 rows below the requested `y` -- matches
+  `large`/`FONT_BUSY_REGULAR_9`'s known 9px height exactly).
+  `RectangleElement`s (the `track` and `divider`) have no such offset.
+- The `large` font is genuinely not fixed-width (see the width-check
+  section above) -- this project's earlier font-width constants
+  (`SMALL_FONT_CHAR_PX`, the retired `CD_TEXT_CHAR_PX`) were flat
+  per-character averages that happened to work well enough for their
+  purposes (a scroll/no-scroll decision has slack; a hard pixel budget for
+  a right-flush numeral does not). `GLYPH_ADVANCE_PX` is the first
+  per-glyph (not per-font-average) width table in this codebase.
+
+**Verification** used the same programmatic ink-overlap methodology as the
+v1.3.1 correction, extended with buffer- and margin-specific checks per
+this round's brief: row 5 has no foreground ink (bg-gradient only);
+columns 0-1 carry no `title`/`time`/`ends`/`cd_text`/`divider` ink (only
+the full-width `bg`/`track`/`track_fill` legitimately span there); the
+divider has at least one blank column on each side (checked directly:
+neither the neighboring text's ink nor the divider's own ink reaches the
+immediately adjacent column). See the implementation report for the
+verbatim check output and captures.
