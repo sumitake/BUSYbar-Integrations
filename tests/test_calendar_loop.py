@@ -117,6 +117,53 @@ def test_no_transition_clear_when_state_omitted():
     run_once(client, lambda hours: [active], CFG, NOW, dry_run=False)
     client.clear.assert_not_called()
 
+def test_failed_draw_leaves_state_unchanged_and_retries_next_poll():
+    # (a) A transition poll whose draw() doesn't land (UNREACHABLE here, but
+    # the same reasoning applies to REJECTED/ERROR) must not commit `state`
+    # -- otherwise no future poll would ever retry the clear+draw pair, and
+    # a stale element set from before the transition would persist
+    # indefinitely instead of just until its own bounded timeout.
+    client = Mock()
+    client.draw.return_value = DrawResult.DRAWN
+    state = {}
+    run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
+    assert state["in_progress"] is False
+
+    active = make_event(-5, dur_min=30, title="Active")
+    fetch = lambda hours: [active]
+
+    client.draw.return_value = DrawResult.UNREACHABLE
+    run_once(client, fetch, CFG, NOW, dry_run=False, state=state)
+    assert state["in_progress"] is False   # unchanged: draw never landed
+    assert client.clear.call_count == 1    # transition was still detected and clear attempted
+    assert client.draw.call_count == 2
+
+    # Next poll: state still mismatches (unchanged above), so it retries
+    # clear() then draw(); this time draw succeeds and state finally commits.
+    client.draw.return_value = DrawResult.DRAWN
+    run_once(client, fetch, CFG, NOW, dry_run=False, state=state)
+    assert client.clear.call_count == 2
+    assert client.draw.call_count == 3
+    assert state["in_progress"] is True
+
+def test_clear_failure_does_not_block_state_commit_when_draw_succeeds():
+    # (b) clear()'s own return value is intentionally ignored -- only
+    # draw()'s result gates the state commit (see the comment in
+    # main.run_once). If clear() fails but draw() still lands the new
+    # element set, state should commit as transitioned: any leftover stale
+    # ids are bounded by their own original timeout (a one-off, self-healing
+    # gap), and gating on clear() too would make a persistently-failing
+    # clear() retry every poll forever even once draws keep succeeding.
+    client = Mock()
+    client.clear.return_value = False
+    client.draw.return_value = DrawResult.DRAWN
+    state = {}
+    run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
+    active = make_event(-5, dur_min=30, title="Active")
+    run_once(client, lambda hours: [active], CFG, NOW, dry_run=False, state=state)
+    client.clear.assert_called_once_with("calendar_countdown")
+    assert state["in_progress"] is True
+
 def test_state_reset_after_no_event_clear():
     client = Mock()
     client.draw.return_value = DrawResult.DRAWN

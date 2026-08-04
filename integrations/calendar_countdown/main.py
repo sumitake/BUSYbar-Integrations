@@ -67,11 +67,27 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
         return f"DRY-RUN would draw: {label} (in_progress={in_progress})"
 
     if state is not None and state.get("in_progress") not in (None, in_progress):
+        # clear()'s own success/failure is intentionally not checked here --
+        # only draw()'s result (below) gates whether `state` commits. If
+        # clear() silently fails but draw() then succeeds, the new element
+        # set is still correctly installed via the id-upsert; any leftover
+        # stale ids from before the failed clear are bounded by their own
+        # original timeout, a one-off gap that self-heals, not a reason to
+        # re-clear on every subsequent poll. Gating on clear() too would mean
+        # a persistently-failing clear() retries forever even once draw()
+        # keeps succeeding, since `state` would never converge.
         client.clear(APP)
 
     elements = build_elements(event, now, c, timeout_s, in_progress)
     result = client.draw(APP, elements=elements, priority=PRIORITY)
-    if state is not None:
+    if state is not None and result == DrawResult.DRAWN:
+        # Only commit the transition once it actually lands on the device.
+        # If draw() failed (UNREACHABLE/REJECTED/ERROR), leave `state`
+        # unchanged so the next poll still sees the same mismatch and
+        # retries the clear+draw pair, rather than assuming a transition
+        # happened that never actually reached the device -- which would
+        # otherwise let stale elements from the old layout persist
+        # unbounded (no further poll would ever re-attempt the clear).
         state["in_progress"] = in_progress
     return f"drew {label} -> {result.value}"
 

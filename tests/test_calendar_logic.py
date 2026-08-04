@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 from calendar_countdown.logic import (
     CalEvent, select_next_event, select_active_event, ascii_safe,
     build_elements, _track_fill_width, _state_for, _title_fits,
-    STATE_NORMAL, STATE_NOTICE, STATE_WARNING, STATE_IN_PROGRESS,
+    STATE_NORMAL, STATE_NOTICE, STATE_WARNING, STATE_IN_PROGRESS, STATES,
     BG_GRADIENT, TITLE_COLOR, TRACK_COLOR, TRACK_FILL_GRADIENT,
     TRACK_FILL_IN_PROGRESS, TIME_CARD_COLOR, TIME_TEXT_COLOR,
     ENDS_TEXT_COLOR, ENDS_TEXT, DIVIDER_COLOR, CD_CARD_COLOR, DIGIT_COLOR,
@@ -69,8 +69,7 @@ def test_every_state_has_a_palette_entry_in_every_state_keyed_table():
     tables = [BG_GRADIENT, TITLE_COLOR, TRACK_FILL_GRADIENT, DIVIDER_COLOR, CD_CARD_COLOR, DIGIT_COLOR]
     for table in tables:
         # TRACK_FILL_GRADIENT intentionally omits in_progress (solid fill instead).
-        expected = {STATE_NORMAL, STATE_NOTICE, STATE_WARNING} if table is TRACK_FILL_GRADIENT else \
-                   {STATE_NORMAL, STATE_NOTICE, STATE_WARNING, STATE_IN_PROGRESS}
+        expected = set(STATES) - {STATE_IN_PROGRESS} if table is TRACK_FILL_GRADIENT else set(STATES)
         assert set(table) == expected
 
 
@@ -108,6 +107,12 @@ def test_build_elements_upcoming_shape():
     els = build_elements(e, NOW, CFG, timeout_s=90, in_progress=False)
     by_id = {el["id"]: el for el in els}
     assert set(by_id) == {"bg", "title", "track", "track_fill", "time_card", "time", "divider", "cd_card", "countdown"}
+    # Draw order is z-order (first = behind); set-membership alone wouldn't
+    # catch a reorder that visually breaks layering (e.g. cd_card drawn
+    # after countdown would hide the countdown digits behind its fill).
+    assert [el["id"] for el in els] == [
+        "bg", "title", "track", "track_fill", "time_card", "time", "divider", "cd_card", "countdown",
+    ]
 
     bg = by_id["bg"]
     assert bg["type"] == "rectangle" and bg["x"] == 0 and bg["y"] == 0
@@ -227,6 +232,11 @@ def test_build_elements_in_progress_shape():
     by_id = {el["id"]: el for el in els}
     assert set(by_id) == {"bg", "title", "track", "track_fill", "ends", "divider", "cd_card", "countdown"}
     assert "time_card" not in by_id and "time" not in by_id  # no start-time label while in progress
+    # Draw order is z-order (first = behind); see the upcoming-shape test
+    # for why set-membership alone isn't enough to catch a reorder.
+    assert [el["id"] for el in els] == [
+        "bg", "title", "track", "track_fill", "ends", "divider", "cd_card", "countdown",
+    ]
 
     bg = by_id["bg"]
     assert bg["fill_colors"] == BG_GRADIENT[STATE_IN_PROGRESS]
