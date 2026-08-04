@@ -9,6 +9,11 @@ def test_defaults_when_no_file(tmp_path):
     assert cfg["ci_status"]["show_running"] is True
     assert cfg["ci_status"]["running_poll_seconds"] == 20
     assert cfg["ci_status"]["show_quota"] is True
+    # v1.5.1 account-wide watching defaults
+    assert cfg["ci_status"]["watch_account_repos"] is False
+    assert cfg["ci_status"]["repos_exclude"] == []
+    assert cfg["ci_status"]["active_within_days"] == 30
+    assert cfg["ci_status"]["repo_refresh_minutes"] == 60
 
 def test_file_overrides_defaults(tmp_path):
     p = tmp_path / "config.toml"

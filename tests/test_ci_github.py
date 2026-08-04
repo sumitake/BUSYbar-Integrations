@@ -198,3 +198,117 @@ def test_fetch_rate_limit_none_on_malformed_json(mock_get):
     resp.json.side_effect = ValueError("Invalid JSON")
     mock_get.return_value = resp
     assert RestPoller("tok").fetch_rate_limit() is None
+
+
+# --- fetch_account_repos: discovery, pagination, page-1-only ETag (v1.5.1) ------
+
+def _list_response(status: int, body: list | None = None, etag: str | None = None) -> Mock:
+    resp = Mock()
+    resp.status_code = status
+    resp.json.return_value = [] if body is None else body
+    resp.headers = {"ETag": etag} if etag else {}
+    return resp
+
+def _repo(full_name: str, pushed_at: str = "2026-08-03T10:00:00Z", archived: bool = False) -> dict:
+    return {"full_name": full_name, "archived": archived, "pushed_at": pushed_at}
+
+@patch("ci_status.github.requests.get")
+def test_fetch_account_repos_single_page_passthrough(mock_get):
+    repos = [_repo("o/a"), _repo("o/b")]
+    mock_get.return_value = _list_response(200, repos, etag='W/"page1"')
+    poller = RestPoller("tok")
+    assert poller.fetch_account_repos() == repos
+    assert mock_get.call_args.args[0] == "https://api.github.com/user/repos"
+    assert mock_get.call_args.kwargs["params"] == {"affiliation": "owner", "sort": "pushed", "per_page": 100}
+    assert "If-None-Match" not in mock_get.call_args.kwargs["headers"]
+
+@patch("ci_status.github.requests.get")
+def test_fetch_account_repos_uses_cached_etag_on_next_call(mock_get):
+    mock_get.return_value = _list_response(200, [_repo("o/a")], etag='W/"page1"')
+    poller = RestPoller("tok")
+    poller.fetch_account_repos()
+
+    mock_get.return_value = _list_response(304)
+    assert poller.fetch_account_repos() is None   # 304 -> caller keeps its own cached list
+    assert mock_get.call_args.kwargs["headers"]["If-None-Match"] == 'W/"page1"'
+
+@patch("ci_status.github.requests.get")
+def test_fetch_account_repos_paginates_across_multiple_pages(mock_get):
+    page1 = [_repo(f"o/r{i}") for i in range(100)]   # exactly 100 -> triggers page 2
+    page2 = [_repo("o/r100"), _repo("o/r101")]        # < 100 -> stops here
+    mock_get.side_effect = [_list_response(200, page1), _list_response(200, page2)]
+    poller = RestPoller("tok")
+    result = poller.fetch_account_repos()
+    assert len(result) == 102
+    assert result[-1]["full_name"] == "o/r101"
+    # Page 2 request carries no If-None-Match -- only page 1 gets a slot.
+    second_call = mock_get.call_args_list[1]
+    assert second_call.kwargs["params"]["page"] == 2
+    assert "If-None-Match" not in second_call.kwargs["headers"]
+
+@patch("ci_status.github.requests.get")
+def test_fetch_account_repos_partial_pagination_failure_keeps_earlier_pages(mock_get):
+    page1 = [_repo(f"o/r{i}") for i in range(100)]
+    mock_get.side_effect = [_list_response(200, page1), _list_response(500)]
+    poller = RestPoller("tok")
+    result = poller.fetch_account_repos()
+    assert len(result) == 100   # page 1 kept, page 2's failure just stops pagination
+
+@patch("ci_status.github.requests.get")
+def test_fetch_account_repos_swallows_network_errors(mock_get):
+    mock_get.side_effect = requests.ConnectionError()
+    assert RestPoller("tok").fetch_account_repos() is None
+
+@patch("ci_status.github.requests.get")
+def test_fetch_account_repos_none_on_non_200(mock_get):
+    mock_get.return_value = _list_response(403)
+    assert RestPoller("tok").fetch_account_repos() is None
+
+@patch("ci_status.github.requests.get")
+def test_fetch_account_repos_none_on_malformed_json(mock_get):
+    resp = Mock()
+    resp.status_code = 200
+    resp.headers = {}
+    resp.json.side_effect = ValueError("Invalid JSON")
+    mock_get.return_value = resp
+    assert RestPoller("tok").fetch_account_repos() is None
+
+@patch("ci_status.github.requests.get")
+def test_fetch_account_repos_none_on_unexpected_shape(mock_get):
+    # A dict instead of a list would indicate something is very wrong
+    # (wrong endpoint, API change) -- must not silently misinterpret it.
+    mock_get.return_value = _response_dict_shape()
+    assert RestPoller("tok").fetch_account_repos() is None
+
+def _response_dict_shape() -> Mock:
+    resp = Mock()
+    resp.status_code = 200
+    resp.headers = {}
+    resp.json.return_value = {"not": "a list"}
+    return resp
+
+@patch("ci_status.github.requests.get")
+def test_fetch_account_repos_empty_account_returns_empty_list_not_none(mock_get):
+    # Zero owned repos is a legitimate (if unusual) real answer -- distinct
+    # from None, which means "treat as unknown, keep whatever was cached."
+    mock_get.return_value = _list_response(200, [])
+    assert RestPoller("tok").fetch_account_repos() == []
+
+
+# --- forget_repo: drops both ETag slots for a repo (v1.5.1) ---------------------
+
+@patch("ci_status.github.requests.get")
+def test_forget_repo_clears_both_etag_slots(mock_get):
+    poller = RestPoller("tok")
+    mock_get.return_value = _response(200, {"workflow_runs": []}, etag='W/"a"')
+    poller.fetch_runs("o/r")
+    mock_get.return_value = _response(200, {"workflow_runs": []}, etag='W/"b"')
+    poller.fetch_running_runs("o/r")
+    assert "o/r" in poller._etags and "o/r" in poller._running_etags
+
+    poller.forget_repo("o/r")
+    assert "o/r" not in poller._etags
+    assert "o/r" not in poller._running_etags
+
+def test_forget_repo_unknown_repo_is_a_no_op():
+    RestPoller("tok").forget_repo("never/seen")   # must not raise

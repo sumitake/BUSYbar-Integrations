@@ -24,3 +24,12 @@ show_running = true          # show a badge (alternating with the calendar) whil
 running_poll_seconds = 20    # poll interval while a run is active (shortened from poll_seconds)
 show_quota = true            # GraphQL/REST quota frames join the overlay rotation while a run
                               # is active (no effect if show_running is false)
+
+# Account-wide watching (v1.5.1) -- off by default. When on, the watch list
+# becomes auto-discovered account repos UNION `repos` above, MINUS
+# repos_exclude below. See ci_status/README.md's "Account-wide watching"
+# section for quota math and the active-window caveat before enabling.
+watch_account_repos = false
+# repos_exclude = ["your-user/archived-experiment"]  # silence specific repos without leaving account mode
+active_within_days = 30      # only repos pushed within this window are polled
+repo_refresh_minutes = 60    # how often the repo list itself is re-enumerated (new repos picked up within this interval)

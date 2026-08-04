@@ -11,6 +11,7 @@ from ci_status.logic import (
     _pr_or_branch, select_running_run, compute_median_duration_minutes,
     _format_eta_text, _progress_width, _build_running_title,
     parse_rate_limit, _quota_headroom, _quota_used_width,
+    resolve_repo_list,
 )
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS, PRIORITY_ALERT
 
@@ -464,3 +465,78 @@ def test_payload_no_overlay_falls_through_to_quiet_or_green_as_before():
     assert build_ci_payload([RepoState("o/r", [], [])], False, 180, overlay=None) is None
     payload = build_ci_payload([RepoState("o/r", [], [])], True, 180, overlay=None)
     assert payload["priority"] == PRIORITY_ALERT
+
+
+# --- resolve_repo_list (v1.5.1 account-wide watching) -----------------------------
+
+def _account_repo(full_name, pushed_days_ago=1, archived=False):
+    pushed = (NOW - timedelta(days=pushed_days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"full_name": full_name, "archived": archived, "pushed_at": pushed}
+
+def test_resolve_repo_list_account_mode_off_is_just_repos_minus_exclude():
+    result = resolve_repo_list(["o/a", "o/b"], ["o/b"], False,
+                               [_account_repo("o/c")], 30, NOW)
+    assert result == ["o/a"]   # account_repos ignored entirely when the mode is off
+
+def test_resolve_repo_list_unions_explicit_and_discovered():
+    account = [_account_repo("o/discovered")]
+    result = resolve_repo_list(["o/explicit"], [], True, account, 30, NOW)
+    assert result == ["o/discovered", "o/explicit"]
+
+def test_resolve_repo_list_excludes_apply_in_account_mode():
+    account = [_account_repo("o/a"), _account_repo("o/b")]
+    result = resolve_repo_list([], ["o/b"], True, account, 30, NOW)
+    assert result == ["o/a"]
+
+def test_resolve_repo_list_filters_out_stale_pushed_repos():
+    account = [_account_repo("o/fresh", pushed_days_ago=5),
+              _account_repo("o/stale", pushed_days_ago=45)]
+    result = resolve_repo_list([], [], True, account, active_within_days=30, now=NOW)
+    assert result == ["o/fresh"]
+
+def test_resolve_repo_list_active_within_days_boundary_is_inclusive():
+    # Exactly at the cutoff (pushed_at == now - active_within_days) IS
+    # included -- the exclusion test is `pushed < cutoff` (strict), so the
+    # boundary instant itself counts as "within the window."
+    account = [_account_repo("o/exact", pushed_days_ago=30)]
+    result = resolve_repo_list([], [], True, account, active_within_days=30, now=NOW)
+    assert result == ["o/exact"]
+
+    # One second past the boundary is excluded.
+    just_over = {"full_name": "o/just_over", "archived": False,
+                "pushed_at": (NOW - timedelta(days=30, seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    result2 = resolve_repo_list([], [], True, [just_over], active_within_days=30, now=NOW)
+    assert result2 == []
+
+def test_resolve_repo_list_explicit_repos_never_filtered_by_staleness():
+    # o/explicit was pushed 400 days ago -- would fail the active-window
+    # filter if it were subject to it, but it's in `repos`, not discovered.
+    account = [_account_repo("o/explicit", pushed_days_ago=400)]
+    result = resolve_repo_list(["o/explicit"], [], True, account, active_within_days=30, now=NOW)
+    assert result == ["o/explicit"]
+
+def test_resolve_repo_list_archived_repos_excluded():
+    account = [_account_repo("o/live"), _account_repo("o/dead", archived=True)]
+    result = resolve_repo_list([], [], True, account, 30, NOW)
+    assert result == ["o/live"]
+
+def test_resolve_repo_list_none_account_repos_falls_back_to_repos_only():
+    # e.g. discovery hasn't succeeded yet and there's no cached list.
+    result = resolve_repo_list(["o/a"], [], True, None, 30, NOW)
+    assert result == ["o/a"]
+
+def test_resolve_repo_list_malformed_pushed_at_skipped_not_crashed():
+    account = [{"full_name": "o/bad", "archived": False, "pushed_at": "not-a-date"},
+              _account_repo("o/good")]
+    result = resolve_repo_list([], [], True, account, 30, NOW)
+    assert result == ["o/good"]
+
+def test_resolve_repo_list_dedupes_explicit_and_discovered_overlap():
+    account = [_account_repo("o/both")]
+    result = resolve_repo_list(["o/both"], [], True, account, 30, NOW)
+    assert result == ["o/both"]   # not ["o/both", "o/both"]
+
+def test_resolve_repo_list_sorted_deterministic_order():
+    account = [_account_repo("z/last"), _account_repo("a/first")]
+    result = resolve_repo_list(["m/middle"], [], True, account, 30, NOW)
+    assert result == ["a/first", "m/middle", "z/last"]

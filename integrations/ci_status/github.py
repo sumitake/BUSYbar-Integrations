@@ -37,6 +37,11 @@ class RestPoller:
         # running-runs check which must be fresh every cycle to track
         # elapsed time. Populated lazily by fetch_median_eta.
         self._eta_cache: dict[int, float | None] = {}
+        # Account-wide repo discovery (v1.5.1): only page 1 of
+        # /user/repos gets a conditional-request slot -- see
+        # fetch_account_repos's docstring for why pages 2+ deliberately
+        # don't get one.
+        self._account_repos_etag: str | None = None
 
     def _headers(self) -> dict:
         return {
@@ -156,3 +161,94 @@ class RestPoller:
         except ValueError as exc:
             log.warning("github returned non-JSON (rate_limit fetch): %s", exc)
             return None
+
+    def fetch_account_repos(self) -> list[dict] | None:
+        """GET /user/repos?affiliation=owner&sort=pushed&per_page=100,
+        paginated (v1.5.1 account-wide watching). Includes private repos
+        -- that's intentional and fine, since both the resulting config
+        state and the physical display are local to the operator's own
+        device; see the README's "Account-wide watching" section for the
+        explicit note that private repo names can render on-screen.
+
+        Only page 1 uses a conditional (ETag) request. This is a
+        deliberate tradeoff, not an oversight: `sort=pushed` puts the
+        most-recently-active repos first, so page 1's ETag is the cheap
+        common-case win (a single-page account -- the overwhelming
+        majority -- gets a 304 whenever nothing relevant changed, costing
+        zero quota); paying for pages 2+ on every re-enumeration (which
+        itself only runs every `repo_refresh_minutes`, not every poll) is
+        an acceptable, rare cost for >100-repo accounts, and it avoids a
+        subtler correctness trap: reusing a stale cached page 2+ result
+        on a page-1 304 could miss a `pushed_at` update to a repo that
+        moved within page 2 without ever crossing into page 1.
+
+        Returns `None` on a page-1 304 (nothing changed) or any failure
+        (network, non-200, malformed JSON) at any page -- the caller
+        (`main._refresh_account_repos`) treats `None` as "keep whatever
+        was cached before" and logs a warning on a genuine failure, never
+        falling back to an empty list (an empty list would look
+        indistinguishable from "this account genuinely owns zero repos,"
+        which would silently stop watching everything).
+        """
+        url = f"{API}/user/repos"
+        headers = self._headers()
+        if self._account_repos_etag is not None:
+            headers["If-None-Match"] = self._account_repos_etag
+        try:
+            resp = requests.get(url, headers=headers,
+                                params={"affiliation": "owner", "sort": "pushed", "per_page": 100},
+                                timeout=(5, 15))
+        except requests.RequestException as exc:
+            log.debug("github unreachable (account repo enumeration): %s", exc)
+            return None
+        if resp.status_code == 304:
+            return None
+        if resp.status_code != 200:
+            log.warning("github %s (account repo enumeration)", resp.status_code)
+            return None
+        if "ETag" in resp.headers:
+            self._account_repos_etag = resp.headers["ETag"]
+        try:
+            page_items = resp.json()
+        except ValueError as exc:
+            log.warning("github returned non-JSON (account repo enumeration): %s", exc)
+            return None
+        if not isinstance(page_items, list):
+            log.warning("github returned unexpected shape (account repo enumeration)")
+            return None
+
+        repos = list(page_items)
+        page = 2
+        while len(page_items) == 100 and page <= 10:  # cap: 1000 owned repos
+            try:
+                resp = requests.get(url, headers=self._headers(),
+                                    params={"affiliation": "owner", "sort": "pushed",
+                                           "per_page": 100, "page": page},
+                                    timeout=(5, 15))
+            except requests.RequestException as exc:
+                log.debug("github unreachable (account repo enumeration page %d): %s", page, exc)
+                break  # a partial result is still better than discarding everything
+            if resp.status_code != 200:
+                log.warning("github %s (account repo enumeration page %d)", resp.status_code, page)
+                break
+            try:
+                page_items = resp.json()
+            except ValueError as exc:
+                log.warning("github returned non-JSON (account repo enumeration page %d): %s", page, exc)
+                break
+            if not isinstance(page_items, list):
+                break
+            repos.extend(page_items)
+            page += 1
+        return repos
+
+    def forget_repo(self, repo: str) -> None:
+        """Drop cached conditional-request state (both ETag slots) for a
+        repo that has left the effective watch list -- excluded, aged out
+        of `active_within_days`, or deleted upstream (v1.5.1). Called by
+        `main.run_once` alongside `state_cache`/`running_cache` pruning so
+        a repo that's later re-added (e.g. it becomes active again) starts
+        with a clean conditional-request slate instead of an ETag from a
+        stale enumeration."""
+        self._etags.pop(repo, None)
+        self._running_etags.pop(repo, None)

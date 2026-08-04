@@ -1,6 +1,6 @@
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Reuse the calendar integration's generic text/formatting helpers rather
@@ -67,6 +67,64 @@ class QuotaInfo:
 
 def _parse_ts(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_repos: bool,
+                      account_repos: list[dict] | None, active_within_days: int,
+                      now: datetime) -> list[str]:
+    """The effective set of repos to poll this cycle (v1.5.1 account-wide
+    watching).
+
+    In account mode (`watch_account_repos`), the watch list is the union
+    of auto-discovered account repos -- filtered to non-archived and
+    pushed within `active_within_days` -- and the explicit `repos` list.
+    An explicitly configured repo is always included regardless of its
+    own push recency: the user named it on purpose, so staleness
+    filtering shouldn't silently drop it. `account_repos` (raw dicts from
+    `RestPoller.fetch_account_repos`, or the caller's cached copy of an
+    earlier successful fetch) may be `None` or empty -- e.g. enumeration
+    hasn't succeeded yet, or `watch_account_repos` is off -- in which
+    case the result is just `repos` minus `repos_exclude`, same as
+    pre-v1.5.1 behavior.
+
+    `repos_exclude` is applied last, unconditionally, in both modes --
+    always a no-op when empty, not something that only matters in
+    account mode -- so a user can silence a noisy repo without leaving
+    account mode, or (less commonly) without editing an explicit `repos`
+    list either.
+
+    Caveat (documented in the README too): a repo whose most recent push
+    predates `active_within_days` is excluded from account-mode
+    discovery even if it has a *schedule*-triggered workflow run more
+    recent than that -- `pushed_at` is a repo-level field, not aware of
+    scheduled/dispatched runs that don't touch the git history. Such a
+    repo is only observed if named explicitly in `repos`.
+
+    Returns a sorted, deduplicated list -- the raw account-repo discovery
+    order (by `pushed_at`) isn't meaningful to callers, and a stable,
+    deterministic order makes both testing and reading `--dry-run` output
+    easier.
+    """
+    names = set(repos)
+    if watch_account_repos and account_repos:
+        cutoff = now - timedelta(days=active_within_days)
+        for r in account_repos:
+            if r.get("archived"):
+                continue
+            pushed_at = r.get("pushed_at")
+            if not pushed_at:
+                continue
+            try:
+                pushed = _parse_ts(pushed_at)
+            except (ValueError, TypeError):
+                continue
+            if pushed < cutoff:
+                continue
+            full_name = r.get("full_name")
+            if full_name:
+                names.add(full_name)
+    names -= set(repos_exclude)
+    return sorted(names)
 
 
 def evaluate_runs(repo: str, runs: list[dict], now: datetime,

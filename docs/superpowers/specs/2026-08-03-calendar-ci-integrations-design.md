@@ -904,3 +904,121 @@ has no effect when `show_running` is false, since the quota frames only
 ever appear as part of the running badge's own rotation. `calendar_countdown`'s
 `poll_seconds` default changed from 60 to 10 (see the tuning table above);
 existing configs that set `poll_seconds` explicitly are unaffected.
+
+## 2026-08-03 — v1.5.1 account-wide repo watching
+
+**Status:** Implemented, branch `dev/claude/account-wide-v1.5.1` off `main`
+(which by this point already includes the full v1.5 revision above, merged
+via PR #9). Not pushed.
+
+New feature: `ci_status` can watch every repo the operator owns instead of
+a fixed, manually-maintained `repos` list, with automatic pickup of newly
+created (or newly re-activated) repos -- no config edit or restart needed.
+
+### Config additions
+
+`[ci_status]` gains: `watch_account_repos = false` (default off -- the
+operator enables it locally, not shipped as a default, since it changes
+what gets polled/displayed without an explicit repo list), `repos_exclude
+= []`, `active_within_days = 30`, `repo_refresh_minutes = 60`.
+
+### Discovery (`RestPoller.fetch_account_repos`, `ci_status/github.py`)
+
+`GET /user/repos?affiliation=owner&sort=pushed&per_page=100`, paginated up
+to a 1000-repo cap (10 pages). Only page 1 carries a conditional-request
+(ETag) slot -- a deliberate choice: `sort=pushed` puts the most-recently-
+active repos first, so the common case (a single-page account) gets a free
+`304` whenever nothing relevant changed, while paying for pages 2+ on
+every re-enumeration (itself only every `repo_refresh_minutes`, not every
+poll) is an acceptable rare cost for >100-repo accounts. It also sidesteps
+a correctness trap: reusing a cached page-2+ result on a page-1 304 could
+miss a `pushed_at` update to a repo that moved within page 2 without
+crossing into page 1 -- so pages 2+ are always fetched fresh when needed,
+never cached across calls.
+
+Returns `None` (not an empty list) on a 304 or any failure at any page --
+an empty list is indistinguishable from "this account genuinely owns zero
+repos," which would silently stop watching everything. The caller
+(`main._refresh_account_repos`) treats `None` as "keep the previous
+cached list," logging a warning only when there is no previous list to
+fall back on yet.
+
+### List resolution (`resolve_repo_list`, `ci_status/logic.py`)
+
+Pure function: `repos` (explicit list, always included, never filtered by
+recency) **union** auto-discovered account repos filtered to
+non-archived + `pushed_at` within `active_within_days` **minus**
+`repos_exclude` (applied unconditionally in both modes, always a no-op
+when empty). Returns a sorted, deduplicated list -- the raw
+`pushed`-sort order from discovery isn't meaningful to callers.
+
+Caveat, documented in the README too: `pushed_at` is a repo-level field
+with no notion of schedule-triggered workflow runs. A repo whose CI only
+fires on a cron schedule (no pushes) ages out of `active_within_days` and
+stops being watched even while its scheduled runs keep firing, since
+nothing about a scheduled run touches `pushed_at`. Such a repo must be
+named explicitly in `repos` to stay watched indefinitely.
+
+### `run_once` integration (`ci_status/main.py`)
+
+New optional `repo_cache` parameter (same caller-owned-mutable-dict
+pattern as `running_cache`/`overlay_state`/`quota_cache`; omitting it
+skips account-wide discovery entirely and preserves the exact pre-v1.5.1
+behavior of polling `cfg["ci_status"]["repos"]` verbatim). Each poll
+resolves the effective repo list fresh (cheap -- a set operation over
+already-cached data, not a network call) via `resolve_repo_list`, calling
+`_refresh_account_repos` (mirrors `_refresh_quota`'s freshness-cache
+pattern) only when `watch_account_repos` is on and the cache is stale.
+
+Any repo present in `state_cache`/`running_cache` from a previous poll but
+absent from the freshly-resolved list -- excluded, aged out, or deleted
+upstream -- has its cached state dropped, and the poller's own per-repo
+ETag slots forgotten (`RestPoller.forget_repo`, pops both `_etags` and
+`_running_etags`), so a stale failure/stuck alert or running badge can't
+linger for a repo no longer being watched, and a repo that's later
+re-added starts with a clean conditional-request slate.
+
+Two related fixes needed for account-wide watching to actually work
+end-to-end, not just compile: `main()`'s "no repos configured" validation
+previously required a non-empty `repos` list unconditionally, which would
+have rejected a valid `watch_account_repos = true` / `repos = []`
+configuration outright -- now it only errors when *both* are empty/off.
+`next_poll_seconds` previously iterated `cfg_ci["repos"]` to check for an
+active run; since `running_cache`'s keys can now include auto-discovered
+repos never present in `repos` at all, that would have silently failed to
+shorten the poll interval for an active run on any auto-discovered repo,
+defeating a chunk of the alternation feature for exactly the repos this
+feature exists to add. Fixed to check `running_cache.values()` directly.
+
+### Quota math and the private-repo-name caveat
+
+See the README's "Account-wide watching" section for the full quota-cost
+breakdown (N watched repos x `poll_seconds` cadence, all free in the
+304 steady state; +1 request/`repo_refresh_minutes` for enumeration
+itself, also ETag-cached on its first page) and the explicit note that
+discovery includes private repos by design (no way to filter public vs.
+private from the API call used, and it's fine for this integration's
+local-only threat model) -- with the practical consequence that a private
+repo's name can render on the physical display exactly like a public
+one's.
+
+### Verification
+
+Tests: `resolve_repo_list` (union/exclude/active-window filtering,
+explicit repos never filtered, empty/`None` account_repos, dedup +
+deterministic sort), `fetch_account_repos` (single-page pass-through,
+pagination across multiple pages, 304 handling, failure returns `None`
+not `[]`, `forget_repo` clearing both ETag dicts), `_refresh_account_repos`
+timing (stale cache re-fetches, fresh cache doesn't, failure keeps the
+previous list), `state_cache`/`running_cache` pruning for repos dropped
+from the effective list, `next_poll_seconds` checking auto-discovered
+repos, config defaults. Full suite run verbatim in the implementation
+report.
+
+Live check: `--once --dry-run` against a **local throwaway config** (not
+the operator's real `config.toml`) with `watch_account_repos` temporarily
+`true`, confirming real discovery + resolution end-to-end against the
+live GitHub API. Discovered-repo count and public-repo names are in the
+implementation report; private repo names are redacted there (`<private-N>`)
+since reports may be quoted in public PRs, even though the display itself
+has no such redaction (see the caveat above).

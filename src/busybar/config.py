@@ -34,6 +34,15 @@ DEFAULTS: dict = {
         "show_quota": True,  # GraphQL/REST quota frames join the overlay
                             # rotation while a run is active (no effect if
                             # show_running is false -- see ci_status/main.py)
+        # Account-wide watching (v1.5.1) -- off by default; the operator
+        # enables it locally per-machine, not as a shipped default, since
+        # it changes what gets polled/displayed without an explicit repo
+        # list. See ci_status/README.md's "Account-wide watching" section
+        # for quota math and the active-window caveat.
+        "watch_account_repos": False,
+        "repos_exclude": [],       # silence specific repos without leaving account mode
+        "active_within_days": 30,  # only repos pushed within this window are polled
+        "repo_refresh_minutes": 60,  # how often the repo list itself is re-enumerated
     },
 }
 
