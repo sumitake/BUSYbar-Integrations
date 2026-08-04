@@ -72,9 +72,17 @@ DIGIT_COLOR = {
 }
 
 # --- geometry -----------------------------------------------------------------
+#
+# Firmware ink-offset gotcha (found via on-device frame captures after the
+# first v1.3 pass mashed the layout): every font renders its ink ~2px below
+# the element's `y`, uniformly across the small/extra_large/bold fonts tested
+# (e.g. `y=4` on the extra_large font puts ink at rows 6-15, not 4-13). The
+# `_Y` constants below are already offset-corrected so ink lands where the
+# name implies -- do not "fix" them back to the visually-obvious value without
+# re-verifying ink rows on-device.
 
 TITLE_X = 1
-TITLE_Y = 0
+TITLE_Y = -2   # ink rows 0-4 (small font); stays clear of the track at row 5
 TITLE_WIDTH = 70
 
 TRACK_Y = 5
@@ -86,10 +94,10 @@ TIME_CARD_WIDTH = 34
 TIME_CARD_HEIGHT = 10
 TIME_CARD_RADIUS = 1
 TIME_X = 1
-TIME_Y = 6
+TIME_Y = 4     # ink rows 6-15 (extra_large font); exactly fills the y6-15 card
 
 ENDS_X = 3
-ENDS_Y = 8
+ENDS_Y = 6     # ink rows 8-14 (bold font); clear of the track and the panel's bottom edge
 
 DIVIDER_X = 34
 DIVIDER_Y = 6
@@ -102,16 +110,31 @@ CD_CARD_WIDTH = 36
 CD_CARD_HEIGHT = 10
 CD_CARD_RADIUS = 1
 
-COUNTDOWN_Y = 6
-# Right-anchor the countdown within cd_card using the firmware's `align`
-# field, 1px in from the card's right edge (x=72). Verified reliable
-# on-device (firmware 1.1.1): drawing both a long (H:MM:SS, 7 chars) and a
-# short (M:SS, 4 chars) countdown with align="top_right" kept the right edge
-# pinned at the same column while the left edge moved -- true right-anchoring,
-# not a fixed left position. If a future firmware makes this unreliable, the
-# approved fallback is a fixed x=40 (H:MM:SS = 31px fits x40-71).
-COUNTDOWN_ALIGN_X = 71
-COUNTDOWN_FALLBACK_X = 40
+# The native `countdown` element's digits render only 5px tall in every mode
+# (MM:SS and H:MM:SS both) -- confirmed with fresh-id on-device probes after
+# the first v1.3 pass's "10px" figure turned out to be a stale measurement
+# corrupted by the firmware's id-reuse-type-change quirk (an id that changes
+# element `type` between draws can serve pixel data from the previous type).
+# Large numerals are the operator's core requirement, so the native countdown
+# element is unusable here; a plain `text` element in the `extra_large` font
+# replaces it, formatted by `_format_countdown` below. Renamed from
+# "countdown" to "cd_text" so the id's element `type` never changes
+# (countdown -> text) across an upsert -- the same id-reuse-type-change
+# quirk that corrupted the original measurement. `main()`'s startup
+# `client.clear(APP)` additionally guards a process restart against any
+# lingering "countdown"-type element left by a previous deploy.
+CD_TEXT_X = 38
+CD_TEXT_Y = 4   # ink rows 6-15 (extra_large font), matching cd_card
+# No `align` field -- the previous pass's align="top_right" right-anchoring
+# was implicated in the mash (align re-anchors screen-relative, not
+# card-relative, and interacted badly with the ink-offset bug). Fixed left
+# position within the card instead.
+
+# Measured on-device, extra_large font: "12h00m" (6 glyphs) ~= 37px. Used
+# only to size-check _format_countdown's output against the space available
+# between cd_text's x and the panel's right edge (see _format_countdown).
+CD_TEXT_CHAR_PX = 37 / 6
+CD_TEXT_MAX_WIDTH = PANEL_WIDTH - CD_TEXT_X   # 34px
 
 # Approximate px-per-character for the "small" bitmap font, used only to
 # decide whether a title needs to scroll. Deliberately conservative (slightly
@@ -181,6 +204,33 @@ def _title_fits(title: str, width_px: int) -> bool:
     return len(title) * SMALL_FONT_CHAR_PX <= width_px
 
 
+def _format_countdown(minutes_left: float) -> str:
+    """Minutes-granular countdown text for the `cd_text` element.
+
+    Floored (not rounded) to whole minutes, so the display always reads "at
+    least this much time remains" rather than rounding up past the actual
+    remaining time -- matches how a countdown is conventionally read ("1m"
+    means just under 2 minutes left, not "close to 1 minute"). Negative
+    input (defensive only; callers shouldn't produce it) clamps to 0.
+
+    Below 10 hours: "<M>m" (e.g. "54m") under 60 minutes, else "<H>h<MM>m"
+    (e.g. "1h05m", minutes zero-padded to 2 digits). At 10+ hours: "<H>h"
+    only, dropping minutes entirely. The drop is required, not cosmetic: the
+    full "<H>h<MM>m" form is 6 glyphs at 2 digits of hours (e.g. "12h00m"),
+    which measures ~37px on-device at this font (CD_TEXT_CHAR_PX) -- wider
+    than the ~34px available between `cd_text`'s x and the panel's right
+    edge (CD_TEXT_MAX_WIDTH), so it would clip. Below 10 hours the full form
+    is at most 5 glyphs ("9h59m" ~= 31px), which fits comfortably.
+    """
+    total_minutes = max(0, int(minutes_left))
+    hours, minutes = divmod(total_minutes, 60)
+    if hours == 0:
+        return f"{minutes}m"
+    if hours >= 10:
+        return f"{hours}h"
+    return f"{hours}h{minutes:02d}m"
+
+
 def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
                    in_progress: bool) -> list[dict]:
     """Build the v1.3 "Color Horizon" layout.
@@ -189,17 +239,20 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
     progress_window_minutes, notice_minutes, warn_minutes). `in_progress`
     selects between the "upcoming" layout (countdown to event.start, a
     time-card label) and the "in-progress" layout (countdown to event.end, an
-    "ENDS" label, full-width non-draining track fill). Draw order below is
-    z-order, first = behind.
+    "ENDS" label, full-width non-draining track fill). The countdown itself
+    (`cd_text`) is a plain `text` element re-rendered from `minutes_left`
+    each poll -- not the native `countdown` element (see the CD_TEXT_X
+    comment above for why). Draw order below is z-order, first = behind.
     """
-    title = ascii_safe(event.title)
+    # Uppercase kills descenders (g, y, p, ...), which is what let the title
+    # collide with the track below it before the ink-offset fix -- see the
+    # geometry comment above TITLE_Y.
+    title = ascii_safe(event.title).upper()
 
     if in_progress:
         minutes_left = (event.end - now).total_seconds() / 60
-        target = event.end
     else:
         minutes_left = (event.start - now).total_seconds() / 60
-        target = event.start
 
     state = _state_for(minutes_left, cfg["notice_minutes"], cfg["warn_minutes"], in_progress)
 
@@ -333,15 +386,13 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
     })
 
     elements.append({
-        "id": "countdown",
-        "type": "countdown",
-        "timestamp": str(int(target.timestamp())),
-        "direction": "time_left",
-        "show_hours": "when_non_zero",
+        "id": "cd_text",
+        "type": "text",
+        "text": _format_countdown(minutes_left),
+        "font": "extra_large",
         "color": DIGIT_COLOR[state],
-        "align": "top_right",
-        "x": COUNTDOWN_ALIGN_X,
-        "y": COUNTDOWN_Y,
+        "x": CD_TEXT_X,
+        "y": CD_TEXT_Y,
         "timeout": timeout_s,
     })
 

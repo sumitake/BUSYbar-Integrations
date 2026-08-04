@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
-from calendar_countdown.logic import CalEvent
+from calendar_countdown.logic import CalEvent, _format_countdown
 from calendar_countdown.main import run_once
 from busybar.client import DrawResult
 
@@ -25,14 +25,15 @@ def make_event(offset_min: int, dur_min: int = 30, title: str = "Standup") -> Ca
 def test_draws_countdown_for_upcoming_event():
     client = Mock()
     client.draw.return_value = DrawResult.DRAWN
-    summary = run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False)
+    event = make_event(23)
+    summary = run_once(client, lambda hours: [event], CFG, NOW, dry_run=False)
     client.draw.assert_called_once()
     kwargs = client.draw.call_args.kwargs
     assert kwargs["priority"] == 20
     by_id = {el["id"]: el for el in kwargs["elements"]}
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "time_card", "time", "divider", "cd_card", "countdown"}
-    assert by_id["countdown"]["timestamp"] == str(int(make_event(23).start.timestamp()))
-    assert by_id["title"]["text"] == "Standup"
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "time_card", "time", "divider", "cd_card", "cd_text"}
+    assert by_id["cd_text"]["text"] == _format_countdown((event.start - NOW).total_seconds() / 60)
+    assert by_id["title"]["text"] == "STANDUP"   # uppercased after ascii_safe
     assert "drew" in summary
 
 def test_draws_in_progress_event_targeting_active_over_upcoming():
@@ -43,9 +44,9 @@ def test_draws_in_progress_event_targeting_active_over_upcoming():
     summary = run_once(client, lambda hours: [active, upcoming], CFG, NOW, dry_run=False)
     kwargs = client.draw.call_args.kwargs
     by_id = {el["id"]: el for el in kwargs["elements"]}
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "ends", "divider", "cd_card", "countdown"}
-    assert by_id["title"]["text"] == "Active"
-    assert by_id["countdown"]["timestamp"] == str(int(active.end.timestamp()))
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "ends", "divider", "cd_card", "cd_text"}
+    assert by_id["title"]["text"] == "ACTIVE"
+    assert by_id["cd_text"]["text"] == _format_countdown((active.end - NOW).total_seconds() / 60)
     assert "time" not in by_id and "time_card" not in by_id
     assert "drew" in summary
 
