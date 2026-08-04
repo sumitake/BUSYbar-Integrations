@@ -2,12 +2,14 @@
 
 ## What It Does
 
-This integration polls your macOS calendar for upcoming events and displays a live countdown on the busybar device: a vertical progress bar that drains as the event approaches, a title row (start time + event title), and a native on-device countdown timer that ticks every second between polls.
+This integration polls your macOS calendar for upcoming events and displays a live countdown card on the busybar device: a full-panel gradient background that itself signals urgency, a title row, a horizontal drain track, a large start-time (or "ENDS") card, and a native on-device countdown timer that ticks every second between polls.
 
-- **Progress accent bar** — a thin bar on the left edge fills from the bottom, representing time remaining within `progress_window_minutes` (default 60). It's full height once the event is `progress_window_minutes` or more away, and drains to a 1px sliver as the start time arrives.
-- **Title row** — `HH:MM` start time in a small gray label, with the event title next to it. Long titles scroll; short ones sit static.
-- **Countdown** — a native device countdown to the event start (or, once the event has begun, to its end) so the display keeps ticking without waiting on the next poll.
-- **Urgency color** — the bar and countdown are white by default, turn amber within `notice_minutes` (default 15) of start, and red within `warn_minutes` (default 5). An in-progress event switches to a full teal bar and a countdown to the event's end instead.
+- **Color Horizon background** — the whole panel is a top-to-bottom gradient whose colors shift with urgency: deep violet when the event is far off, warm orange approaching `notice_minutes`, red approaching `warn_minutes`, and teal while the event is in progress. Urgency reads at a glance before you even look at the countdown.
+- **Title row** — the event title in a small font across the top. Long titles scroll; short ones sit static.
+- **Drain track** — a thin horizontal bar under the title fills proportionally to time remaining within `progress_window_minutes` (default 60) and shrinks toward empty as the start time arrives. An in-progress event shows it full-width and steady instead (no drain — the relevant countdown is now "time until it ends").
+- **Time / Ends card** — a large `HH:MM` local start time on a rounded card for an upcoming event, or a bold "ENDS" label once the event has begun.
+- **Countdown card** — a native device countdown, right-anchored in its own rounded card: to the event start while upcoming, or to its end once in progress, so the display keeps ticking without waiting on the next poll.
+- **Four states** — `normal`, `notice` (within `notice_minutes` of start), `warning` (within `warn_minutes` of start), and `in_progress`, each with its own background gradient, title color, drain-track gradient, divider color, countdown-card color, and digit color. See the design spec (`docs/superpowers/specs/2026-08-03-calendar-ci-integrations-design.md`) for the full palette table.
 
 The integration looks ahead 12 hours by default and draws at priority 20 on the display. If an active BUSY session exists on the device, the calendar event display is suppressed in favor of the busy state (priority 90).
 
@@ -57,7 +59,7 @@ poll_seconds = 60              # how often to check the calendar (default: 60)
 lookahead_hours = 12           # how far ahead to scan (default: 12)
 warn_minutes = 5               # bar/countdown turn red within N minutes of start (default: 5)
 notice_minutes = 15            # bar/countdown turn amber within N minutes of start (default: 15)
-progress_window_minutes = 60   # progress bar drains from full over this many minutes (default: 60)
+progress_window_minutes = 60   # drain track empties from full over this many minutes (default: 60)
 include_all_day = false        # include all-day events (default: false)
 auto_busy = false              # auto-mark as BUSY during events (default: false)
 # calendars = ["Work"]         # optional: list calendar names to limit scope (discover with --list-calendars)
@@ -81,7 +83,7 @@ Verify that the output shows your next upcoming event with the correct countdown
 | `lookahead_hours` | integer | 12 | Hours into the future to scan for events |
 | `warn_minutes` | integer | 5 | Bar/countdown turn red when within N minutes of event start |
 | `notice_minutes` | integer | 15 | Bar/countdown turn amber when within N minutes of event start |
-| `progress_window_minutes` | integer | 60 | Progress bar drains from full height over this many minutes before the event start |
+| `progress_window_minutes` | integer | 60 | Drain track empties from full width over this many minutes before the event start |
 | `include_all_day` | boolean | false | Include all-day events in the display |
 | `auto_busy` | boolean | false | Automatically mark device BUSY during event time |
 | `calendars` | array of strings | (all) | List of calendar names to monitor. Discover available names with `uv run python -m calendar_countdown.main --list-calendars` |
