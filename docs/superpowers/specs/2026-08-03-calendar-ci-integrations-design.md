@@ -1611,3 +1611,59 @@ placeholder-string token (`"test-placeholder-token-do-not-use"`) — no
 network call was made to any `busy.app` host during this round's work.
 The three-item live-probe checklist above is the explicit handoff for
 the controller/operator pass that runs once a token exists.
+
+### Final-gate review fixes (same branch)
+
+The coordinator's final-gate review found two Important issues and three
+Minor issues before merge:
+
+1. **Important — `**cfg["device"]` crash surface.** Both call sites
+  splatting the raw `[device]` dict meant an unknown/typo'd key (e.g.
+  `coud_token` for `cloud_token`) went from silently-ignored (pre-v1.6,
+  when only `host=` was ever passed explicitly) to a `TypeError`
+  crashing startup — exactly the wrong failure mode for a typo made
+  while first configuring `cloud_token`. Fixed with a new
+  `busybar.config.device_kwargs(cfg)` helper: filters `cfg["device"]` to
+  `BusyBarClient`'s actual constructor kwargs (introspected via
+  `inspect.signature`, so it can't drift out of sync with the
+  constructor) and logs a `WARNING` naming each dropped key, restoring
+  "ignored, not fatal" while adding the observability the pre-v1.6 code
+  never had. Both call sites now read
+  `BusyBarClient(**device_kwargs(cfg))`. Five new tests in
+  `test_config.py`: known keys pass through unchanged, an unknown key is
+  dropped without crashing (`caplog` confirms the `WARNING` names it),
+  constructing `BusyBarClient` from the filtered result never raises,
+  one `WARNING` fires per unknown key (not one combined message), and no
+  warnings fire when every key is known.
+2. **Important — untested highest-risk semantic.** Added
+  `test_local_http_500_is_error_and_does_not_trigger_cloud_fallback`:
+  with `cloud_token` configured, a local HTTP `500` (a real response, no
+  exception) must return `DrawResult.ERROR` and must NOT attempt cloud
+  at all — locks in that fallback triggers strictly on
+  `requests.RequestException`, never on a non-2xx/409 response the
+  device actually returned. This was previously only implied by the
+  `_request` implementation, not directly asserted.
+3. **Minor — inaccurate comment fixed.**
+  `test_cloud_token_never_appears_in_log_output`'s second `draw()` call
+  was commented "local fails again, cloud fails too" — wrong: per the
+  recovery-probe design, a call made well within `LOCAL_RETRY_SECONDS`
+  of degrading skips the local attempt entirely and goes straight to
+  cloud, so only one `requests.request` call happens on that second
+  draw. Corrected the comment and, per the reviewer's suggestion, added
+  `@patch("busybar.client.time.monotonic")` to control elapsed time
+  explicitly rather than relying on real wall-clock time staying under
+  60s between two adjacent test statements.
+4. **Minor — cloud-409 coverage added.** Two new tests:
+  `test_cloud_409_is_rejected_not_error_forced_cloud` (forced
+  `transport="cloud"`) and `test_cloud_409_is_rejected_not_error_while_degraded`
+  (auto mode, already degraded to cloud) — both assert a cloud `409`
+  maps to `DrawResult.REJECTED`, mirroring the existing local-409
+  coverage.
+5. **Minor — transport `ValueError` guard tested.**
+  `test_invalid_transport_value_raises_value_error` asserts
+  `BusyBarClient(transport="carrier-pigeon")` raises `ValueError` naming
+  the bad value — previously implemented but unverified by any test.
+
+`TZ=UTC uv run pytest -v`: 346 passed (337 before this review round's 9
+net-new tests: 5 in `test_config.py` for `device_kwargs`, 4 in
+`test_client.py` for the 500/409/ValueError contracts).

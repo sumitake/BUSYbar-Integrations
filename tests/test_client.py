@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import Mock, patch
 import requests
 from busybar.client import BusyBarClient, DrawResult
@@ -313,15 +314,70 @@ def test_no_recovery_probe_before_window_when_never_degraded(mock_request):
 
 # --- token never logged (v1.6 security requirement) -------------------------
 
+@patch("busybar.client.time.monotonic")
 @patch("busybar.client.requests.request")
-def test_cloud_token_never_appears_in_log_output(mock_request, caplog):
-    import logging
+def test_cloud_token_never_appears_in_log_output(mock_request, mock_time, caplog):
     caplog.set_level(logging.DEBUG, logger="busybar.client")
-    mock_request.side_effect = [requests.ConnectionError(), _response(200),
-                                requests.ConnectionError(), requests.ConnectionError()]
+    mock_time.return_value = 0.0
+    mock_request.side_effect = [requests.ConnectionError(), _response(200)]
     client = _cloud_client()
-    client.draw("app", ELEMENTS)          # local fails, cloud succeeds -- degrades
-    client.draw("app", ELEMENTS)          # local fails again, cloud fails too -- UNREACHABLE
+    client.draw("app", ELEMENTS)  # local fails, cloud succeeds -- degrades to cloud
+
+    # Still well within LOCAL_RETRY_SECONDS (60): per the recovery-probe
+    # design (see test_degraded_client_skips_local_within_retry_window),
+    # this second call skips the local attempt entirely and goes straight
+    # to cloud -- only ONE requests.request call happens here, not two.
+    mock_time.return_value = 30.0
+    mock_request.side_effect = [requests.ConnectionError()]  # the sole (cloud) attempt fails
+    assert client.draw("app", ELEMENTS) == DrawResult.UNREACHABLE
+
     for record in caplog.records:
         assert FAKE_TOKEN not in record.getMessage()
         assert FAKE_TOKEN not in str(record.args)
+
+
+# --- fallback-only-on-RequestException contract (final-gate review) --------
+
+@patch("busybar.client.requests.request")
+def test_local_http_500_is_error_and_does_not_trigger_cloud_fallback(mock_request):
+    # Highest-risk semantic in the whole feature: a local HTTP error
+    # response (no exception -- the device is reachable, it just returned
+    # a bad status) must NOT be treated as "local is down." Locks in that
+    # fallback triggers ONLY on requests.RequestException, never on a
+    # non-2xx/409 response the device actually returned.
+    local_500 = _response(500)
+    mock_request.return_value = local_500
+    client = _cloud_client()
+    assert client.draw("app", ELEMENTS) == DrawResult.ERROR
+    assert mock_request.call_count == 1  # cloud was never attempted
+    assert mock_request.call_args.args == ("POST", "http://192.0.2.1/api/display/draw")
+    assert client.active_transport == "local"  # never degraded
+
+
+# --- cloud 409 -> REJECTED (final-gate review) -------------------------------
+
+@patch("busybar.client.requests.request")
+def test_cloud_409_is_rejected_not_error_forced_cloud(mock_request):
+    mock_request.return_value = _response(409)
+    client = _cloud_client(transport="cloud")
+    assert client.draw("app", ELEMENTS) == DrawResult.REJECTED
+
+@patch("busybar.client.requests.request")
+def test_cloud_409_is_rejected_not_error_while_degraded(mock_request):
+    mock_request.side_effect = [requests.ConnectionError(), _response(200)]
+    client = _cloud_client()
+    client.draw("app", ELEMENTS)  # degrades to cloud
+    assert client.active_transport == "cloud"
+
+    mock_request.side_effect = [_response(409)]  # degraded -- skips local, straight to cloud
+    assert client.draw("app", ELEMENTS) == DrawResult.REJECTED
+
+
+# --- transport ValueError guard (final-gate review) --------------------------
+
+def test_invalid_transport_value_raises_value_error():
+    try:
+        BusyBarClient(transport="carrier-pigeon")
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "carrier-pigeon" in str(exc)

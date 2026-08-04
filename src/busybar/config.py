@@ -1,7 +1,13 @@
 import copy
+import inspect
+import logging
 import os
 import tomllib
 from pathlib import Path
+
+from busybar.client import BusyBarClient
+
+log = logging.getLogger(__name__)
 
 DEFAULTS: dict = {
     "device": {
@@ -77,6 +83,36 @@ def _merge(base: dict, override: dict) -> dict:
         else:
             out[key] = value
     return out
+
+
+def device_kwargs(cfg: dict) -> dict:
+    """Filter `cfg["device"]` down to BusyBarClient's known constructor
+    kwargs, for use as `BusyBarClient(**device_kwargs(cfg))`.
+
+    Before v1.6 both integration call sites only ever passed a single
+    explicit keyword (`host=cfg["device"]["host"]`), so an unknown/typo'd
+    [device] key in config.toml (e.g. `coud_token` for `cloud_token`) was
+    silently ignored -- it just never got read. v1.6 switched both call
+    sites to splat the whole [device] table so the three new cloud-
+    transport keys wouldn't need updating twice; splatting an *unfiltered*
+    dict, though, means that same typo now raises TypeError("unexpected
+    keyword argument") at startup instead -- a cryptic crash, and the
+    worst possible failure mode for exactly the moment an operator is
+    most likely to typo a key: first-time cloud_token setup. This
+    restores "unknown key doesn't crash startup" while adding
+    observability the pre-v1.6 code never had: each ignored key is
+    logged at WARNING (not silently dropped) so a genuine typo is still
+    visible, just not fatal.
+
+    The known-kwargs set is derived from BusyBarClient's own signature
+    (rather than hardcoded here) so it can't drift out of sync with the
+    constructor as transport options evolve.
+    """
+    known = set(inspect.signature(BusyBarClient.__init__).parameters) - {"self"}
+    device = cfg.get("device", {})
+    for key in sorted(set(device) - known):
+        log.warning("config: ignoring unknown [device] key %r (not a BusyBarClient parameter)", key)
+    return {k: v for k, v in device.items() if k in known}
 
 
 def find_config() -> Path | None:

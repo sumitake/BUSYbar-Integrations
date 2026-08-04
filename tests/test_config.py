@@ -1,6 +1,7 @@
+import logging
 import tomllib
 from pathlib import Path
-from busybar.config import DEFAULTS, load_config
+from busybar.config import DEFAULTS, device_kwargs, load_config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -67,3 +68,47 @@ def test_example_toml_cloud_token_is_empty_placeholder_not_a_real_looking_token(
     # in the committed example file -- the real token belongs only in the
     # git-ignored config.toml.
     assert example["device"]["cloud_token"] == ""
+
+
+# --- device_kwargs() unknown-key guard (final-gate review, v1.6) -----------
+# Both integration call sites splat cfg["device"] into BusyBarClient's
+# constructor. Splatting the raw dict would TypeError on any unknown/typo'd
+# [device] key (a silent-ignore -> crash regression from pre-v1.6, where
+# only host= was ever passed explicitly) -- device_kwargs() must filter to
+# known kwargs and warn, not crash.
+
+def test_device_kwargs_passes_through_all_known_keys():
+    cfg = {"device": {"host": "192.0.2.1", "cloud_token": "x",
+                      "cloud_base_url": "https://cloud.example.test",
+                      "transport": "local"}}
+    assert device_kwargs(cfg) == cfg["device"]
+
+def test_device_kwargs_drops_unknown_key_without_crashing(caplog):
+    cfg = {"device": {"host": "192.0.2.1", "coud_token": "typo'd-key"}}
+    caplog.set_level(logging.WARNING, logger="busybar.config")
+    result = device_kwargs(cfg)
+    assert result == {"host": "192.0.2.1"}  # unknown key silently dropped, not crashed
+    assert "coud_token" in caplog.text
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+def test_device_kwargs_result_never_crashes_busybarclient_construction():
+    from busybar.client import BusyBarClient
+    cfg = {"device": {"host": "192.0.2.1", "cloud_token": "x", "bogus_extra_key": 123}}
+    # This is the actual regression this guard exists for: a typo'd or
+    # unrecognized [device] key must not raise TypeError when splatted.
+    client = BusyBarClient(**device_kwargs(cfg))
+    assert client.base == "http://192.0.2.1"
+
+def test_device_kwargs_logs_one_warning_per_unknown_key(caplog):
+    cfg = {"device": {"host": "192.0.2.1", "bogus_one": 1, "bogus_two": 2}}
+    caplog.set_level(logging.WARNING, logger="busybar.config")
+    device_kwargs(cfg)
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2
+    assert any("bogus_one" in r.getMessage() for r in warnings)
+    assert any("bogus_two" in r.getMessage() for r in warnings)
+
+def test_device_kwargs_no_warnings_when_all_keys_known(caplog):
+    caplog.set_level(logging.WARNING, logger="busybar.config")
+    device_kwargs({"device": dict(DEFAULTS["device"])})
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
