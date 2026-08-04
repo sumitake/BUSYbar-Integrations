@@ -30,12 +30,14 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
     calling run_once standalone can omit it).
 
     The upcoming and in-progress layouts use different element id sets
-    (`time_card`+`time` vs `ends`) and the device's draw endpoint upserts by
-    id rather than replacing an app's whole element set -- confirmed
-    on-device that switching id sets without an explicit clear leaves the
-    previous set's elements (e.g. an opaque time_card) rendered on top of
-    the new ones until their own timeout expires. `state` lets us clear only
-    at the transition, not on every poll.
+    (`time` vs `ends`) and the device's draw endpoint upserts by id rather
+    than replacing an app's whole element set -- confirmed on-device that
+    switching id sets without an explicit clear leaves the previous set's
+    elements rendered on top of the new ones until their own timeout
+    expires (originally found with the v1.3 `time_card`+`time` vs `ends`
+    id sets; the same upsert-by-id model applies regardless of which ids
+    are in play). `state` lets us clear only at the transition, not on
+    every poll.
     """
     c = cfg["calendar_countdown"]
     timeout_s = int(c["poll_seconds"] * 1.5)
@@ -116,11 +118,14 @@ def main() -> int:
     cfg = load_config()
     client = BusyBarClient(host=cfg["device"]["host"])
     # Drop any stale elements from a previous process. This also protects a
-    # restart onto this version against the v1.3 -> v1.3.1 id/type change:
-    # the native "countdown" element was replaced by a "cd_text" text
-    # element (see logic.py), and the draw endpoint's id-reuse-type-change
-    # quirk means a leftover "countdown"-typed element from an older deploy
-    # could otherwise serve stale pixel data under a colliding id.
+    # restart onto this version against every id change made across the
+    # v1.3 -> v1.3.1 -> v1.4 line: v1.3.1 replaced the native "countdown"
+    # element with a "cd_text" text element (a type change under upsert can
+    # serve stale pixel data), and v1.4 removed "time_card"/"cd_card"
+    # entirely. Neither removed id needs a drawn successor -- this startup
+    # clear plus the transition-state clear above are sufficient, since a
+    # deploy always restarts the process (fresh client.clear(APP) here) and
+    # build_elements() simply never emits those ids again afterward.
     client.clear(APP)
     fetch = lambda hours: eventkit.fetch_events(hours, cfg["calendar_countdown"]["calendars"])
 

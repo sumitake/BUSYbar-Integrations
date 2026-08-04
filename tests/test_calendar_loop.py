@@ -31,7 +31,8 @@ def test_draws_countdown_for_upcoming_event():
     kwargs = client.draw.call_args.kwargs
     assert kwargs["priority"] == 20
     by_id = {el["id"]: el for el in kwargs["elements"]}
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "time_card", "time", "divider", "cd_card", "cd_text"}
+    # v1.4 "airy": no card elements.
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "time", "divider", "cd_text"}
     assert by_id["cd_text"]["text"] == _format_countdown((event.start - NOW).total_seconds() / 60)
     assert by_id["title"]["text"] == "STANDUP"   # uppercased after ascii_safe
     assert "drew" in summary
@@ -44,10 +45,10 @@ def test_draws_in_progress_event_targeting_active_over_upcoming():
     summary = run_once(client, lambda hours: [active, upcoming], CFG, NOW, dry_run=False)
     kwargs = client.draw.call_args.kwargs
     by_id = {el["id"]: el for el in kwargs["elements"]}
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "ends", "divider", "cd_card", "cd_text"}
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"}
     assert by_id["title"]["text"] == "ACTIVE"
     assert by_id["cd_text"]["text"] == _format_countdown((active.end - NOW).total_seconds() / 60)
-    assert "time" not in by_id and "time_card" not in by_id
+    assert "time" not in by_id
     assert "drew" in summary
 
 def test_clears_when_no_event():
