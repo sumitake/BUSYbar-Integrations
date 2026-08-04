@@ -1121,3 +1121,261 @@ same-priority `preview` draw was observed being rejected outright (the
 same equal-priority-different-`application_name` firmware behavior the
 v1.5 probes found) until the priority was raised, matching the precedent
 already set by the original v1.5 badge-variant verification script.
+
+## 2026-08-04 — v1.5.2 urgent-ambient escalation, stage-4 chirp, and CI-alert snooze
+
+**Status:** Implemented, branch `dev/claude/urgent-ambient-v1.5.2` off `main`
+(which by this point includes the full v1.5/v1.5.1 lines, merged via PR #9
+and PR #10). Not pushed.
+
+Operator-reported live UX gap: a persistent CI failure alert
+(`PRIORITY_ALERT`, 60) permanently evicted the calendar, hiding an
+imminent event with no way for the ambient tier to ever reclaim the
+screen -- unlike the overlay tier, the ambient tier has no dwell/silence
+contract of its own to fall back on. This round's fix arrived across three
+operator messages that iterated on the same in-flight work (a two-stage
+proposal superseded by a three-stage one, then a four-stage one, then a
+timing split for stage 4, then an entirely additive snooze feature); this
+section documents the final, converged design, not the intermediate ones.
+
+### Framework: two new priority tiers (`src/busybar/display.py`)
+
+```
+PRIORITY_AMBIENT        = 20
+PRIORITY_OVERLAY        = 21
+PRIORITY_AMBIENT_RAISED = 25   -- new
+PRIORITY_ALERT          = 60
+PRIORITY_AMBIENT_URGENT = 65   -- new
+PRIORITY_SESSION        = 90
+```
+
+- **`PRIORITY_AMBIENT_RAISED` (25)**: an ambient app carrying near-term
+  (not yet imminent) user-critical information. Strictly above
+  `PRIORITY_OVERLAY`, strictly below `PRIORITY_ALERT` -- may outrank
+  overlays, never alerts. Overlay and alert tiers must never draw here;
+  it's an ambient-only elevation.
+- **`PRIORITY_AMBIENT_URGENT` (65)**: an ambient app carrying imminent
+  user-critical information. Strictly above `PRIORITY_ALERT`, strictly
+  below `PRIORITY_SESSION` -- may outrank a genuine alert, never a real
+  BUSY/CUSTOM session. **The LED is the session-safe channel**: a session
+  at 90 still outranks this tier for the drawn *elements*, but
+  `led_notification_color` is a separate hardware channel entirely, not
+  subject to the same priority arbitration -- it is the one signal that
+  still gets through even when a session owns the whole panel.
+
+Both are documented in `busybar/display.py` with the full contract text
+(when each may/must not be used) and covered by the ladder-ordering test
+(`20 < 21 < 25 < 60 < 65 < 90`, plus dedicated
+`PRIORITY_OVERLAY < PRIORITY_AMBIENT_RAISED < PRIORITY_ALERT` and
+`PRIORITY_ALERT < PRIORITY_AMBIENT_URGENT < PRIORITY_SESSION` boundary
+tests).
+
+### Escalation ladder (`calendar_countdown`)
+
+New pure functions in `calendar_countdown/logic.py`, deliberately
+SEPARATE from `_state_for`'s existing 4-way visual-palette selection, not
+a 1:1 mapping of it -- the "approach" window changes priority without
+changing the palette at all, and NOTICE/WARNING share the same priority
+despite being visually distinct:
+
+- `_minutes_left(event, now, in_progress)` -- extracted from
+  `build_elements`'s own inline calculation so `main.run_once` can compute
+  the identical value for the priority/LED/chirp decisions without
+  duplicating the branch (same `event`/`now`/`in_progress` in, same number
+  out, no drift risk).
+- `select_priority(minutes_left, approach_minutes, notice_minutes,
+  in_progress) -> int`: `in_progress` -> `PRIORITY_AMBIENT`; `<=
+  notice_minutes` (covers NOTICE and WARNING) -> `PRIORITY_AMBIENT_URGENT`;
+  `<= approach_minutes` -> `PRIORITY_AMBIENT_RAISED`; else
+  `PRIORITY_AMBIENT`.
+- `select_led(minutes_left, imminent_minutes, in_progress) -> str | None`:
+  fires on every draw from `imminent_minutes` before start until the event
+  starts, stops the instant `in_progress` is true.
+
+Final ladder:
+
+| Window | Priority | Palette | LED |
+|---|---|---|---|
+| normal (> `approach_minutes`) | `PRIORITY_AMBIENT` (20) | normal | off |
+| approach (<= `approach_minutes`, > `notice_minutes`) | `PRIORITY_AMBIENT_RAISED` (25) | normal (unchanged) | off |
+| notice (<= `notice_minutes`, > `warn_minutes`) | `PRIORITY_AMBIENT_URGENT` (65) | amber | off |
+| warn (<= `warn_minutes`) | `PRIORITY_AMBIENT_URGENT` (65) | red | off |
+| imminent (<= `imminent_minutes`, subset of warn) | `PRIORITY_AMBIENT_URGENT` (65) | red (same as warn) | **on** |
+| in_progress | `PRIORITY_AMBIENT` (20) | teal | off |
+
+New config keys (`[calendar_countdown]`): `approach_minutes = 30`,
+`imminent_minutes = 1` (governs the LED window only -- see the timing
+split below), `chirp = true`.
+
+**Why in_progress stays at the baseline, not elevated.** Once a meeting
+has started you already know about it -- you're either in it or
+conspicuously not. The elevation exists to catch your attention *before*
+an event starts, not to keep fighting for the screen once it has; an
+alert regains the panel for an in-progress event exactly as it did before
+this feature existed.
+
+**Eviction/409 interplay (verified, not just asserted).** A
+`PRIORITY_AMBIENT_URGENT` draw succeeding while a `ci_status` alert is
+showing evicts the alert's elements outright (fact 2: eviction, not
+restoration). `ci_status` needs no new code for this: its existing
+unified shape-tracking mechanism (added in the v1.5 revision round)
+already only commits `overlay_state`/`last_shape` on a confirmed `DRAWN`
+result, so a `409` (`DrawResult.REJECTED`) from trying to redraw the alert
+while the calendar holds the higher tier is already handled exactly like
+any other rejected draw -- no crash, no state committed, and the alert
+resumes cleanly once `client.draw` finally lands again. Two new regression
+tests (`test_alert_rejected_during_calendar_elevation_does_not_commit_
+then_recovers`, `test_overlay_dwell_rejected_during_calendar_elevation_
+resumes_after`) exercise this end-to-end through `ci_status.main.run_once`
+and confirm the existing mechanism was already sufficient.
+
+Priority changes for the SAME app_name (the calendar's own escalation)
+need no clear() of their own, unlike shape changes: it's the same
+`application_name` upserting the same element ids at a new priority
+number, and a strictly-higher-priority same-app_name draw always
+succeeds regardless of the priority value.
+
+### Stage 4: LED + T-0 chirp
+
+**LED timing.** `imminent_minutes` (default 1) governs only the LED
+window, independent of priority (which stays at `PRIORITY_AMBIENT_URGENT`
+throughout notice/warn/imminent uniformly). The LED blinks on every draw
+from `imminent_minutes` before start until the event starts, then stops.
+
+**Chirp timing (operator-amended from an initial "during the final
+minute" proposal to a precise T-0 design).** The chirp fires exactly once
+per event, at the moment it starts -- the transition edge from upcoming
+to in_progress, not any point during the countdown. `next_sleep_seconds
+(poll_seconds, seconds_until_start)` sleeps exactly until a sooner-than-
+usual event start instead of the full `poll_seconds`, so the poll that
+detects the transition (and fires the chirp) lands within about a second
+of the real start time.
+
+**Audio API probe (done before any implementation, per the operator's
+explicit instruction to check firmware research notes first).** The
+firmware ships stock sounds at `assets/shared/sounds/`, including
+`calendar_event_starts.wav` and `calendar_reminder_ends.wav` -- an exact
+semantic match for this feature, found in the scratchpad's firmware
+research notes (`busy-app-org-research.md` / `firmware_tree.txt`) before
+generating anything. Confirmed live: `POST /api/audio/play` with
+`{"application_name": "calendar_countdown", "stock_path":
+"shared/calendar_event_starts.wav"}` returned `200` at `2026-08-04T06:23:32Z`.
+No asset generation, upload, or repo-committed binary was needed --
+`BusyBarClient.play_audio` (added to `src/busybar/client.py`) supports
+both `stock_path` (firmware-shipped) and `path` (an app's own uploaded
+asset) per the device's `PlayAudio` schema, but this feature only ever
+uses `stock_path`. `play_audio` has no volume parameter at all --
+deliberately, so playback always uses whatever volume is currently
+configured on the device; `/api/audio/volume` is never touched.
+
+**Once-per-event semantics, edge-detected not level-detected**
+(`should_chirp`/`commit_chirped`, `calendar_countdown/logic.py`).
+`chirp_state` (caller-owned, mirroring every other cache in this
+codebase) tracks two sets: `seen_upcoming` (event starts observed with
+`in_progress=False` at some earlier poll -- recorded every call,
+regardless of whether chirp is enabled, so toggling it on mid-run doesn't
+lose the precondition) and `chirped` (already-fired starts). The fire
+decision requires the CURRENT poll to see `in_progress=True` for a start
+present in `seen_upcoming` and absent from `chirped` -- level-detection
+(`in_progress=True` alone) would spuriously re-chirp on every poll for an
+ongoing event, and would also spuriously chirp on a restart that happens
+to come up mid-event; edge-detection avoids both. Commit is a separate
+step (`commit_chirped`), called only after `client.play_audio` returns a
+confirmed success, so a transient audio failure retries on the next poll
+rather than silently skipping the chirp forever -- the same DRAWN-gated-
+commit discipline used throughout this codebase for display state,
+applied here to an audio action. `_prune_chirp_state` drops entries older
+than 24h so a long-running process's bookkeeping doesn't grow unbounded.
+
+**Restart edge case (documented, not fixed -- an accepted tradeoff).** A
+restart during an event's final minute, or any time after it started,
+never observed that event as upcoming, so the edge is never detected and
+the chirp does not fire for it. The alternative (level-detection) would
+risk a spurious chirp on every restart during an active event, judged
+worse.
+
+### CI-alert snooze via the device's native start button (additive,
+ci_status)
+
+Raw physical button events are not API-observable (confirmed: the status
+WebSocket only reports what's currently on screen, not button events),
+but the BUSY/CUSTOM session the button starts *is*, via
+`client.get_busy()`. The snooze rule rides on that: an alert showing at
+the moment a session starts is treated as "the operator saw it and
+pressed the button."
+
+**Fingerprint** (`compute_alert_fingerprint`, `ci_status/logic.py`): a
+frozenset of `(repo, workflow, category)` triples, `category` being
+`"failing"` or `"stuck"` so a pair moving between categories counts as a
+change, not the same alert continuing. Empty when nothing is
+failing/stuck.
+
+**State machine** (`update_snooze`, in-memory, restart clears -- see its
+own extensive docstring for the full reasoning):
+
+1. **Pending** starts only on a genuine inactive -> active transition
+   (edge, not level) while an alert is showing: records the fingerprint.
+   Returns `(suppress_alert=False, suppress_led=True)` -- the alert draw
+   still proceeds as normal (naturally rejected by the session's own
+   higher priority, same as always), but its LED is silenced, since LED
+   bypasses that same priority arbitration and would otherwise keep
+   blinking through a session the operator just acknowledged.
+2. The session **ends** while still pending, same fingerprint: begins a
+   timed snooze, `snooze_until = now + snooze_minutes`. Returns
+   `(True, False)` -- the alert is now suppressed entirely (falls through
+   to overlay/quiet-green/nothing in `build_ci_payload`, exactly as if
+   nothing were failing).
+3. **Any fingerprint change** at any pending/timed point clears the
+   snooze immediately and re-alerts (or re-arms pending fresh, only if a
+   session is *already* active AND this is a genuine edge for the NEW
+   fingerprint -- not merely "a session happens to be running").
+4. **Expiry**: clears and resumes alerting normally if still failing.
+5. `snooze_minutes <= 0` disables the feature outright.
+
+**Edge, not level, and the conservative default.** Requirement: pending
+starts only on an *observed* inactive -> active transition, not merely
+"an alert is showing and a session happens to be active" -- otherwise a
+session that predates the alert (or predates a fingerprint change
+mid-session) would be wrongly treated as "you just pressed the button for
+this." Detecting the edge needs the previous poll's observation
+(`session_was_active`), tracked in `snooze_state` -- but polling
+`get_busy()` is deliberately gated (only while an alert is showing or a
+snooze is pending/active, never on a fully idle poll, per the operator's
+"keep idle cycles lean" requirement), which can create observation gaps.
+On the first poll after such a gap (or the very first poll of a fresh
+process), `session_was_active` defaults to `True`, not `False` -- biasing
+against a false-positive auto-snooze (an unobserved pre-existing session
+being misattributed as a fresh acknowledgement) at the cost of
+occasionally requiring the operator to press the button again. This same
+default also correctly handles a process restart that happens to land
+mid-session.
+
+**`build_ci_payload` additions**: `suppress_alert` (skip the
+failure/stuck branches entirely, falling through to overlay/quiet-green/
+nothing) and `suppress_led` (blank the failure branch's LED specifically,
+without suppressing the draw -- used during pending; has no effect on
+stuck, whose LED is already always `None`). `main.run_once` computes an
+`effective_has_alert = has_alert and not suppress_alert` and uses it for
+the overlay rotation's own "an alert takes precedence" reset check too --
+"running/quota rotation and green behavior unaffected" is an explicit
+design requirement, not just about the alert badge's own rendering.
+
+### Verification
+
+`TZ=UTC uv run pytest -q`: 299 passed (274 at the start of this branch's
+work, after the prior v1.5/v1.5.1 lines). New coverage: priority
+selection (all boundary cases including exact-threshold), LED window
+boundaries, the approach window's palette staying `STATE_NORMAL` (no new
+visual state), chirp edge-detection (transition fires, restart-mid-event
+doesn't, disabled never fires, retry-on-play-failure, pruning), 
+`next_sleep_seconds` boundaries, `play_audio` (stock_path/path variants,
+failure handling, never touches the volume endpoint), the two REJECTED-
+during-elevation regression tests, `compute_alert_fingerprint`, and the
+full `update_snooze` state machine (pending -> timed -> suppression ->
+expiry, fingerprint-change re-alert at every stage, `snooze_minutes=0`
+disables, busy-poll gating).
+
+On-device verification, docs, and the report are covered in the
+implementation report for this round; see there for verbatim frame
+captures, the chirp's real playback timestamp, and the snooze end-to-end
+sequence against the live device.
