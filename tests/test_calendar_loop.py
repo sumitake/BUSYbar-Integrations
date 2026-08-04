@@ -180,10 +180,10 @@ def test_state_reset_after_no_event_clear():
     client.clear.assert_not_called()
 
 
-# --- log-noise control (v1.5: 15s default poll cadence) ------------------------
+# --- log-noise control (v1.5: 10s default poll cadence) ------------------------
 #
-# At the ambient tier's shortened default poll interval (60s -> 15s), the
-# old "log every summary at INFO" behavior would quadruple calendar.log's
+# At the ambient tier's shortened default poll interval (60s -> 10s), the
+# old "log every summary at INFO" behavior would sixfold calendar.log's
 # line rate for no new information on most polls (the summary is usually
 # unchanged poll to poll). should_log_info decides INFO vs DEBUG.
 

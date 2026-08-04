@@ -460,7 +460,14 @@ OVERLAY_FRAME_QUOTA_REST = "quota_rest"
 # without an explicit clear would leave a stale numeral element from the
 # previous shape rendered alongside the new one. quota_gql and quota_rest
 # share an identical id set, so switching between *those* needs no clear.
-# main.py tracks the last-drawn shape and clears only on a shape change.
+# NOTE: this dict is documentation/reference only -- main.py's actual
+# clear-gate does NOT consult it. It instead compares the *literal*
+# frozenset of element ids on each drawn payload (frozenset(e["id"] for e
+# in payload["elements"])), unified across every tier that can draw to
+# APP (alert, quiet-green, and both overlay frame kinds), not just these
+# two overlay shapes -- see run_once's docstring in ci_status/main.py for
+# why a badge/quota-only mapping here wasn't enough (it missed the
+# alert<->overlay and green<->overlay seams entirely).
 OVERLAY_FRAME_SHAPE = {
     OVERLAY_FRAME_CI_BADGE: "badge",
     OVERLAY_FRAME_QUOTA_GQL: "quota",

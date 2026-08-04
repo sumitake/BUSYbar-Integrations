@@ -16,7 +16,7 @@ from busybar.config import load_config
 from busybar.display import OVERLAY_DWELL_SECONDS, overlay_gap_elapsed
 
 from .logic import (
-    RepoState, RunningInfo, QuotaInfo, OVERLAY_FRAME_SHAPE,
+    RepoState, RunningInfo, QuotaInfo,
     build_ci_payload, build_overlay_payload, evaluate_runs,
     overlay_frame_sequence, parse_rate_limit, select_running_run,
 )
@@ -77,14 +77,35 @@ def run_once(client, poller, cfg: dict, now: datetime,
     OVERLAY_DWELL_SECONDS` (busybar.display's contract: stay silent at
     least one full dwell so the ambient calendar has a real chance to
     reclaim the screen in between -- see busybar/display.py and the spec
-    doc's v1.5 section for why). `overlay_state`'s `frame_index`/
-    `last_dwell_end`/`last_shape` only commit once `client.draw` actually
-    returns DRAWN, same discipline as calendar_countdown's transition-state
-    fix: a failed draw must not be mistaken for a completed dwell, or the
+    doc's v1.5 section for why). `overlay_state`'s `frame_index` and
+    `last_dwell_end` only commit once `client.draw` actually returns
+    DRAWN, same discipline as calendar_countdown's transition-state fix: a
+    failed draw must not be mistaken for a completed dwell, or the
     rotation would silently skip frames / wait a dwell for nothing.
-    `last_shape` also drives an explicit clear() when the overlay switches
-    between the CI badge's element-id shape and a quota frame's (they
-    don't upsert cleanly into each other -- see OVERLAY_FRAME_SHAPE).
+
+    `overlay_state["last_shape"]` is a *unified* shape tracker, not
+    overlay-specific despite living in this dict: it records the element-id
+    set of whatever payload was last actually drawn to `APP`, across every
+    tier that can draw here -- an alert badge, the quiet-green text, or
+    either overlay frame kind -- and every draw path below checks it before
+    drawing and commits to it after DRAWN. The firmware upserts by element
+    id within an `application_name`, and each of these payload shapes has a
+    different id set (`{bg, ci}` for an alert, `{ci}` alone for quiet
+    green, `{bg, title, track, track_fill, eta}` for the running badge,
+    `{bg, title, track, track_fill, pct, reset}` for a quota frame) --
+    switching shapes without a clear() first leaves the previous shape's
+    now-orphaned ids rendered until their own timeout elapses (up to 1.5x
+    `poll_seconds` for an alert/green draw), the same upsert-by-id bug
+    class the v1.3.1 calendar transition-clear fix addressed, recurring at
+    every seam a different payload shape can follow another -- not just
+    between the two overlay-frame shapes. Critically, resetting the
+    rotation bookkeeping (`frame_index`/`last_dwell_end`, e.g. when an
+    alert preempts the overlay or a run ends) must NOT also reset
+    `last_shape`: that field describes what is physically on the device
+    right now, which a bookkeeping reset does not change, and clearing it
+    prematurely was the root cause of a real bug where the clear-gate saw
+    "no shape on record" and wrongly concluded no clear was needed on the
+    next transition.
     """
     c = cfg["ci_status"]
     timeout_s = int(c["poll_seconds"] * 1.5)
@@ -97,9 +118,9 @@ def run_once(client, poller, cfg: dict, now: datetime,
     has_alert = any(s.failing or s.stuck for s in states)
 
     overlay_payload = None
-    overlay_frame_name = None
     frame_index = 0
     stay_silent = False
+    frame_data_unavailable = False
 
     # running_cache check first: short-circuits before touching c["show_running"],
     # so callers/tests using an older, fully-spelled-out cfg dict that predates
@@ -113,10 +134,12 @@ def run_once(client, poller, cfg: dict, now: datetime,
 
         if selected is None or has_alert:
             # Nothing running, or an alert takes precedence this poll --
-            # reset the rotation so the next run to start always begins at
-            # the CI badge (never mid-way into a quota frame).
+            # reset only the ROTATION bookkeeping, so the next run to start
+            # always begins at the CI badge. Deliberately do NOT touch
+            # last_shape here -- see the docstring above.
             if overlay_state is not None:
-                overlay_state.clear()
+                overlay_state.pop("frame_index", None)
+                overlay_state.pop("last_dwell_end", None)
         else:
             run, repo, other_count = selected
             median = poller.fetch_median_eta(repo, run["workflow_id"])
@@ -129,47 +152,57 @@ def run_once(client, poller, cfg: dict, now: datetime,
             last_dwell_end = overlay_state.get("last_dwell_end") if overlay_state is not None else None
 
             if overlay_gap_elapsed(last_dwell_end, now) >= OVERLAY_DWELL_SECONDS:
-                overlay_frame_name = sequence[frame_index]
+                frame_name = sequence[frame_index]
                 overlay_payload = build_overlay_payload(
-                    overlay_frame_name, OVERLAY_DWELL_SECONDS,
+                    frame_name, OVERLAY_DWELL_SECONDS,
                     running=running_info, quota_by_bucket=quota_by_bucket)
                 if overlay_payload is None:
                     # This frame's data wasn't available this cycle (e.g. a
                     # quota frame with no fresh rate_limit data). Advance
                     # past it without consuming a dwell -- nothing was
-                    # shown, so there's no gap to protect, and the next
-                    # poll retries the next frame in sequence immediately.
+                    # shown, so there's no gap to protect -- and skip this
+                    # poll's draw entirely (no draw, no clear): whatever was
+                    # already on screen is still within its own dwell
+                    # timeout and is left exactly as it is.
                     if overlay_state is not None:
                         overlay_state["frame_index"] = frame_index + 1
-                    overlay_frame_name = None
+                    frame_data_unavailable = True
             else:
                 stay_silent = True
 
     if stay_silent:
         return "overlay dwell gap; staying silent (letting the ambient app reclaim the screen)"
+    if frame_data_unavailable:
+        return "overlay frame data unavailable this cycle; skipping (no draw, no clear)"
 
     payload = build_ci_payload(states, c["show_green"], timeout_s, overlay=overlay_payload)
     if dry_run:
         return f"DRY-RUN payload: {payload!r}"
     if payload is None:
         client.clear(APP)
+        if overlay_state is not None:
+            overlay_state["last_shape"] = None  # device is now genuinely blank
         return "all green; cleared"
 
-    if overlay_frame_name is not None and overlay_state is not None:
-        shape = OVERLAY_FRAME_SHAPE[overlay_frame_name]
-        # clear()'s own success/failure is intentionally not checked here,
-        # same reasoning as calendar_countdown's transition-clear: only
-        # draw()'s result below gates the state commit.
-        if overlay_state.get("last_shape") not in (None, shape):
+    # Unified shape check (see docstring): applies to this draw regardless
+    # of which tier produced it -- alert, quiet-green, or an overlay frame.
+    shape = frozenset(e["id"] for e in payload["elements"])
+    if overlay_state is not None:
+        last_shape = overlay_state.get("last_shape")
+        if last_shape is not None and last_shape != shape:
+            # clear()'s own success/failure is intentionally not checked
+            # here, same reasoning as calendar_countdown's transition-clear:
+            # only draw()'s result below gates the state commit.
             client.clear(APP)
 
     result = client.draw(APP, payload["elements"], priority=payload["priority"],
                          led_notification_color=payload["led"])
 
-    if overlay_frame_name is not None and overlay_state is not None and result == DrawResult.DRAWN:
-        overlay_state["frame_index"] = frame_index + 1
-        overlay_state["last_dwell_end"] = now + timedelta(seconds=OVERLAY_DWELL_SECONDS)
-        overlay_state["last_shape"] = OVERLAY_FRAME_SHAPE[overlay_frame_name]
+    if result == DrawResult.DRAWN and overlay_state is not None:
+        overlay_state["last_shape"] = shape
+        if overlay_payload is not None:
+            overlay_state["frame_index"] = frame_index + 1
+            overlay_state["last_dwell_end"] = now + timedelta(seconds=OVERLAY_DWELL_SECONDS)
 
     text = next(e["text"] for e in payload["elements"] if e["type"] == "text")
     return f"{text[:40]!r} -> {result.value}"

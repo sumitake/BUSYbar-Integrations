@@ -381,6 +381,14 @@ def test_quota_used_width_clamped_min_one():
 def test_quota_used_width_full_when_limit_non_positive():
     assert _quota_used_width(10, 0) == 72
 
+def test_quota_used_width_clamped_max_when_used_exceeds_limit():
+    # Live-observed case (v1.5 on-device quota verification): a real
+    # GitHub account's GraphQL bucket reported used=5150 > limit=5000 --
+    # GitHub's point-based GraphQL cost accounting can transiently exceed
+    # the nominal limit. round(72 * 5150 / 5000) == 74, which must clamp
+    # to the panel width rather than overflow the track.
+    assert _quota_used_width(5150, 5000) == 72
+
 
 # --- parse_rate_limit ------------------------------------------------------------
 

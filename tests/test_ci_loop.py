@@ -20,6 +20,7 @@ CFG_RUNNING = {"ci_status": {"poll_seconds": 120, "running_poll_seconds": 20,
                              "stale_queued_minutes": 0, "show_running": True,
                              "show_quota": False}}
 CFG_QUOTA = {"ci_status": {**CFG_RUNNING["ci_status"], "show_quota": True}}
+CFG_GREEN = {"ci_status": {**CFG_RUNNING["ci_status"], "show_green": True}}
 
 
 def _run(conclusion: str) -> dict:
@@ -216,7 +217,88 @@ def test_overlay_state_resets_when_run_ends():
     poller.fetch_running_runs.return_value = []   # run finished
     run_once(client, poller, CFG_RUNNING, NOW, {}, dry_run=False,
             running_cache={"o/r": [_running_run()]}, overlay_state=overlay_state)
-    assert overlay_state == {}
+    # Only the rotation bookkeeping (frame_index/last_dwell_end) resets
+    # here -- the "run ended, nothing else to show" branch happens to
+    # also reach the explicit client.clear()/"all green" path this same
+    # poll (show_green is False in CFG_RUNNING), so last_shape correctly
+    # becomes None too: the device really is blank now, this poll. The
+    # critical-bug regression coverage -- last_shape surviving a
+    # bookkeeping-only reset that does NOT clear the device this same
+    # poll (e.g. an alert preempting the overlay without falling through
+    # to the "nothing to show" branch) -- lives in
+    # test_overlay_then_alert_clears_stale_overlay_shape below.
+    assert "frame_index" not in overlay_state
+    assert "last_dwell_end" not in overlay_state
+    assert overlay_state["last_shape"] is None
+
+
+# --- unified shape tracking across alert / quiet-green / overlay tiers ----------
+
+def test_overlay_then_alert_clears_stale_overlay_shape():
+    # Running badge draws first (shape {bg,title,track,track_fill,eta});
+    # the next poll turns up a failure. The alert payload's shape
+    # ({bg,ci}) differs, so the stale title/track/track_fill/eta ink from
+    # the badge must be cleared before the alert draws -- not left to
+    # linger until its own ~1.5x-poll timeout.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    poller.fetch_running_runs.return_value = [_running_run()]
+    poller.fetch_median_eta.return_value = None
+    overlay_state: dict = {}
+    run_once(client, poller, CFG_RUNNING, NOW, {}, dry_run=False,
+            running_cache={}, overlay_state=overlay_state)
+    client.clear.assert_not_called()   # nothing on screen before -- no clear needed yet
+
+    poller.fetch_runs.return_value = [_run("failure")]
+    later = NOW + timedelta(seconds=2 * OVERLAY_DWELL_SECONDS + 1)
+    summary = run_once(client, poller, CFG_RUNNING, later, {}, dry_run=False,
+                       running_cache={}, overlay_state=overlay_state)
+    client.clear.assert_called_once_with("ci_status")
+    assert "FAIL" in summary
+
+def test_alert_then_overlay_clears_stale_alert_shape():
+    # Symmetric direction: an alert draws first (shape {bg,ci}); once it
+    # resolves and a run is active, the running badge's shape ({bg,title,
+    # track,track_fill,eta}) differs and must clear the alert's stale
+    # elements first.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    poller.fetch_running_runs.return_value = [_running_run()]
+    poller.fetch_median_eta.return_value = None
+    overlay_state: dict = {}
+    run_once(client, poller, CFG_RUNNING, NOW, {}, dry_run=False,
+            running_cache={}, overlay_state=overlay_state)
+    client.clear.assert_not_called()   # first-ever draw -- nothing to clear yet
+
+    poller.fetch_runs.return_value = [_run("success")]   # alert resolves
+    later = NOW + timedelta(seconds=1)
+    run_once(client, poller, CFG_RUNNING, later, {}, dry_run=False,
+            running_cache={}, overlay_state=overlay_state)
+    client.clear.assert_called_once_with("ci_status")
+
+def test_quiet_green_then_overlay_clears_stale_green_shape():
+    # Quiet "CI ok" text (shape {ci}, no bg) draws first when show_green
+    # is on and nothing is running; once a run starts, the badge's shape
+    # differs (it has a bg + several more ids) and must clear first, or
+    # the old green text -- drawn with a ~1.5x-poll timeout, e.g. 180s at
+    # the default -- would linger behind/around the badge for minutes.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    poller.fetch_running_runs.return_value = []   # nothing running yet
+    overlay_state: dict = {}
+    summary = run_once(client, poller, CFG_GREEN, NOW, {}, dry_run=False,
+                       running_cache={}, overlay_state=overlay_state)
+    client.clear.assert_not_called()
+    assert overlay_state["last_shape"] == frozenset({"ci"})
+
+    poller.fetch_running_runs.return_value = [_running_run()]
+    poller.fetch_median_eta.return_value = None
+    run_once(client, poller, CFG_GREEN, NOW, {}, dry_run=False,
+            running_cache={"o/r": []}, overlay_state=overlay_state)
+    client.clear.assert_called_once_with("ci_status")
 
 
 # --- overlay rotation (quota frames) ---------------------------------------------
@@ -290,9 +372,14 @@ def test_quota_frame_skipped_without_crashing_when_fetch_fails():
     summary = run_once(client, poller, CFG_QUOTA, later, {}, dry_run=False,
                        running_cache={}, overlay_state=overlay_state, quota_cache=quota_cache)
     # quota_gql's turn, but no data -- must not crash, must not draw stale
-    # data, and must advance so the next call doesn't wait a dwell.
+    # data, and must advance so the next call doesn't wait a dwell. The
+    # skip contract is "no draw, no clear": the previously-drawn ci_badge
+    # is still within its own dwell timeout and must be left exactly as
+    # it is, not evicted by an unnecessary clear() call.
     assert client.draw.call_count == 1   # only the earlier ci_badge draw
+    assert client.clear.call_count == 0   # skip path never clears
     assert overlay_state["frame_index"] == 2   # advanced past quota_gql
+    assert "no draw, no clear" in summary
 
 def test_quota_stale_data_not_shown_after_5_minutes():
     client = Mock(); client.draw.return_value = DrawResult.DRAWN
@@ -310,8 +397,9 @@ def test_quota_stale_data_not_shown_after_5_minutes():
     run_once(client, poller, CFG_QUOTA, later, {}, dry_run=False,
             running_cache={}, overlay_state=overlay_state, quota_cache=quota_cache)
     # quota_gql's turn: cached data exists but is 6 minutes old -- must be
-    # treated as unavailable, not shown.
+    # treated as unavailable, not shown, and (skip contract) not cleared.
     assert client.draw.call_count == 1   # only the ci_badge draw landed
+    assert client.clear.call_count == 0
 
 
 # --- cadence switch (next_poll_seconds) -----------------------------------------

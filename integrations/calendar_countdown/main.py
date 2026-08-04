@@ -103,8 +103,8 @@ def should_log_info(summary: str, last_logged_summary: str | None,
                     seconds_since_heartbeat: float,
                     heartbeat_seconds: int = HEARTBEAT_SECONDS) -> bool:
     """Log-noise control for the v1.5 poll-cadence drop (poll_seconds
-    60 -> 15 as the ambient-tier default): at 15s polling, logging every
-    summary at INFO would quadruple the audit log's line rate versus the
+    60 -> 10 as the ambient-tier default): at 10s polling, logging every
+    summary at INFO would sixfold the audit log's line rate versus the
     old 60s cadence for no new information on most polls (the summary is
     usually identical poll to poll). INFO only when the summary actually
     changed since the last INFO line, or a heartbeat interval has elapsed
