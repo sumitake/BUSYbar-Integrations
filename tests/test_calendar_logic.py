@@ -12,6 +12,12 @@ from calendar_countdown.logic import (
     TRACK_FILL_IN_PROGRESS, TIME_TEXT_COLOR,
     ENDS_TEXT_COLOR, ENDS_TEXT, DIVIDER_COLOR, DIGIT_COLOR,
     PANEL_WIDTH, PANEL_HEIGHT, CD_TEXT_X, CD_TEXT_MAX_WIDTH, GLYPH_ADVANCE_PX,
+    _minutes_left, select_priority, select_led, resolve_led_value, should_chirp, commit_chirped,
+    next_sleep_seconds, IMMINENT_LED_COLOR, CHIRP_STOCK_PATH, _chirp_key,
+    check_threshold_ordering,
+)
+from busybar.display import (
+    PRIORITY_AMBIENT, PRIORITY_AMBIENT_RAISED, PRIORITY_AMBIENT_URGENT,
 )
 
 TZ = timezone.utc
@@ -393,3 +399,277 @@ def test_no_foreground_element_inks_beyond_panel_rows():
         for el in els:
             rows = ink_rows(el)
             assert min(rows) >= 0 and max(rows) <= PANEL_HEIGHT - 1, (el["id"], rows)
+
+
+# --- v1.5.2 escalation ladder: select_priority ------------------------------------
+
+APPROACH = 30
+NOTICE = 15
+WARN = 5
+IMMINENT = 1
+
+def test_select_priority_normal_beyond_approach():
+    assert select_priority(45, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT
+
+def test_select_priority_approach_tier():
+    # Inside approach_minutes, outside notice_minutes.
+    assert select_priority(30, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT_RAISED
+    assert select_priority(16, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT_RAISED
+
+def test_select_priority_notice_tier():
+    assert select_priority(15, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT_URGENT
+    assert select_priority(6, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT_URGENT
+
+def test_select_priority_warn_tier_same_priority_as_notice():
+    # warn and notice share PRIORITY_AMBIENT_URGENT -- they differ visually
+    # (palette) and in LED (select_led), not in priority.
+    assert select_priority(5, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT_URGENT
+    assert select_priority(1, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT_URGENT
+
+def test_select_priority_in_progress_always_baseline():
+    # Even with minutes_left inside every elevated window, in_progress
+    # forces the baseline priority -- see the module docstring for why.
+    assert select_priority(0.5, APPROACH, NOTICE, in_progress=True) == PRIORITY_AMBIENT
+    assert select_priority(-5, APPROACH, NOTICE, in_progress=True) == PRIORITY_AMBIENT
+
+def test_select_priority_boundary_exact_approach_minutes():
+    assert select_priority(APPROACH, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT_RAISED
+    assert select_priority(APPROACH + 0.01, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT
+
+def test_select_priority_boundary_exact_notice_minutes():
+    assert select_priority(NOTICE, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT_URGENT
+    assert select_priority(NOTICE + 0.01, APPROACH, NOTICE, in_progress=False) == PRIORITY_AMBIENT_RAISED
+
+
+# --- select_led (v1.5.2 revision: returns a bool "should be on", not a
+# color -- resolve_led_value below decides the actual value to send) --------------
+
+def test_select_led_false_outside_imminent_window():
+    assert select_led(2, IMMINENT, in_progress=False) is False
+    assert select_led(15, IMMINENT, in_progress=False) is False
+
+def test_select_led_true_inside_imminent_window():
+    assert select_led(1, IMMINENT, in_progress=False) is True
+    assert select_led(0.1, IMMINENT, in_progress=False) is True
+
+def test_select_led_never_true_in_progress():
+    # Even with minutes_left well inside the imminent window (e.g. a
+    # negative value from an event that's technically started), in_progress
+    # forces False.
+    assert select_led(0.5, IMMINENT, in_progress=True) is False
+    assert select_led(-1, IMMINENT, in_progress=True) is False
+
+def test_select_led_boundary_exact_imminent_minutes():
+    assert select_led(IMMINENT, IMMINENT, in_progress=False) is True
+    assert select_led(IMMINENT + 0.01, IMMINENT, in_progress=False) is False
+
+def test_select_led_only_notice_and_warn_have_no_led_outside_imminent():
+    # warn_minutes=5 is well outside imminent_minutes=1 by default -- no LED
+    # in the warn tier itself, only inside the (much narrower) imminent one.
+    assert select_led(WARN, IMMINENT, in_progress=False) is False
+
+
+# --- resolve_led_value: explicit off-transition, not a bare omission -------------
+
+def test_resolve_led_value_should_be_on_returns_imminent_color():
+    assert resolve_led_value(led_should_be_on=True, led_was_on=False) == IMMINENT_LED_COLOR
+    assert resolve_led_value(led_should_be_on=True, led_was_on=True) == IMMINENT_LED_COLOR
+
+def test_resolve_led_value_off_transition_is_explicit_not_omitted():
+    from calendar_countdown.logic import LED_OFF_COLOR
+    assert resolve_led_value(led_should_be_on=False, led_was_on=True) == LED_OFF_COLOR
+
+def test_resolve_led_value_already_off_omits_field():
+    assert resolve_led_value(led_should_be_on=False, led_was_on=False) is None
+
+
+# --- palette stays 4-way: approach adds NO new visual state -----------------------
+
+def test_approach_window_uses_normal_palette_not_a_new_state():
+    # v1.5.2: the approach tier changes priority only -- build_elements
+    # (and _state_for underneath it) never sees approach_minutes at all,
+    # so an event at e.g. 20 minutes out (inside approach, outside notice)
+    # still renders with STATE_NORMAL colors.
+    e = CalEvent("Standup", NOW + timedelta(minutes=20), NOW + timedelta(minutes=50), False)
+    els = build_elements(e, NOW, CFG, timeout_s=90, in_progress=False)
+    bg = next(el for el in els if el["id"] == "bg")
+    assert bg["fill_colors"] == BG_GRADIENT[STATE_NORMAL]
+
+
+# --- should_chirp / commit_chirped: once-per-event, edge-detected ----------------
+# (reuses the module's own `ev(offset_min, ...)` helper defined near the top)
+
+def test_should_chirp_false_while_upcoming():
+    event = ev(2)
+    state = {}
+    assert should_chirp(event, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=True) is False
+    assert _chirp_key(event) in state["seen_upcoming"]
+
+def test_should_chirp_true_on_transition_edge():
+    event = ev(2)
+    state = {}
+    # Poll while upcoming (records seen_upcoming).
+    should_chirp(event, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=True)
+    # Next poll: event has started.
+    assert should_chirp(event, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is True
+
+def test_should_chirp_does_not_refire_after_commit():
+    event = ev(2)
+    state = {}
+    should_chirp(event, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=True)
+    assert should_chirp(event, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is True
+    commit_chirped(event, state)
+    # Multiple subsequent in_progress polls must never re-fire.
+    assert should_chirp(event, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is False
+    assert should_chirp(event, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is False
+
+def test_should_chirp_restart_mid_event_does_not_fire():
+    # Fresh chirp_state (as if the process just restarted) that never saw
+    # this event as upcoming -- the documented restart-safety edge case.
+    event = ev(-2)   # already started
+    state = {}
+    assert should_chirp(event, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is False
+
+def test_should_chirp_disabled_never_fires():
+    event = ev(2)
+    state = {}
+    should_chirp(event, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=False)
+    assert should_chirp(event, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=False) is False
+
+def test_should_chirp_disabled_still_tracks_seen_upcoming():
+    # Observation happens regardless of chirp_enabled, so toggling chirp on
+    # mid-run doesn't lose the edge-detection precondition it needs.
+    event = ev(2)
+    state = {}
+    should_chirp(event, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=False)
+    assert _chirp_key(event) in state["seen_upcoming"]
+
+def test_should_chirp_new_event_fires_independently():
+    event_a = ev(2)
+    event_b = ev(5, dur_min=15)
+    state = {}
+    should_chirp(event_a, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=True)
+    assert should_chirp(event_a, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is True
+    commit_chirped(event_a, state)
+    # A different event (different start) is entirely independent.
+    should_chirp(event_b, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=True)
+    assert should_chirp(event_b, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is True
+
+def test_should_chirp_same_start_different_title_do_not_collide():
+    # Two distinct events sharing the exact same start timestamp (e.g. two
+    # all-day events both effectively at midnight, or two calendars firing
+    # something simultaneously) must be tracked independently -- keyed by
+    # (start, title), not start alone -- so chirping/committing one never
+    # silently marks the other as already handled.
+    start = NOW + timedelta(minutes=2)
+    event_a = CalEvent("Standup", start, start + timedelta(minutes=30), False)
+    event_b = CalEvent("Retro", start, start + timedelta(minutes=15), False)
+    state = {}
+    should_chirp(event_a, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=True)
+    assert should_chirp(event_a, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is True
+    commit_chirped(event_a, state)
+    # event_b shares event_a's start but was never itself observed
+    # upcoming -- must NOT be considered already-chirped just because
+    # event_a (same start, different title) was.
+    assert should_chirp(event_b, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is False
+    # Once event_b is properly observed upcoming first, it chirps on its
+    # own, independently of event_a's already-committed chirp.
+    should_chirp(event_b, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=True)
+    assert should_chirp(event_b, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is True
+
+def test_commit_chirped_not_called_means_retry_next_poll():
+    # Mirrors the DRAWN-gated commit discipline: if the caller doesn't
+    # call commit_chirped (e.g. because play_audio failed), the very next
+    # poll must still see should_chirp return True.
+    event = ev(2)
+    state = {}
+    should_chirp(event, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=True)
+    assert should_chirp(event, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is True
+    # (caller's play_audio "failed" -- commit_chirped deliberately not called)
+    assert should_chirp(event, in_progress=True, now=NOW, chirp_state=state, chirp_enabled=True) is True
+
+def test_chirp_state_prunes_old_entries():
+    event = ev(2)
+    state = {}
+    should_chirp(event, in_progress=False, now=NOW, chirp_state=state, chirp_enabled=True)
+    assert _chirp_key(event) in state["seen_upcoming"]
+    much_later = NOW + timedelta(hours=48)
+    # A call for an unrelated, far-future event 48h later should prune the
+    # old entry out of seen_upcoming.
+    other = ev(48 * 60 + 2)
+    should_chirp(other, in_progress=False, now=much_later, chirp_state=state, chirp_enabled=True)
+    assert _chirp_key(event) not in state["seen_upcoming"]
+
+def test_chirp_stock_path_is_a_firmware_stock_sound_not_an_uploaded_asset():
+    # Documents the design choice (v1.5.2): no asset generation/upload
+    # needed -- see logic.py's module comment for the on-device probe that
+    # confirmed this exact stock_path works.
+    assert CHIRP_STOCK_PATH == "shared/calendar_event_starts.wav"
+
+
+# --- next_sleep_seconds: T-0 chirp precision --------------------------------------
+
+def test_next_sleep_seconds_normal_when_no_upcoming_event():
+    assert next_sleep_seconds(10, None) == 10
+
+def test_next_sleep_seconds_normal_when_event_far_out():
+    assert next_sleep_seconds(10, 25.0) == 10   # >= poll_seconds, not imminent enough
+
+def test_next_sleep_seconds_shortens_when_start_is_sooner():
+    assert next_sleep_seconds(10, 3.0) == 3.0
+
+def test_next_sleep_seconds_normal_when_already_started():
+    assert next_sleep_seconds(10, 0) == 10
+    assert next_sleep_seconds(10, -5.0) == 10
+
+def test_next_sleep_seconds_boundary_exact_poll_seconds():
+    # Strictly less than poll_seconds triggers shortening; exactly equal
+    # does not (falls through to the normal interval, same value either way).
+    assert next_sleep_seconds(10, 10.0) == 10
+
+
+# --- _minutes_left -------------------------------------------------------------
+
+def test_minutes_left_upcoming_uses_start():
+    e = ev(23)
+    assert _minutes_left(e, NOW, in_progress=False) == 23.0
+
+def test_minutes_left_in_progress_uses_end():
+    e = ev(-5, dur_min=30)   # started 5 min ago, 30 min long -> ends in 25 min
+    assert _minutes_left(e, NOW, in_progress=True) == 25.0
+
+
+# --- check_threshold_ordering: v1.5.2 config sanity warning ----------------------
+
+SANE_CFG = {"approach_minutes": 30, "notice_minutes": 15, "warn_minutes": 5, "imminent_minutes": 1}
+
+def test_check_threshold_ordering_sane_config_no_warning():
+    assert check_threshold_ordering(SANE_CFG) is None
+
+def test_check_threshold_ordering_approach_not_greater_than_notice():
+    cfg = {**SANE_CFG, "approach_minutes": 15}   # == notice_minutes
+    msg = check_threshold_ordering(cfg)
+    assert msg is not None
+    assert "approach_minutes" in msg and "notice_minutes" in msg
+
+def test_check_threshold_ordering_notice_not_greater_than_warn():
+    cfg = {**SANE_CFG, "notice_minutes": 5}   # == warn_minutes
+    msg = check_threshold_ordering(cfg)
+    assert msg is not None
+    assert "notice_minutes" in msg and "warn_minutes" in msg
+
+def test_check_threshold_ordering_warn_less_than_imminent():
+    cfg = {**SANE_CFG, "warn_minutes": 0, "imminent_minutes": 1}
+    msg = check_threshold_ordering(cfg)
+    assert msg is not None
+    assert "warn_minutes" in msg and "imminent_minutes" in msg
+
+def test_check_threshold_ordering_warn_equal_imminent_is_fine():
+    # warn_minutes >= imminent_minutes is the assumed (non-strict) bound.
+    cfg = {**SANE_CFG, "warn_minutes": 1, "imminent_minutes": 1}
+    assert check_threshold_ordering(cfg) is None
+
+def test_check_threshold_ordering_missing_keys_returns_none():
+    # An old-style cfg dict predating the v1.5.2 keys -- nothing to check,
+    # must not KeyError.
+    assert check_threshold_ordering({"notice_minutes": 15, "warn_minutes": 5}) is None

@@ -87,6 +87,7 @@ Once the foreground test completes, your `config.toml` is in place and GitHub au
 | `repos_exclude` | array of strings | `[]` | Repos to never watch, regardless of mode — silences a specific repo without leaving account mode (or, less commonly, without editing `repos`). Applied last, unconditionally; a no-op when empty. |
 | `active_within_days` | integer | 30 | In account mode, only auto-discovered repos pushed within this many days are watched (caps request volume on large accounts). Repos in `repos` are never subject to this filter. |
 | `repo_refresh_minutes` | integer | 60 | How often the account's repo list is re-enumerated. A newly created (or newly pushed-to, if previously outside the active window) repo is picked up within this interval, not instantly. |
+| `snooze_minutes` | integer | 30 | v1.5.2: how long an alert stays snoozed after you start-then-end a BUSY session on the device while it's showing. `0` disables the feature. See "Snoozing alerts" below. |
 
 ## Account-wide watching
 
@@ -97,6 +98,18 @@ By default this integration watches exactly the repos listed in `repos`. Setting
 **Quota math.** With N repos in the effective watch list, each poll cycle costs N REST requests to `.../actions/runs` (steady-state, these return `304` and cost nothing against your quota — see "Design: REST-only, Quota-Efficient" above) at `poll_seconds` cadence (default every 120s, so N requests every 2 minutes = up to `N * 30` requests/hour, all free in the steady state), plus N more to the running-runs endpoint whenever `show_running` is on, at `running_poll_seconds` cadence while any run is active. Account-wide discovery itself adds one more request per `repo_refresh_minutes` (default hourly = 1 request/hour, also ETag-cached on its first page — see `RestPoller.fetch_account_repos`'s docstring). None of this touches your real GitHub REST quota unless workflow state is actually changing, since 304s are free; the practical cap that matters is request *volume* (GitHub does rate-limit request rate, not just quota), which is why `active_within_days` exists — it keeps N bounded to your actually-active repos instead of every repo you've ever created.
 
 **Caveat: `active_within_days` filters on `pushed_at`, a repo-level field — it has no idea about *schedule*-triggered workflow runs.** A repo whose CI only ever runs on a cron schedule (no pushes) will fall out of the active window and stop being watched even while its scheduled runs keep firing, because nothing about a scheduled run touches `pushed_at`. If you rely on schedule-triggered CI on a repo that doesn't otherwise see regular pushes, add it to `repos` explicitly (explicit repos are never subject to the active-window filter) rather than relying on account-wide discovery to keep watching it.
+
+## Snoozing alerts
+
+**From the button's perspective:** you're looking at a persistent CI failure or stuck-queue alert on the device, and you already know about it — you don't want to keep seeing it right now. Press the device's native **start** button (the same one that begins a BUSY/CUSTOM session), then press it again to end the session whenever you're ready. Once that session ends, this exact failure stays off the panel for `snooze_minutes` (default 30) — no config edit, no separate acknowledgement step, just the button you were already going to press anyway.
+
+**Why a session, not a dedicated gesture.** Raw physical button presses aren't observable through the device's API at all (confirmed: the status WebSocket only reports what's currently on screen, not button events) — but the BUSY/CUSTOM session the button starts *is*, via `client.get_busy()`. The snooze rule rides on that signal rather than needing a new one: an alert showing at the moment a session starts is treated as "you saw it and pressed the button." While the session runs, the alert is naturally hidden anyway (`PRIORITY_SESSION`, 90, outranks the alert's 60) — the snooze rule's actual work happens once the session *ends*.
+
+**What exactly gets remembered.** The snooze is scoped to the precise set of currently-failing/stuck `repo:workflow` pairs (their "fingerprint"), not "alerts in general." If anything about that set changes while snoozed — a new repo starts failing, a different workflow in the same repo fails, or the original failure resolves and a new one appears — the snooze is dropped immediately and the (new) alert shows right away, even mid-snooze. The snooze also only ever suppresses the alert badge itself: the running-CI badge/quota overlay and the quiet-green "CI ok" text (if enabled) behave exactly as if nothing were snoozed at all.
+
+**During the session itself** (before you've ended it), the alert's own LED — which normally blinks even through a BUSY session, since LED is a separate channel from the panel's own priority arbitration — is suppressed too, the moment the session starts. You pressed the button; the LED doesn't need to keep insisting.
+
+**Restart edge case.** This state is in-memory only, like every other cache in this codebase — a process restart loses any pending or active snooze. A restart that happens to land while a session is *already* active is deliberately treated conservatively: rather than risk assuming a session that predates this process's own observation was "a button press for the alert," a fresh process requires an actually-observed inactive → active transition before it will start a new pending snooze. Practically: if you restart the integration mid-session, you may need to end and (if still needed) re-acknowledge via a fresh session press.
 
 ## Display Priority Tiers
 
@@ -122,6 +135,19 @@ The alert tier (`PRIORITY_ALERT`, 60) sits above the overlay tier and
 preempts it unconditionally — a failure or stuck-queue badge always wins
 over the running badge or a quota frame, per the precedence in
 `build_ci_payload` (failure > stuck > overlay > quiet green > nothing).
+
+**v1.5.2: the alert tier is no longer the ceiling.** `calendar_countdown`
+can elevate to `PRIORITY_AMBIENT_URGENT` (65, above `PRIORITY_ALERT`) when
+one of its own events is imminent (see its README's "Escalation ladder")
+— closing an operator-reported gap where a persistent CI failure alert
+permanently buried an imminent calendar event with no way for the
+calendar to ever reclaim the screen. When that happens, this integration's
+own alert draw gets a `409` (`DrawResult.REJECTED`) exactly like it always
+has against the overlay tier's own dwell gaps — `run_once` treats that as
+expected and silent (no state committed, no crash), and the alert
+reappears on its own next poll once the calendar drops back down. See
+`calendar_countdown`'s README for the full eviction/409 interplay and the
+priority table.
 
 ## Overlay Rotation: Running Badge + Quota Frames
 

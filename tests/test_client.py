@@ -106,3 +106,47 @@ def test_status_success(mock_request):
     payload = {"version": "1.0.0", "uptime_ms": 300_000}
     mock_request.return_value = _response(200, payload)
     assert BusyBarClient().status() == payload
+
+
+# --- play_audio (v1.5.2, calendar_countdown chirp) -------------------------------
+
+@patch("busybar.client.requests.request")
+def test_play_audio_stock_path_success(mock_request):
+    mock_request.return_value = _response(200)
+    assert BusyBarClient().play_audio("calendar_countdown", stock_path="shared/calendar_event_starts.wav") is True
+    method, url = mock_request.call_args.args
+    assert method == "POST" and url == "http://10.0.4.20/api/audio/play"
+    body = mock_request.call_args.kwargs["json"]
+    assert body == {"application_name": "calendar_countdown",
+                    "stock_path": "shared/calendar_event_starts.wav"}
+
+@patch("busybar.client.requests.request")
+def test_play_audio_path_variant(mock_request):
+    mock_request.return_value = _response(200)
+    assert BusyBarClient().play_audio("app", path="data.snd") is True
+    body = mock_request.call_args.kwargs["json"]
+    assert body == {"application_name": "app", "path": "data.snd"}
+
+def test_play_audio_requires_exactly_one_source():
+    try:
+        BusyBarClient().play_audio("app")
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+@patch("busybar.client.requests.request")
+def test_play_audio_false_on_404(mock_request):
+    mock_request.return_value = _response(404)
+    assert BusyBarClient().play_audio("app", stock_path="shared/nope.wav") is False
+
+@patch("busybar.client.requests.request")
+def test_play_audio_false_on_unreachable(mock_request):
+    mock_request.side_effect = requests.ConnectionError()
+    assert BusyBarClient().play_audio("app", stock_path="shared/x.wav") is False
+
+@patch("busybar.client.requests.request")
+def test_play_audio_never_touches_volume_endpoint(mock_request):
+    mock_request.return_value = _response(200)
+    BusyBarClient().play_audio("app", stock_path="shared/x.wav")
+    for call in mock_request.call_args_list:
+        assert "/api/audio/volume" not in call.args[1]

@@ -86,11 +86,73 @@ def overlay_gap_elapsed(last_dwell_end, now) -> float:
     return (now - last_dwell_end).total_seconds()
 
 
+PRIORITY_AMBIENT_RAISED = 25
+"""An ambient app carrying near-term (but not yet imminent) user-critical
+information may draw here instead of PRIORITY_AMBIENT (v1.5.2). Strictly
+above PRIORITY_OVERLAY (21) -- so a raised-tier ambient draw can no longer
+be silently interrupted by an overlay-tier dwell rotation (e.g. the
+running-CI badge/quota frames) -- and strictly below PRIORITY_ALERT (60)
+-- a genuine alert still wins over a merely-approaching event. This tier
+exists for the "approach" window: calendar_countdown uses it once an
+event is within `approach_minutes` of starting but still outside its
+`notice_minutes` window (see calendar_countdown.logic.select_priority).
+Overlay and alert tiers must never draw here -- this is an ambient-only
+elevation, not a general-purpose "important overlay" priority; an overlay
+frame that wants to preempt alerts belongs at PRIORITY_AMBIENT_URGENT or
+higher only if it is itself carrying ambient, not overlay, semantics
+(none currently do).
+"""
+
 PRIORITY_ALERT = 60
 """Urgent, preempting states (e.g. CI failure/stuck badges). Always wins
-over PRIORITY_AMBIENT and PRIORITY_OVERLAY by virtue of being a strictly
-higher number (fact 1 above) -- no dwell/silence contract; draw
-immediately and keep redrawing every poll while the condition holds.
+over PRIORITY_AMBIENT, PRIORITY_OVERLAY, and PRIORITY_AMBIENT_RAISED by
+virtue of being a strictly higher number (fact 1 above) -- no dwell/
+silence contract; draw immediately and keep redrawing every poll while
+the condition holds.
+"""
+
+PRIORITY_AMBIENT_URGENT = 65
+"""An ambient app carrying IMMINENT user-critical information may draw
+here instead of PRIORITY_AMBIENT (v1.5.2) -- strictly above
+PRIORITY_ALERT (60), so it can preempt even a genuine, currently-active
+alert (fact 2 means that alert's elements are evicted, not merely
+occluded-and-later-restored -- see the eviction/409 interplay in the spec
+doc's v1.5.2 section for why this is safe: the alert's own app keeps
+trying to redraw every poll per its no-dwell contract, gets a `409`
+REJECTED response while this tier holds the screen, treats that as
+expected and silent, and re-asserts itself the moment this tier drops
+back down -- no cross-process coordination needed). Strictly below
+PRIORITY_SESSION (90) -- a real BUSY/CUSTOM work session still wins.
+
+This tier exists specifically to close an operator-reported UX gap: a
+persistent CI failure alert was permanently evicting the calendar,
+hiding imminent events with no way for the calendar to ever reclaim the
+screen (an ambient app has no dwell/silence contract of its own to fall
+back on the way the overlay tier does). calendar_countdown elevates here
+once an event enters its `notice_minutes` window and stays here through
+`warn_minutes`, reverting to PRIORITY_AMBIENT once the event starts (see
+calendar_countdown.logic.select_priority) -- deliberately NOT while
+merely in_progress, since once a meeting has started you already know
+about it; the elevation exists to catch your attention BEFORE it starts.
+
+**The LED is ASSUMED to be the session-safe channel -- unverified,
+requires operator observation.** A BUSY/CUSTOM session at
+PRIORITY_SESSION (90) still outranks this tier for the *panel*, so an
+urgent-ambient draw's `elements` can be evicted the same way an alert's
+can. The device's own API schema describes `led_notification_color` as a
+separate field from the drawn elements, and probing what's actually
+checkable from this codebase (the 409 rejection response body, whether
+any status endpoint exposes current LED state) turned up nothing that
+either confirms or refutes whether it survives the same priority
+eviction that evicts the elements -- there is no LED-state-observable
+endpoint anywhere in the device's API, and this claim can only be
+settled by a human actually watching the physical LED during a live
+session test. Until that observation happens, treat "the LED gets
+through a session" as a design assumption this codebase acts on (see
+calendar_countdown, which sets the LED during its final-minute window --
+`imminent_minutes` -- specifically because a session might otherwise
+hide it), not a verified fact. See calendar_countdown's README for a
+short recipe to verify this on the actual hardware.
 """
 
 PRIORITY_SESSION = 90

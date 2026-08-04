@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
 from busybar.display import (
-    PRIORITY_AMBIENT, PRIORITY_OVERLAY, PRIORITY_ALERT, PRIORITY_SESSION,
+    PRIORITY_AMBIENT, PRIORITY_OVERLAY, PRIORITY_AMBIENT_RAISED, PRIORITY_ALERT,
+    PRIORITY_AMBIENT_URGENT, PRIORITY_SESSION,
     AMBIENT_REDRAW_SECONDS, OVERLAY_DWELL_SECONDS,
     ambient_timeout, overlay_gap_elapsed,
 )
@@ -12,7 +13,9 @@ NOW = datetime(2026, 8, 3, 13, 37, tzinfo=timezone.utc)
 def test_priority_ladder_values():
     assert PRIORITY_AMBIENT == 20
     assert PRIORITY_OVERLAY == 21
+    assert PRIORITY_AMBIENT_RAISED == 25
     assert PRIORITY_ALERT == 60
+    assert PRIORITY_AMBIENT_URGENT == 65
     assert PRIORITY_SESSION == 90
 
 def test_priority_ladder_is_strictly_increasing():
@@ -20,12 +23,20 @@ def test_priority_ladder_is_strictly_increasing():
     # REJECTED by the firmware (probed, contradicts the OpenAPI doc), so
     # every tier that must be able to preempt the one below it needs a
     # strictly greater number, not merely a "greater or equal" one.
-    ladder = [PRIORITY_AMBIENT, PRIORITY_OVERLAY, PRIORITY_ALERT, PRIORITY_SESSION]
+    # v1.5.2: 20 < 21 < 25 < 60 < 65 < 90.
+    ladder = [PRIORITY_AMBIENT, PRIORITY_OVERLAY, PRIORITY_AMBIENT_RAISED,
+             PRIORITY_ALERT, PRIORITY_AMBIENT_URGENT, PRIORITY_SESSION]
     assert ladder == sorted(set(ladder))
     assert len(ladder) == len(set(ladder))
 
 def test_overlay_priority_strictly_exceeds_ambient():
     assert PRIORITY_OVERLAY > PRIORITY_AMBIENT
+
+def test_ambient_raised_strictly_between_overlay_and_alert():
+    assert PRIORITY_OVERLAY < PRIORITY_AMBIENT_RAISED < PRIORITY_ALERT
+
+def test_ambient_urgent_strictly_between_alert_and_session():
+    assert PRIORITY_ALERT < PRIORITY_AMBIENT_URGENT < PRIORITY_SESSION
 
 def test_cadence_constants():
     # Tuned down from 15 to 10 after on-device re-measurement showed 15s
