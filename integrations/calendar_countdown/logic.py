@@ -42,11 +42,17 @@ TRACK_FILL_GRADIENT = {
 }
 TRACK_FILL_IN_PROGRESS = "#24D6C5FF"
 
-# Fixed regardless of state -- only drawn for upcoming events.
-TIME_CARD_COLOR = "#062238FF"
+# Fixed regardless of state -- only drawn for upcoming events. No card
+# behind it as of v1.4 ("airy" refinement): per operator design principle,
+# a card/panel surface is only acceptable with strong luminance contrast
+# against both the background and its own text (near-black surface + bright
+# text, or an inverse chip -- bright surface + near-black text, as the CI
+# failure badge does). The v1.3.1 cards (#062238/#062A22, etc.) were
+# mid-luminance dim fills that read as glow-mud on emissive LEDs, so v1.4
+# removes cards entirely rather than trying to re-tune their luminance.
 TIME_TEXT_COLOR = "#8DDEFFFF"
 
-# Fixed -- only drawn for the in-progress state (replaces time_card + time).
+# Fixed -- only drawn for the in-progress state (replaces time + ends).
 ENDS_TEXT_COLOR = "#8CFFF4FF"
 ENDS_TEXT = "ENDS"
 
@@ -55,13 +61,6 @@ DIVIDER_COLOR = {
     STATE_NOTICE: "#C37A0CFF",
     STATE_WARNING: "#E02A4CFF",
     STATE_IN_PROGRESS: "#178C88FF",
-}
-
-CD_CARD_COLOR = {
-    STATE_NORMAL: "#062A22FF",
-    STATE_NOTICE: "#3A2000FF",
-    STATE_WARNING: "#3A0711FF",
-    STATE_IN_PROGRESS: "#063238FF",
 }
 
 DIGIT_COLOR = {
@@ -75,66 +74,83 @@ DIGIT_COLOR = {
 #
 # Firmware ink-offset gotcha (found via on-device frame captures after the
 # first v1.3 pass mashed the layout): every font renders its ink ~2px below
-# the element's `y`, uniformly across the small/extra_large/bold fonts tested
-# (e.g. `y=4` on the extra_large font puts ink at rows 6-15, not 4-13). The
-# `_Y` constants below are already offset-corrected so ink lands where the
-# name implies -- do not "fix" them back to the visually-obvious value without
-# re-verifying ink rows on-device.
+# the element's `y`, uniformly across every font tested so far (tiny/small/
+# large/extra_large/bold). The `_Y` constants below are already
+# offset-corrected so ink lands where the name/row-comment implies -- do not
+# "fix" them back to the visually-obvious value without re-verifying ink
+# rows on-device. Rectangles have no such offset; a rectangle's ink starts
+# exactly at its `y`.
+#
+# v1.4 "airy" refinement: more breathing room, no card surfaces (removed
+# per the operator's luminance-contrast design principle -- see the
+# TIME_TEXT_COLOR comment above), both numerals drop from extra_large (10px
+# bold) to `large` (9px) so they stay equal-sized (never independently
+# resized -- another operator design principle). Freeing the card rows
+# opened up row 5 as a deliberate blank buffer row between the title (ink
+# 0-4) and the track, which moved from y=5 to y=6.
 
-TITLE_X = 1
-TITLE_Y = -2   # ink rows 0-4 (small font); stays clear of the track at row 5
-TITLE_WIDTH = 70
+TITLE_X = 2
+TITLE_Y = -2   # ink rows 0-4 (small font, 5px); top-flush is deliberate (ribbon)
+TITLE_WIDTH = 68   # 2px margin each side (x=2..70 of a 72px panel)
 
-TRACK_Y = 5
+# Row 5 is a deliberate blank buffer -- nothing may ink it. Verified
+# on-device (see the spec doc's v1.4 section and the report).
+TRACK_Y = 6   # was 5 in v1.3.1; full width edge-to-edge is deliberate (horizon line)
 TRACK_HEIGHT = 1
 
-TIME_CARD_X = 0
-TIME_CARD_Y = 6
-TIME_CARD_WIDTH = 34
-TIME_CARD_HEIGHT = 10
-TIME_CARD_RADIUS = 1
-TIME_X = 1
-TIME_Y = 4     # ink rows 6-15 (extra_large font); exactly fills the y6-15 card
+TIME_X = 2
+TIME_Y = 5     # ink rows 7-15 (large font, 9px); bottom-flush at row 15 is deliberate
 
-ENDS_X = 3
-ENDS_Y = 6     # ink rows 8-14 (bold font); clear of the track and the panel's bottom edge
+ENDS_X = 2
+ENDS_Y = 6     # ink rows 8-14 (bold font, 7px); numerically shares y with track,
+               # but text's +2 ink offset means ink starts at row 8, 1px clear of
+               # track's ink at row 6 -- verify no contact on-device, not just by
+               # the numbers matching.
 
 DIVIDER_X = 34
-DIVIDER_Y = 6
+DIVIDER_Y = 8   # ink rows 8-14 (rectangle, no offset); 1px clear of the track
 DIVIDER_WIDTH = 2
-DIVIDER_HEIGHT = 10
-
-CD_CARD_X = 36
-CD_CARD_Y = 6
-CD_CARD_WIDTH = 36
-CD_CARD_HEIGHT = 10
-CD_CARD_RADIUS = 1
+DIVIDER_HEIGHT = 7   # ... above (row 7 blank) and the panel's bottom edge below (row 15 blank)
 
 # The native `countdown` element's digits render only 5px tall in every mode
-# (MM:SS and H:MM:SS both) -- confirmed with fresh-id on-device probes after
-# the first v1.3 pass's "10px" figure turned out to be a stale measurement
-# corrupted by the firmware's id-reuse-type-change quirk (an id that changes
-# element `type` between draws can serve pixel data from the previous type).
-# Large numerals are the operator's core requirement, so the native countdown
-# element is unusable here; a plain `text` element in the `extra_large` font
-# replaces it, formatted by `_format_countdown` below. Renamed from
-# "countdown" to "cd_text" so the id's element `type` never changes
-# (countdown -> text) across an upsert -- the same id-reuse-type-change
-# quirk that corrupted the original measurement. `main()`'s startup
-# `client.clear(APP)` additionally guards a process restart against any
-# lingering "countdown"-type element left by a previous deploy.
-CD_TEXT_X = 38
-CD_TEXT_Y = 4   # ink rows 6-15 (extra_large font), matching cd_card
-# No `align` field -- the previous pass's align="top_right" right-anchoring
-# was implicated in the mash (align re-anchors screen-relative, not
-# card-relative, and interacted badly with the ink-offset bug). Fixed left
-# position within the card instead.
+# (MM:SS and H:MM:SS both) -- confirmed with fresh-id on-device probes during
+# the v1.3.1 correction. Large numerals are the operator's core requirement,
+# so the native countdown element is unusable here; a plain `text` element
+# replaces it (id "cd_text" -- not "countdown", since its element `type`
+# differs and the draw endpoint's id-reuse-type-change quirk can serve stale
+# pixel data across a type change), formatted by `_format_countdown` below.
+# No `align` field: align re-anchors screen-relative, not layout-relative,
+# and was implicated in the v1.3 mash. Fixed left position instead.
+CD_TEXT_X = 39
+CD_TEXT_Y = 5   # ink rows 7-15 (large font, 9px) -- same offset pattern as `time`,
+                # since both are the same font size per the "numerals track together" rule
 
-# Measured on-device, extra_large font: "12h00m" (6 glyphs) ~= 37px. Used
-# only to size-check _format_countdown's output against the space available
-# between cd_text's x and the panel's right edge (see _format_countdown).
-CD_TEXT_CHAR_PX = 37 / 6
-CD_TEXT_MAX_WIDTH = PANEL_WIDTH - CD_TEXT_X   # 34px
+# Available width for cd_text's rendered string, right up to the panel's
+# edge (there's nothing to its right in v1.4 -- no card, no divider on that
+# side).
+CD_TEXT_MAX_WIDTH = PANEL_WIDTH - CD_TEXT_X   # 33px
+
+# Per-glyph advance width in px, `large` font (9px), measured on-device by
+# differencing (e.g. width("001") - width("00") = the '1' glyph's advance).
+# This font is NOT fixed-width: '1' measures 5px vs 7px for every other
+# digit -- a ~30% difference that a single flat "px per char" constant
+# cannot represent accurately enough to safely decide whether a given
+# countdown string fits (see _format_countdown's docstring for why this
+# matters here specifically). Values are rounded up from the raw
+# differencing measurements (which came out ~1px lower than an additive
+# reconstruction predicts, consistently, likely a one-time string-start
+# left-bearing the differencing technique double-counts) -- i.e. this table
+# deliberately over-estimates width slightly, the safe direction for a
+# fits/doesn't-fit decision.
+GLYPH_ADVANCE_PX = {
+    "0": 7, "1": 5, "2": 7, "3": 7, "4": 7, "5": 7, "6": 7, "7": 7, "8": 7, "9": 7,
+    "h": 6, "m": 8,
+}
+
+
+def _text_width_px(s: str) -> int:
+    return sum(GLYPH_ADVANCE_PX[ch] for ch in s)
+
 
 # Approximate px-per-character for the "small" bitmap font, used only to
 # decide whether a title needs to scroll. Deliberately conservative (slightly
@@ -213,36 +229,52 @@ def _format_countdown(minutes_left: float) -> str:
     means just under 2 minutes left, not "close to 1 minute"). Negative
     input (defensive only; callers shouldn't produce it) clamps to 0.
 
-    Below 10 hours: "<M>m" (e.g. "54m") under 60 minutes, else "<H>h<MM>m"
-    (e.g. "1h05m", minutes zero-padded to 2 digits). At 10+ hours: "<H>h"
-    only, dropping minutes entirely. The drop is required, not cosmetic: the
-    full "<H>h<MM>m" form is 6 glyphs at 2 digits of hours (e.g. "12h00m"),
-    which measures ~37px on-device at this font (CD_TEXT_CHAR_PX) -- wider
-    than the ~34px available between `cd_text`'s x and the panel's right
-    edge (CD_TEXT_MAX_WIDTH), so it would clip. Below 10 hours the full form
-    is at most 5 glyphs ("9h59m" ~= 31px), which fits comfortably.
+    Under 60 minutes: "<M>m" (e.g. "54m"). At/above 1 hour: tries the full
+    "<H>h<MM>m" form (e.g. "1h05m", minutes zero-padded to 2 digits) and
+    falls back to "<H>h" (minutes dropped) only if the full form's *actual*
+    rendered width (via GLYPH_ADVANCE_PX) would exceed CD_TEXT_MAX_WIDTH.
+
+    This is a per-string width check, not a fixed hour cutoff (e.g. "only
+    hours >= 10 drop minutes"), because on-device measurement (v1.4
+    re-verification) found a fixed cutoff is unsafe: this font's '1' glyph
+    is ~30% narrower than every other digit (5px vs 7px advance), so
+    whether a given single-digit-hour string fits depends on which actual
+    digits appear, not just the hour count. Measured examples: "1h05m" and
+    "1h59m" fit (the hours digit's own "1" is enough headroom); "9h11m"
+    fits too (two "1"s in the minutes make up for a non-"1" hours digit);
+    but "2h05m", "5h55m", "9h59m", and even "0h00m" do NOT fit (34px
+    measured against a 33px budget) despite all being single-digit-hour,
+    5-glyph strings -- the same nominal "shape" the original fixed-cutoff
+    design assumed was uniformly safe. Two-digit hours (10+) always fail
+    the width check on their own digits alone and correctly fall through to
+    the hour-only form as a natural consequence, with no special case
+    needed.
     """
     total_minutes = max(0, int(minutes_left))
     hours, minutes = divmod(total_minutes, 60)
     if hours == 0:
         return f"{minutes}m"
-    if hours >= 10:
-        return f"{hours}h"
-    return f"{hours}h{minutes:02d}m"
+    full_form = f"{hours}h{minutes:02d}m"
+    if _text_width_px(full_form) <= CD_TEXT_MAX_WIDTH:
+        return full_form
+    return f"{hours}h"
 
 
 def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
                    in_progress: bool) -> list[dict]:
-    """Build the v1.3 "Color Horizon" layout.
+    """Build the v1.4 "airy" Color Horizon layout.
 
     `cfg` is the `[calendar_countdown]` config sub-dict (needs
     progress_window_minutes, notice_minutes, warn_minutes). `in_progress`
     selects between the "upcoming" layout (countdown to event.start, a
-    time-card label) and the "in-progress" layout (countdown to event.end, an
-    "ENDS" label, full-width non-draining track fill). The countdown itself
-    (`cd_text`) is a plain `text` element re-rendered from `minutes_left`
-    each poll -- not the native `countdown` element (see the CD_TEXT_X
-    comment above for why). Draw order below is z-order, first = behind.
+    large start-time numeral) and the "in-progress" layout (countdown to
+    event.end, an "ENDS" label, full-width non-draining track fill). No
+    card/panel surfaces -- `time` and `cd_text` float directly on `bg` (see
+    the TIME_TEXT_COLOR comment above for why cards were removed in v1.4).
+    The countdown itself (`cd_text`) is a plain `text` element re-rendered
+    from `minutes_left` each poll -- not the native `countdown` element (see
+    the CD_TEXT_X comment above for why). Draw order below is z-order,
+    first = behind.
     """
     # Uppercase kills descenders (g, y, p, ...), which is what let the title
     # collide with the track below it before the ink-offset fix -- see the
@@ -335,23 +367,10 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
         })
     else:
         elements.append({
-            "id": "time_card",
-            "type": "rectangle",
-            "x": TIME_CARD_X,
-            "y": TIME_CARD_Y,
-            "width": TIME_CARD_WIDTH,
-            "height": TIME_CARD_HEIGHT,
-            "radius": TIME_CARD_RADIUS,
-            "fill": "solid",
-            "fill_colors": [TIME_CARD_COLOR],
-            "border_width": 0,
-            "timeout": timeout_s,
-        })
-        elements.append({
             "id": "time",
             "type": "text",
             "text": f"{event.start.astimezone():%H:%M}",
-            "font": "extra_large",
+            "font": "large",
             "color": TIME_TEXT_COLOR,
             "x": TIME_X,
             "y": TIME_Y,
@@ -372,24 +391,10 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
     })
 
     elements.append({
-        "id": "cd_card",
-        "type": "rectangle",
-        "x": CD_CARD_X,
-        "y": CD_CARD_Y,
-        "width": CD_CARD_WIDTH,
-        "height": CD_CARD_HEIGHT,
-        "radius": CD_CARD_RADIUS,
-        "fill": "solid",
-        "fill_colors": [CD_CARD_COLOR[state]],
-        "border_width": 0,
-        "timeout": timeout_s,
-    })
-
-    elements.append({
         "id": "cd_text",
         "type": "text",
         "text": _format_countdown(minutes_left),
-        "font": "extra_large",
+        "font": "large",
         "color": DIGIT_COLOR[state],
         "x": CD_TEXT_X,
         "y": CD_TEXT_Y,

@@ -6,22 +6,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 from calendar_countdown.logic import (
     CalEvent, select_next_event, select_active_event, ascii_safe,
     build_elements, _track_fill_width, _state_for, _title_fits,
-    _format_countdown,
+    _format_countdown, _text_width_px,
     STATE_NORMAL, STATE_NOTICE, STATE_WARNING, STATE_IN_PROGRESS, STATES,
     BG_GRADIENT, TITLE_COLOR, TRACK_COLOR, TRACK_FILL_GRADIENT,
-    TRACK_FILL_IN_PROGRESS, TIME_CARD_COLOR, TIME_TEXT_COLOR,
-    ENDS_TEXT_COLOR, ENDS_TEXT, DIVIDER_COLOR, CD_CARD_COLOR, DIGIT_COLOR,
-    PANEL_WIDTH, PANEL_HEIGHT, CD_TEXT_X, CD_TEXT_CHAR_PX, CD_TEXT_MAX_WIDTH,
+    TRACK_FILL_IN_PROGRESS, TIME_TEXT_COLOR,
+    ENDS_TEXT_COLOR, ENDS_TEXT, DIVIDER_COLOR, DIGIT_COLOR,
+    PANEL_WIDTH, PANEL_HEIGHT, CD_TEXT_X, CD_TEXT_MAX_WIDTH, GLYPH_ADVANCE_PX,
 )
 
 TZ = timezone.utc
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=TZ)
 CFG = {"progress_window_minutes": 60, "notice_minutes": 15, "warn_minutes": 5}
 
+# Firmware ink-offset model, reconstructed here (test-only) so the row-5
+# buffer rule can be checked structurally from build_elements()'s raw
+# geometry, not just eyeballed against the constants. Text ink starts 2px
+# below the element's `y` and is as tall as the font's native pixel height;
+# rectangles have no offset. Mirrors the table in logic.py's geometry
+# comment and the v1.4 spec doc.
+TEXT_INK_OFFSET = 2
+FONT_PIXEL_HEIGHT = {"small": 5, "large": 9, "bold": 7}
+
 
 def ev(offset_min: int, title: str = "Standup", dur_min: int = 30, all_day: bool = False) -> CalEvent:
     start = NOW + timedelta(minutes=offset_min)
     return CalEvent(title=title, start=start, end=start + timedelta(minutes=dur_min), all_day=all_day)
+
+
+def ink_rows(el: dict) -> range:
+    """Rows an element's ink actually occupies, per the offset model above."""
+    if el["type"] == "text":
+        top = el["y"] + TEXT_INK_OFFSET
+        height = FONT_PIXEL_HEIGHT[el["font"]]
+    else:  # rectangle: no offset
+        top = el["y"]
+        height = el["height"]
+    return range(top, top + height)
 
 
 def test_selects_earliest_upcoming():
@@ -67,7 +87,7 @@ def test_state_in_progress_overrides_thresholds():
 # --- palette completeness ------------------------------------------------------
 
 def test_every_state_has_a_palette_entry_in_every_state_keyed_table():
-    tables = [BG_GRADIENT, TITLE_COLOR, TRACK_FILL_GRADIENT, DIVIDER_COLOR, CD_CARD_COLOR, DIGIT_COLOR]
+    tables = [BG_GRADIENT, TITLE_COLOR, TRACK_FILL_GRADIENT, DIVIDER_COLOR, DIGIT_COLOR]
     for table in tables:
         # TRACK_FILL_GRADIENT intentionally omits in_progress (solid fill instead).
         expected = set(STATES) - {STATE_IN_PROGRESS} if table is TRACK_FILL_GRADIENT else set(STATES)
@@ -95,19 +115,24 @@ def test_track_fill_window_disabled_defensively_full():
 # --- title fit / scroll decision --------------------------------------------
 
 def test_title_fits_short_string():
-    assert _title_fits("Sync", 70) is True
+    assert _title_fits("Sync", 68) is True
 
 def test_title_does_not_fit_long_string():
-    assert _title_fits("A Very Long Meeting Title That Does Not Fit At All", 70) is False
+    assert _title_fits("A Very Long Meeting Title That Does Not Fit At All", 68) is False
 
 
 # --- countdown text formatting ------------------------------------------------
 #
 # _format_countdown feeds the cd_text element (a plain `text` element,
-# extra_large font, replacing the native `countdown` element -- see
-# logic.py's CD_TEXT_X comment for why). Floored to whole minutes; switches
-# to an hour-only form at 10+ hours so the rendered text never overflows the
-# space available in cd_card (see the width tests below).
+# `large` font as of v1.4, replacing the native `countdown` element -- see
+# logic.py's CD_TEXT_X comment for why). Floored to whole minutes; falls
+# back to an hour-only form whenever the full "<H>h<MM>m" form's *measured*
+# width would overflow the space available past cd_text's x -- a per-string
+# check, not a fixed hour cutoff (see _format_countdown's docstring: this
+# font's '1' glyph is measurably narrower than every other digit, so a
+# fixed "hours >= 10" threshold turned out unsafe for single-digit hours on
+# real hardware -- re-verification for v1.4 found several single-digit-hour,
+# 5-glyph strings that measure wider than the budget).
 
 def test_countdown_format_under_an_hour():
     assert _format_countdown(0) == "0m"
@@ -117,38 +142,57 @@ def test_countdown_format_under_an_hour():
 def test_countdown_format_boundary_59_60_minutes():
     assert _format_countdown(59) == "59m"
     assert _format_countdown(59.9) == "59m"   # still floors to 59, not 60
-    assert _format_countdown(60) == "1h00m"
+    assert _format_countdown(60) == "1h00m"   # exactly at the width budget; fits
 
-def test_countdown_format_hours_and_minutes():
-    assert _format_countdown(65) == "1h05m"
-    assert _format_countdown(125) == "2h05m"
+def test_countdown_format_full_form_when_it_fits():
+    assert _format_countdown(65) == "1h05m"          # hours digit '1' is narrow enough
+    assert _format_countdown(119) == "1h59m"         # fits even with wide minute digits
+    assert _format_countdown(9 * 60 + 11) == "9h11m"  # narrow '1's in minutes rescue a wide hours digit
 
-def test_countdown_format_boundary_9h59_10h():
-    assert _format_countdown(9 * 60 + 59) == "9h59m"    # 599 min -> full form
-    assert _format_countdown(10 * 60) == "10h"          # 600 min -> hour-only form
-    assert _format_countdown(10 * 60 + 59) == "10h"      # still hour-only just past the boundary
+def test_countdown_format_falls_back_to_hour_only_when_full_form_overflows():
+    # Single-digit-hour, 5-glyph strings -- the same nominal "shape" a fixed
+    # hours>=10 cutoff would have assumed always fits -- but none of these
+    # digits happen to include the narrower '1' glyph, so the measured
+    # full-form width (34px) exceeds the 33px budget. This is the concrete
+    # finding that replaced the fixed cutoff with a per-string width check.
+    assert _format_countdown(125) == "2h"              # would-be "2h05m"
+    assert _format_countdown(5 * 60 + 55) == "5h"       # would-be "5h55m"
+    assert _format_countdown(9 * 60 + 59) == "9h"       # would-be "9h59m"
+
+def test_countdown_format_two_digit_hours_always_hour_only():
+    assert _format_countdown(10 * 60) == "10h"
+    assert _format_countdown(10 * 60 + 59) == "10h"
+    assert _format_countdown(12 * 60) == "12h"   # default lookahead_hours
 
 def test_countdown_format_clamps_negative_to_zero():
     assert _format_countdown(-5) == "0m"
 
-def test_countdown_format_never_overflows_card_width():
-    # Sweep a wide range of inputs (including the worst case within each
-    # branch: 9h59m for the full form, and just past the 10h cutover) and
-    # verify every produced string fits CD_TEXT_MAX_WIDTH at the measured
-    # per-glyph width.
-    samples_minutes = [0, 1, 30, 59, 60, 65, 125, 9 * 60 + 59, 10 * 60, 12 * 60, 23 * 60 + 59]
+def test_countdown_format_never_overflows_available_width():
+    # Sweep a wide range of inputs (including the confirmed-overflow cases
+    # above, and the largest 2-digit-hour case) and verify every produced
+    # string's *measured* width (not an approximation) fits CD_TEXT_MAX_WIDTH.
+    samples_minutes = [0, 1, 30, 59, 60, 65, 119, 125, 5 * 60 + 55,
+                       9 * 60 + 11, 9 * 60 + 59, 10 * 60, 12 * 60, 23 * 60 + 59]
     for minutes in samples_minutes:
         text = _format_countdown(minutes)
-        assert len(text) * CD_TEXT_CHAR_PX <= CD_TEXT_MAX_WIDTH, (minutes, text)
+        assert _text_width_px(text) <= CD_TEXT_MAX_WIDTH, (minutes, text)
 
-def test_countdown_full_form_at_10h_would_have_overflowed():
-    # Documents *why* the >=10h rule exists: without it, "10h00m" (the full
-    # <H>h<MM>m form at 2-digit hours) is 6 glyphs, same length as the
-    # "12h00m" measured on-device at ~37px -- wider than CD_TEXT_MAX_WIDTH.
-    hypothetical_full_form = "10h00m"
-    assert len(hypothetical_full_form) * CD_TEXT_CHAR_PX > CD_TEXT_MAX_WIDTH
-    # The actual rule avoids it:
-    assert _format_countdown(10 * 60) == "10h"
+def test_countdown_full_form_overflow_is_a_real_per_string_measurement():
+    # Documents *why* a per-string check replaced the fixed hour cutoff:
+    # two full-form strings of the identical nominal shape (single-digit
+    # hour, 5 glyphs) measure differently and land on opposite sides of the
+    # budget, purely because of which digits happen to appear.
+    assert _text_width_px("1h05m") <= CD_TEXT_MAX_WIDTH   # fits
+    assert _text_width_px("2h05m") > CD_TEXT_MAX_WIDTH    # does not
+    # The actual rule picks correctly in both cases:
+    assert _format_countdown(65) == "1h05m"
+    assert _format_countdown(125) == "2h"
+
+def test_glyph_advance_table_covers_every_countdown_glyph():
+    # Every character _format_countdown can ever emit (digits, 'h', 'm')
+    # must have a table entry, or _text_width_px raises KeyError at draw
+    # time instead of failing a test.
+    assert set(GLYPH_ADVANCE_PX) == set("0123456789hm")
 
 
 # --- build_elements: upcoming event ------------------------------------------
@@ -157,12 +201,12 @@ def test_build_elements_upcoming_shape():
     e = ev(23)
     els = build_elements(e, NOW, CFG, timeout_s=90, in_progress=False)
     by_id = {el["id"]: el for el in els}
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "time_card", "time", "divider", "cd_card", "cd_text"}
+    # v1.4 "airy": no card elements -- time_card and cd_card are gone.
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "time", "divider", "cd_text"}
     # Draw order is z-order (first = behind); set-membership alone wouldn't
-    # catch a reorder that visually breaks layering (e.g. cd_card drawn
-    # after cd_text would hide the countdown digits behind its fill).
+    # catch a reorder that visually breaks layering.
     assert [el["id"] for el in els] == [
-        "bg", "title", "track", "track_fill", "time_card", "time", "divider", "cd_card", "cd_text",
+        "bg", "title", "track", "track_fill", "time", "divider", "cd_text",
     ]
 
     bg = by_id["bg"]
@@ -174,12 +218,12 @@ def test_build_elements_upcoming_shape():
     title = by_id["title"]
     assert title["type"] == "text" and title["font"] == "small"
     assert title["text"] == "STANDUP" and title["color"] == TITLE_COLOR[STATE_NORMAL]
-    assert title["x"] == 1 and title["y"] == -2 and title["width"] == 70
+    assert title["x"] == 2 and title["y"] == -2 and title["width"] == 68
 
     track = by_id["track"]
     assert track["type"] == "rectangle" and track["fill"] == "solid"
     assert track["fill_colors"] == [TRACK_COLOR]
-    assert track["x"] == 0 and track["y"] == 5 and track["width"] == PANEL_WIDTH and track["height"] == 1
+    assert track["x"] == 0 and track["y"] == 6 and track["width"] == PANEL_WIDTH and track["height"] == 1
     # RectangleElement's default 1px white border would swallow this 1px-tall
     # track entirely (the same gotcha found on the v1.1 progress bar) --
     # must be explicitly disabled.
@@ -188,36 +232,24 @@ def test_build_elements_upcoming_shape():
     track_fill = by_id["track_fill"]
     assert track_fill["fill"] == "gradient_h"
     assert track_fill["fill_colors"] == TRACK_FILL_GRADIENT[STATE_NORMAL]
-    assert track_fill["x"] == 0 and track_fill["y"] == 5 and track_fill["height"] == 1
+    assert track_fill["x"] == 0 and track_fill["y"] == 6 and track_fill["height"] == 1
     assert track_fill["border_width"] == 0
 
-    time_card = by_id["time_card"]
-    assert time_card["type"] == "rectangle" and time_card["radius"] == 1
-    assert time_card["x"] == 0 and time_card["y"] == 6 and time_card["width"] == 34 and time_card["height"] == 10
-    assert time_card["fill"] == "solid" and time_card["fill_colors"] == [TIME_CARD_COLOR]
-    assert time_card["border_width"] == 0
-
     time_el = by_id["time"]
-    assert time_el["type"] == "text" and time_el["font"] == "extra_large"
-    assert time_el["color"] == TIME_TEXT_COLOR and time_el["x"] == 1 and time_el["y"] == 4
+    assert time_el["type"] == "text" and time_el["font"] == "large"
+    assert time_el["color"] == TIME_TEXT_COLOR and time_el["x"] == 2 and time_el["y"] == 5
     assert time_el["text"] == f"{e.start.astimezone():%H:%M}"
 
     divider = by_id["divider"]
-    assert divider["x"] == 34 and divider["y"] == 6 and divider["width"] == 2 and divider["height"] == 10
+    assert divider["x"] == 34 and divider["y"] == 8 and divider["width"] == 2 and divider["height"] == 7
     assert divider["fill_colors"] == [DIVIDER_COLOR[STATE_NORMAL]]
     assert divider["border_width"] == 0
 
-    cd_card = by_id["cd_card"]
-    assert cd_card["x"] == 36 and cd_card["y"] == 6 and cd_card["width"] == 36 and cd_card["height"] == 10
-    assert cd_card["radius"] == 1
-    assert cd_card["fill_colors"] == [CD_CARD_COLOR[STATE_NORMAL]]
-    assert cd_card["border_width"] == 0
-
     cd = by_id["cd_text"]
-    assert cd["type"] == "text" and cd["font"] == "extra_large"
+    assert cd["type"] == "text" and cd["font"] == "large"
     assert cd["text"] == _format_countdown((e.start - NOW).total_seconds() / 60)
     assert cd["color"] == DIGIT_COLOR[STATE_NORMAL]
-    assert cd["x"] == CD_TEXT_X == 38 and cd["y"] == 4
+    assert cd["x"] == CD_TEXT_X == 39 and cd["y"] == 5
     assert "align" not in cd  # align was implicated in the v1.3 render mash; not used
 
 def test_build_elements_state_palettes_by_urgency():
@@ -228,7 +260,6 @@ def test_build_elements_state_palettes_by_urgency():
     assert by_id["title"]["color"] == TITLE_COLOR[STATE_NOTICE]
     assert by_id["track_fill"]["fill_colors"] == TRACK_FILL_GRADIENT[STATE_NOTICE]
     assert by_id["divider"]["fill_colors"] == [DIVIDER_COLOR[STATE_NOTICE]]
-    assert by_id["cd_card"]["fill_colors"] == [CD_CARD_COLOR[STATE_NOTICE]]
     assert by_id["cd_text"]["color"] == DIGIT_COLOR[STATE_NOTICE]
 
     warning_event = ev(3)   # within warn_minutes=5
@@ -238,7 +269,6 @@ def test_build_elements_state_palettes_by_urgency():
     assert by_id["title"]["color"] == TITLE_COLOR[STATE_WARNING]
     assert by_id["track_fill"]["fill_colors"] == TRACK_FILL_GRADIENT[STATE_WARNING]
     assert by_id["divider"]["fill_colors"] == [DIVIDER_COLOR[STATE_WARNING]]
-    assert by_id["cd_card"]["fill_colors"] == [CD_CARD_COLOR[STATE_WARNING]]
     assert by_id["cd_text"]["color"] == DIGIT_COLOR[STATE_WARNING]
 
 def test_build_elements_track_fill_width_matches_drain_math():
@@ -284,12 +314,12 @@ def test_build_elements_in_progress_shape():
     e = ev(-5, dur_min=30, title="Standup")
     els = build_elements(e, NOW, CFG, timeout_s=90, in_progress=True)
     by_id = {el["id"]: el for el in els}
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "ends", "divider", "cd_card", "cd_text"}
-    assert "time_card" not in by_id and "time" not in by_id  # no start-time label while in progress
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"}
+    assert "time" not in by_id  # no start-time label while in progress
     # Draw order is z-order (first = behind); see the upcoming-shape test
     # for why set-membership alone isn't enough to catch a reorder.
     assert [el["id"] for el in els] == [
-        "bg", "title", "track", "track_fill", "ends", "divider", "cd_card", "cd_text",
+        "bg", "title", "track", "track_fill", "ends", "divider", "cd_text",
     ]
 
     bg = by_id["bg"]
@@ -307,13 +337,10 @@ def test_build_elements_in_progress_shape():
     ends = by_id["ends"]
     assert ends["type"] == "text" and ends["font"] == "bold"
     assert ends["text"] == ENDS_TEXT and ends["color"] == ENDS_TEXT_COLOR
-    assert ends["x"] == 3 and ends["y"] == 6
+    assert ends["x"] == 2 and ends["y"] == 6
 
     divider = by_id["divider"]
     assert divider["fill_colors"] == [DIVIDER_COLOR[STATE_IN_PROGRESS]]
-
-    cd_card = by_id["cd_card"]
-    assert cd_card["fill_colors"] == [CD_CARD_COLOR[STATE_IN_PROGRESS]]
 
     cd = by_id["cd_text"]
     assert cd["text"] == _format_countdown((e.end - NOW).total_seconds() / 60)  # counts down to END
@@ -327,3 +354,39 @@ def test_build_elements_in_progress_ignores_urgency_thresholds():
     by_id = {el["id"]: el for el in els}
     assert by_id["bg"]["fill_colors"] == BG_GRADIENT[STATE_IN_PROGRESS]
     assert by_id["cd_text"]["color"] == DIGIT_COLOR[STATE_IN_PROGRESS]
+
+
+# --- row-5 buffer (v1.4) --------------------------------------------------------
+#
+# v1.4 frees a deliberate blank row (5) between the title and the track by
+# moving the track down to y=6. Nothing may ink row 5. `bg` is exempt (the
+# gradient background legitimately spans every row) -- this checks every
+# *foreground* element's computed ink range, using the same offset model
+# documented in logic.py's geometry comment.
+
+def test_no_foreground_element_inks_row_5_upcoming():
+    e = ev(23)
+    els = build_elements(e, NOW, CFG, timeout_s=90, in_progress=False)
+    for el in els:
+        if el["id"] == "bg":
+            continue
+        assert 5 not in ink_rows(el), (el["id"], ink_rows(el))
+
+def test_no_foreground_element_inks_row_5_in_progress():
+    e = ev(-5, dur_min=30)
+    els = build_elements(e, NOW, CFG, timeout_s=90, in_progress=True)
+    for el in els:
+        if el["id"] == "bg":
+            continue
+        assert 5 not in ink_rows(el), (el["id"], ink_rows(el))
+
+def test_no_foreground_element_inks_beyond_panel_rows():
+    # Every element's ink must land within the panel's 16 rows (0-15) in
+    # both layouts -- guards against a future geometry edit clipping at the
+    # bottom edge the way v1.3's "ends" originally did.
+    for in_progress in (False, True):
+        e = ev(-5, dur_min=30) if in_progress else ev(23)
+        els = build_elements(e, NOW, CFG, timeout_s=90, in_progress=in_progress)
+        for el in els:
+            rows = ink_rows(el)
+            assert min(rows) >= 0 and max(rows) <= PANEL_HEIGHT - 1, (el["id"], rows)
