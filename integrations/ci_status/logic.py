@@ -6,10 +6,11 @@ from pathlib import Path
 # Reuse the calendar integration's generic text/formatting helpers rather
 # than reimplementing them: ascii_safe (device text sanitization),
 # _format_countdown (minutes-granular "~4m" / "~1h05m" formatting, reused
-# verbatim by the running badge's ETA text per the v1.5 spec), _title_fits
-# (scroll-vs-static decision, parameterized by width so it's not
-# calendar-geometry-specific), SCROLL_RATE/SCROLL_DELAY_MS (the same scroll
-# timing), and PANEL_WIDTH/PANEL_HEIGHT (hardware constants, not actually
+# verbatim by the running badge's ETA text and the quota frames' reset-in
+# text per the v1.5 spec), _title_fits (scroll-vs-static decision,
+# parameterized by width so it's not calendar-geometry-specific),
+# SCROLL_RATE/SCROLL_DELAY_MS (the same scroll timing), and
+# PANEL_WIDTH/PANEL_HEIGHT (hardware constants, not actually
 # calendar-specific despite living in that module). Geometry and palette
 # below are ci_status's own -- only the algorithms are shared, not the
 # layout constants, since the two integrations' layouts are visually
@@ -19,6 +20,15 @@ from calendar_countdown.logic import (  # noqa: E402
     ascii_safe, _format_countdown, _title_fits,
     SCROLL_RATE, SCROLL_DELAY_MS, PANEL_WIDTH, PANEL_HEIGHT,
 )
+
+# Shared display priority ladder (v1.5) -- see busybar/display.py for the
+# full contract and the two firmware facts it's built on (equal priority
+# from a different app is rejected, not an override; occluded elements are
+# evicted, not restored). Formerly local constants here (RUNNING_PRIORITY,
+# RUNNING_BADGE_TIMEOUT_S); now PRIORITY_OVERLAY (and, in main.py,
+# OVERLAY_DWELL_SECONDS) from the shared module so future integrations
+# inherit the same contract instead of re-deriving it.
+from busybar.display import PRIORITY_OVERLAY, PRIORITY_ALERT  # noqa: E402
 
 FAILING = {"failure", "timed_out", "startup_failure"}
 
@@ -32,13 +42,26 @@ class RepoState:
 
 @dataclass
 class RunningInfo:
-    """Everything build_ci_payload needs to render the running badge,
-    pre-computed by the caller (main.run_once) so the precedence/render
+    """Everything build_overlay_payload needs to render the running-CI
+    badge frame, pre-computed by the caller (main.run_once) so the render
     logic here stays pure and testable without network mocking."""
     run: dict
     repo: str
     other_count: int
     median_minutes: float | None
+    now: datetime
+
+
+@dataclass
+class QuotaInfo:
+    """Everything build_overlay_payload needs to render one quota frame
+    (GraphQL or REST bucket), pre-computed by the caller -- same pattern
+    and rationale as RunningInfo."""
+    label: str        # "GITHUB GRAPHQL" or "GITHUB REST"
+    limit: int
+    remaining: int
+    used: int
+    reset_epoch: int
     now: datetime
 
 
@@ -62,7 +85,7 @@ def evaluate_runs(repo: str, runs: list[dict], now: datetime,
     return RepoState(repo=repo, failing=sorted(failing), stuck=sorted(stuck))
 
 
-# --- running-job badge (v1.5) --------------------------------------------------
+# --- overlay tier: shared row template (v1.5) -----------------------------------
 #
 # Firmware priority-arbitration finding that shapes this whole section
 # (empirical probe, see the implementation report and spec doc's v1.5
@@ -71,26 +94,43 @@ def evaluate_runs(repo: str, runs: list[dict], now: datetime,
 # screen," but probing found this is FALSE on firmware 1.1.1 -- a
 # different-application_name draw at the SAME priority as the currently
 # showing app is REJECTED (409 "low priority"); only a STRICTLY GREATER
-# priority succeeds. Since calendar_countdown draws continuously at
-# priority 20, the running badge must use priority 21, not 20 as the task
-# brief literally specified, or every running-badge draw attempt would
-# 409 whenever the calendar happens to be the currently-showing app (which
-# is most of the time). This is a deliberate, evidence-backed deviation
-# from the brief's literal instruction.
+# priority succeeds. This is why PRIORITY_OVERLAY (21) is strictly greater
+# than the calendar's PRIORITY_AMBIENT (20) -- see busybar/display.py.
 #
 # Second finding: occluded elements do NOT reappear once the occluder's
 # elements expire or are cleared -- they are evicted, not merely hidden.
-# Confirmed by probing both the timeout-expiry and explicit-clear cases (a
-# lower-priority app's still-live element stayed gone, screen went black,
-# in both). This means the "clean alternation, zero coordination" path in
-# the brief does not apply; the badge and the calendar do not smoothly
-# swap -- the badge occupies the screen for its own timeout, then the
-# screen goes blank until *some* app performs a fresh draw (either the
-# badge's own next cycle, or the calendar's independent 60s redraw landing
-# in the gap by chance). See the report for the actually-observed rhythm.
-RUNNING_PRIORITY = 21
-RUNNING_BADGE_TIMEOUT_S = 10  # fixed per the brief ("timeout ~10s"), independent
-                              # of running_poll_seconds's configured value
+# There is no cross-process coordination between integrations; an ambient
+# app can only win the screen back with its own fresh draw landing in a
+# gap. `busybar.display.overlay_gap_elapsed` plus the dwell/silence
+# contract exist to make that gap real and predictable (see main.py's
+# rotation loop for how the gate is applied).
+#
+# Geometry: the v1.4 "airy" row template (title ribbon / blank buffer row /
+# full-width horizon-line track / numeral row) shared by every overlay-tier
+# frame (the running badge and both quota frames below) -- independently
+# declared here rather than imported from the calendar, since the two
+# integrations' layouts are visually similar but structurally distinct.
+OVERLAY_TITLE_X = 2
+OVERLAY_TITLE_Y = -2      # ink rows 0-4 (small font); see calendar_countdown.logic
+                          # for the underlying +2px text ink-offset model this assumes
+OVERLAY_TITLE_WIDTH = 68  # 2px margin each side of a 72px panel
+OVERLAY_TRACK_Y = 6       # row 5 is a deliberate blank buffer, same as v1.4 calendar
+OVERLAY_TRACK_HEIGHT = 1
+OVERLAY_NUMERAL_Y = 5     # ink rows 7-15 (large font, 9px) -- every overlay-tier
+                          # numeral uses this same y and the `large` font ("numerals
+                          # track together": never independently resized)
+
+# Back-compat aliases (pre-quota-frame names) -- kept because they're
+# reasonably self-documenting at their one remaining call site
+# (_build_running_elements) and renaming them there too would be pure churn.
+RUNNING_TITLE_X, RUNNING_TITLE_Y, RUNNING_TITLE_WIDTH = OVERLAY_TITLE_X, OVERLAY_TITLE_Y, OVERLAY_TITLE_WIDTH
+RUNNING_TRACK_Y, RUNNING_TRACK_HEIGHT = OVERLAY_TRACK_Y, OVERLAY_TRACK_HEIGHT
+RUNNING_NUMERAL_Y = OVERLAY_NUMERAL_Y
+RUNNING_NUMERAL_X = OVERLAY_TITLE_X  # the running badge's single numeral sits at the
+                                    # same left margin as the title/quota "pct" numeral
+
+
+# --- running-job badge -----------------------------------------------------------
 
 # Palette: a distinct cyan/blue "running" theme, following the same
 # luminance-contrast principle established in the v1.4 calendar work (near-
@@ -103,19 +143,6 @@ RUNNING_TITLE_COLOR = "#7FDBFFFF"
 RUNNING_TRACK_COLOR = "#0F2A42FF"
 RUNNING_TRACK_FILL_COLOR = "#29B6F6FF"   # spec: "solid cyan" -- one flat color, no gradient
 RUNNING_NUMERAL_COLOR = "#66E1FFFF"
-
-# Geometry: same v1.4 "airy" row template as the calendar (title ribbon at
-# the top, blank buffer row, full-width horizon-line track, numeral row
-# below) but independently declared here -- these are ci_status's own rows,
-# not a shared layout object, even though the values happen to match.
-RUNNING_TITLE_X = 2
-RUNNING_TITLE_Y = -2      # ink rows 0-4 (small font); see calendar_countdown.logic
-                          # for the underlying +2px text ink-offset model this assumes
-RUNNING_TITLE_WIDTH = 68  # 2px margin each side of a 72px panel
-RUNNING_TRACK_Y = 6       # row 5 is a deliberate blank buffer, same as v1.4 calendar
-RUNNING_TRACK_HEIGHT = 1
-RUNNING_NUMERAL_X = 2
-RUNNING_NUMERAL_Y = 5     # ink rows 7-15 (large font, 9px)
 
 
 def _pr_or_branch(run: dict) -> str:
@@ -258,6 +285,226 @@ def _build_running_elements(info: RunningInfo, timeout_s: int) -> list[dict]:
     return [bg_element, title_element, track_element, track_fill_element, numeral_element]
 
 
+# --- API-quota overlay frames -----------------------------------------------------
+#
+# GET /rate_limit is exempt from GitHub's own rate limiting (free to call),
+# so it's fetched fresh every poll while the overlay tier is active -- no
+# ETag caching needed or attempted (see RestPoller.fetch_rate_limit).
+#
+# Palette: headroom-themed (not per-bucket -- the same three-tier scheme
+# applies to both GraphQL and REST), following the same near-black-surface
+# + bright-saturated-text contrast principle as everywhere else in this
+# codebase. "high" (>50% remaining) reads as calm green-teal, "medium"
+# (20-50%) as a caution amber, "low" (<20%) as an alert-adjacent red --
+# distinct hue families from RUNNING_*'s cyan/blue so a glance tells quota
+# frames apart from the CI badge even before reading the title. Per the
+# brief's "same structure as other states" framing, theming covers bg,
+# track_fill (the moving/informative part of the track), and both
+# numerals; the track's own groove stays a single fixed neutral color
+# (QUOTA_TRACK_COLOR), matching the "groove is decorative, not themed"
+# convention used for RUNNING_TRACK_COLOR and the calendar's TRACK_COLOR.
+QUOTA_HEADROOM_HIGH = "high"
+QUOTA_HEADROOM_MEDIUM = "medium"
+QUOTA_HEADROOM_LOW = "low"
+
+QUOTA_TRACK_COLOR = "#12241EFF"
+
+QUOTA_BG_GRADIENT = {
+    QUOTA_HEADROOM_HIGH: ["#031F17FF", "#000A08FF"],
+    QUOTA_HEADROOM_MEDIUM: ["#231400FF", "#0A0400FF"],
+    QUOTA_HEADROOM_LOW: ["#2E0509FF", "#0A0101FF"],
+}
+QUOTA_TITLE_COLOR = {
+    QUOTA_HEADROOM_HIGH: "#6FFFCFFF",
+    QUOTA_HEADROOM_MEDIUM: "#FFCB6BFF",
+    QUOTA_HEADROOM_LOW: "#FF6B7AFF",
+}
+QUOTA_TRACK_FILL_COLOR = {
+    QUOTA_HEADROOM_HIGH: "#33FFC1FF",
+    QUOTA_HEADROOM_MEDIUM: "#FFB300FF",
+    QUOTA_HEADROOM_LOW: "#FF3B4EFF",
+}
+QUOTA_NUMERAL_COLOR = {
+    QUOTA_HEADROOM_HIGH: "#7CFFE0FF",
+    QUOTA_HEADROOM_MEDIUM: "#FFD98CFF",
+    QUOTA_HEADROOM_LOW: "#FF8A96FF",
+}
+
+# Two numerals share the row (percentage remaining on the left, reset-in on
+# the right) -- the only overlay frame that does, since the running badge
+# has just one. No divider element between them (the brief didn't ask for
+# one); RESET_X leaves both enough room for their respective worst cases
+# ("100%" on the left, an hours-form countdown on the right).
+QUOTA_PCT_X = OVERLAY_TITLE_X   # 2 -- same left margin as every other overlay element
+QUOTA_RESET_X = 40
+
+
+def _quota_headroom(remaining_pct: float) -> str:
+    """>50% remaining -> "high"; 20-50% inclusive -> "medium"; <20% ->
+    "low". The 50 boundary belongs to "medium" (a literal reading of the
+    brief's "20-50%" as an inclusive range); the 20 boundary also belongs
+    to "medium" (i.e. "low" is strictly less than 20, the tightest/most
+    urgent tier only firing once headroom has genuinely dropped below the
+    named threshold, not merely reached it)."""
+    if remaining_pct < 20:
+        return QUOTA_HEADROOM_LOW
+    if remaining_pct <= 50:
+        return QUOTA_HEADROOM_MEDIUM
+    return QUOTA_HEADROOM_HIGH
+
+
+def _quota_used_width(used: float, limit: float) -> int:
+    """Track-fill width in px: used/limit of the panel width, clamped to
+    [1, PANEL_WIDTH]. Same defensive shape as _progress_width/
+    _track_fill_width -- full width when the denominator is unusable."""
+    if limit <= 0:
+        return PANEL_WIDTH
+    if used <= 0:
+        return 1
+    width = round(PANEL_WIDTH * used / limit)
+    return max(1, min(PANEL_WIDTH, width))
+
+
+def parse_rate_limit(data: dict) -> dict[str, dict] | None:
+    """Extract the `core` (REST) and `graphql` buckets from a raw
+    `GET /rate_limit` response into `{"core": {...}, "graphql": {...}}`
+    (`used` is computed defensively as `limit - remaining` if the API
+    response doesn't include it directly). Only well-formed buckets are
+    included -- a response with one usable bucket and one malformed/absent
+    one still returns the usable one, rather than discarding both. `None`
+    if neither bucket could be parsed at all, signaling "this whole fetch
+    was unusable" to the caller (which should skip quota frames that
+    cycle, not crash or show stale data -- see RestPoller.fetch_rate_limit
+    and main.py's staleness handling).
+    """
+    resources = (data or {}).get("resources") or {}
+    result: dict[str, dict] = {}
+    for key in ("core", "graphql"):
+        bucket = resources.get(key)
+        if not bucket or "limit" not in bucket or "remaining" not in bucket or "reset" not in bucket:
+            continue
+        limit, remaining = bucket["limit"], bucket["remaining"]
+        used = bucket.get("used")
+        if used is None:
+            used = max(0, limit - remaining)
+        result[key] = {"limit": limit, "remaining": remaining, "used": used, "reset": bucket["reset"]}
+    return result or None
+
+
+def _build_quota_elements(info: QuotaInfo, timeout_s: int) -> list[dict]:
+    """Same v1.4-language row template as the running badge (gradient bg,
+    title ribbon, full-width track), but themed by remaining-quota
+    headroom instead of CI state, and with two numerals sharing the bottom
+    row (percentage remaining on the left, reset-in on the right) instead
+    of one. Draw order is z-order, first = behind.
+    """
+    remaining_pct = (info.remaining / info.limit * 100) if info.limit > 0 else 0.0
+    headroom = _quota_headroom(remaining_pct)
+    pct_text = f"{int(remaining_pct)}%"   # floored, not rounded -- same numeral-floor
+                                          # convention as _format_countdown throughout
+    reset_in_minutes = (info.reset_epoch - info.now.timestamp()) / 60
+    reset_text = _format_countdown(reset_in_minutes)
+    used_width = _quota_used_width(info.used, info.limit)
+
+    bg_element = {
+        "id": "bg", "type": "rectangle", "x": 0, "y": 0,
+        "width": PANEL_WIDTH, "height": PANEL_HEIGHT,
+        "fill": "gradient_v", "fill_colors": QUOTA_BG_GRADIENT[headroom],
+        "border_width": 0, "timeout": timeout_s,
+    }
+    title_text = ascii_safe(info.label).upper()
+    title_element = {
+        "id": "title", "type": "text", "text": title_text, "font": "small",
+        "color": QUOTA_TITLE_COLOR[headroom], "x": OVERLAY_TITLE_X, "y": OVERLAY_TITLE_Y,
+        "width": OVERLAY_TITLE_WIDTH, "timeout": timeout_s,
+    }
+    if not _title_fits(title_text, OVERLAY_TITLE_WIDTH):
+        title_element.update({
+            "scroll_rate": SCROLL_RATE,
+            "scroll_start_delay": SCROLL_DELAY_MS,
+            "scroll_repeat_delay": SCROLL_DELAY_MS,
+        })
+    track_element = {
+        "id": "track", "type": "rectangle", "x": 0, "y": OVERLAY_TRACK_Y,
+        "width": PANEL_WIDTH, "height": OVERLAY_TRACK_HEIGHT, "fill": "solid",
+        "fill_colors": [QUOTA_TRACK_COLOR], "border_width": 0, "timeout": timeout_s,
+    }
+    track_fill_element = {
+        "id": "track_fill", "type": "rectangle", "x": 0, "y": OVERLAY_TRACK_Y,
+        "width": used_width, "height": OVERLAY_TRACK_HEIGHT, "fill": "solid",
+        "fill_colors": [QUOTA_TRACK_FILL_COLOR[headroom]], "border_width": 0, "timeout": timeout_s,
+    }
+    pct_element = {
+        "id": "pct", "type": "text", "text": pct_text, "font": "large",
+        "color": QUOTA_NUMERAL_COLOR[headroom], "x": QUOTA_PCT_X, "y": OVERLAY_NUMERAL_Y,
+        "timeout": timeout_s,
+    }
+    reset_element = {
+        "id": "reset", "type": "text", "text": reset_text, "font": "large",
+        "color": QUOTA_NUMERAL_COLOR[headroom], "x": QUOTA_RESET_X, "y": OVERLAY_NUMERAL_Y,
+        "timeout": timeout_s,
+    }
+    return [bg_element, title_element, track_element, track_fill_element, pct_element, reset_element]
+
+
+# --- overlay rotation --------------------------------------------------------------
+
+OVERLAY_FRAME_CI_BADGE = "ci_badge"
+OVERLAY_FRAME_QUOTA_GQL = "quota_gql"
+OVERLAY_FRAME_QUOTA_REST = "quota_rest"
+
+# Element id sets differ between the CI badge ("eta") and either quota frame
+# ("pct", "reset") -- the draw endpoint upserts by id within an
+# application_name (the same firmware behavior that required the v1.3.1
+# calendar transition-clear fix), so switching between these two *shapes*
+# without an explicit clear would leave a stale numeral element from the
+# previous shape rendered alongside the new one. quota_gql and quota_rest
+# share an identical id set, so switching between *those* needs no clear.
+# main.py tracks the last-drawn shape and clears only on a shape change.
+OVERLAY_FRAME_SHAPE = {
+    OVERLAY_FRAME_CI_BADGE: "badge",
+    OVERLAY_FRAME_QUOTA_GQL: "quota",
+    OVERLAY_FRAME_QUOTA_REST: "quota",
+}
+
+
+def overlay_frame_sequence(show_quota: bool) -> list[str]:
+    """The rotation order for the overlay tier's dwell slots. The running
+    badge always leads (and is the only frame at all when show_quota is
+    off), so a run's very first overlay draw is always the CI badge, never
+    a quota frame."""
+    if show_quota:
+        return [OVERLAY_FRAME_CI_BADGE, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST]
+    return [OVERLAY_FRAME_CI_BADGE]
+
+
+def build_overlay_payload(frame_name: str, timeout_s: int, *,
+                         running: RunningInfo | None = None,
+                         quota_by_bucket: dict[str, QuotaInfo] | None = None) -> dict | None:
+    """Build the {"elements", "priority", "led"} payload for one overlay-
+    tier dwell slot, or `None` if this frame's data isn't available this
+    cycle -- the caller must treat `None` as "skip this dwell slot
+    entirely" (no draw, no clear), never substitute stale or placeholder
+    content. This is what lets rate_limit fetch failures silently drop a
+    quota frame from rotation for a cycle instead of crashing or showing
+    minutes-old numbers (see main.py's 5-minute staleness check, which
+    is what actually keeps `quota_by_bucket` fresh enough to trust here).
+    """
+    if frame_name == OVERLAY_FRAME_CI_BADGE:
+        if running is None:
+            return None
+        return {"elements": _build_running_elements(running, timeout_s),
+                "priority": PRIORITY_OVERLAY, "led": None}
+    if frame_name in (OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST):
+        bucket_key = "graphql" if frame_name == OVERLAY_FRAME_QUOTA_GQL else "core"
+        info = (quota_by_bucket or {}).get(bucket_key)
+        if info is None:
+            return None
+        return {"elements": _build_quota_elements(info, timeout_s),
+                "priority": PRIORITY_OVERLAY, "led": None}
+    return None
+
+
 def _text_element(text: str, color: str, timeout_s: int, font: str = "normal") -> dict:
     return {"id": "ci", "type": "text", "text": text, "font": font,
             "x": 0, "y": 4, "width": 72, "color": color,
@@ -276,33 +523,30 @@ def _badge_elements(text: str, bg_color: str, text_color: str, timeout_s: int) -
 
 
 def build_ci_payload(states: list[RepoState], show_green: bool, timeout_s: int,
-                     running: RunningInfo | None = None) -> dict | None:
-    """Precedence: failure > stuck > running > quiet green > nothing.
-    Failure and stuck stay at priority 60 (unchanged) and are evaluated
-    first specifically so they always win over a running badge even if
-    both conditions are true in the same poll -- an active alert must never
-    be preempted by "just" a running-job status update. `running`, when
-    given, is a fully pre-computed RunningInfo (see its docstring for why
-    the render logic here takes it pre-computed rather than raw run data).
+                     overlay: dict | None = None) -> dict | None:
+    """Precedence: failure > stuck > overlay (whichever frame the caller's
+    rotation picked -- the running badge or a quota frame) > quiet green >
+    nothing. Failure and stuck stay at PRIORITY_ALERT (60, unchanged) and
+    are evaluated first specifically so they always win even if an overlay
+    condition is also true in the same poll -- an active alert must never
+    be preempted by "just" a status update. `overlay`, when given, is a
+    fully pre-built payload dict from `build_overlay_payload` (already
+    carrying its own `priority`/`elements`/`led`) so this function's job is
+    purely precedence, not rendering.
     """
     failures = [(s.repo, name) for s in states for name in s.failing]
     stuck = [(s.repo, name) for s in states for name in s.stuck]
     if failures:
         text = "CI FAIL " + " ".join(f"{repo}:{name}" for repo, name in failures)
         return {"elements": _badge_elements(text, "#A32D2DFF", "#FFFFFFFF", timeout_s),
-                "priority": 60, "led": "#FF0000FF"}
+                "priority": PRIORITY_ALERT, "led": "#FF0000FF"}
     if stuck:
         text = "CI stuck " + " ".join(f"{repo}:{name}" for repo, name in stuck)
         return {"elements": _badge_elements(text, "#BA7517FF", "#0B0B0BFF", timeout_s),
-                "priority": 60, "led": None}
-    if running is not None:
-        # RUNNING_BADGE_TIMEOUT_S (fixed ~10s), not the caller's timeout_s
-        # (derived from poll_seconds) -- the running badge's on-screen
-        # duration is a design constant of the alternation cadence, not a
-        # function of how often ci_status happens to poll.
-        return {"elements": _build_running_elements(running, RUNNING_BADGE_TIMEOUT_S),
-                "priority": RUNNING_PRIORITY, "led": None}
+                "priority": PRIORITY_ALERT, "led": None}
+    if overlay is not None:
+        return overlay
     if show_green:
         return {"elements": [_text_element("CI ok", "#00FF00FF", timeout_s)],
-                "priority": 60, "led": None}
+                "priority": PRIORITY_ALERT, "led": None}
     return None

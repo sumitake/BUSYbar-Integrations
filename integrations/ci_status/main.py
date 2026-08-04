@@ -9,27 +9,82 @@ except ImportError:  # bare clone / broken editable install: use the repo's src/
 import argparse
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from busybar.client import BusyBarClient
+from busybar.client import BusyBarClient, DrawResult
 from busybar.config import load_config
+from busybar.display import OVERLAY_DWELL_SECONDS, overlay_gap_elapsed
 
-from .logic import RepoState, RunningInfo, build_ci_payload, evaluate_runs, select_running_run
+from .logic import (
+    RepoState, RunningInfo, QuotaInfo, OVERLAY_FRAME_SHAPE,
+    build_ci_payload, build_overlay_payload, evaluate_runs,
+    overlay_frame_sequence, parse_rate_limit, select_running_run,
+)
 
 APP = "ci_status"
 log = logging.getLogger(APP)
 
+QUOTA_LABELS = {"graphql": "GITHUB GRAPHQL", "core": "GITHUB REST"}
+QUOTA_STALE_SECONDS = 300  # never show rate_limit data older than 5 minutes
+
+
+def _refresh_quota(poller, quota_cache: dict | None, now: datetime) -> dict[str, QuotaInfo] | None:
+    """Fetch /rate_limit fresh (it's exempt from GitHub's own rate
+    limiting, so there's no cost to calling it every poll) and update
+    `quota_cache` on success. Returns the current bucket->QuotaInfo mapping
+    if `quota_cache` holds data no older than QUOTA_STALE_SECONDS (whether
+    from this fetch or an earlier one that succeeded when this one
+    didn't), else None -- callers must treat None as "no quota frames this
+    cycle," never fall back to stale numbers.
+    """
+    if quota_cache is None:
+        return None
+    raw = poller.fetch_rate_limit()
+    if raw is not None:
+        parsed = parse_rate_limit(raw)
+        if parsed is not None:
+            quota_cache["buckets"] = parsed
+            quota_cache["fetched_at"] = now
+    fetched_at = quota_cache.get("fetched_at")
+    if fetched_at is None or (now - fetched_at).total_seconds() > QUOTA_STALE_SECONDS:
+        return None
+    buckets = quota_cache.get("buckets") or {}
+    return {
+        key: QuotaInfo(label=QUOTA_LABELS[key], limit=buckets[key]["limit"],
+                      remaining=buckets[key]["remaining"], used=buckets[key]["used"],
+                      reset_epoch=buckets[key]["reset"], now=now)
+        for key in buckets if key in QUOTA_LABELS
+    }
+
 
 def run_once(client, poller, cfg: dict, now: datetime,
              state_cache: dict[str, RepoState], dry_run: bool,
-             running_cache: dict[str, list[dict]] | None = None) -> str:
-    """`running_cache`, when passed, is a caller-owned dict this function
-    mutates in place with each repo's currently-running runs (mirroring
-    `state_cache`'s existing pattern) -- `main()` inspects it afterward to
-    decide whether to shorten its poll interval to `running_poll_seconds`
-    (see `next_poll_seconds`). Omitting it (the default) skips running-job
-    detection entirely, e.g. for callers that only care about failure/stuck
-    status.
+             running_cache: dict[str, list[dict]] | None = None,
+             overlay_state: dict | None = None,
+             quota_cache: dict | None = None) -> str:
+    """`running_cache`, `overlay_state`, and `quota_cache`, when passed, are
+    caller-owned dicts this function mutates in place (mirroring
+    `state_cache`'s existing pattern) so `main()` can hold one instance of
+    each across loop iterations while `run_once` itself stays a pure
+    function of its arguments plus those dicts. Omitting `running_cache`
+    (the default) skips running-job/overlay detection entirely.
+
+    Overlay rotation: while a run is active (and no failure/stuck alert
+    preempts it), the overlay tier draws one frame per dwell slot, cycling
+    through `overlay_frame_sequence(show_quota)` (the running badge, then
+    -- if `show_quota` -- the GraphQL and REST quota frames). A dwell slot
+    only fires once `overlay_gap_elapsed(last_dwell_end, now) >=
+    OVERLAY_DWELL_SECONDS` (busybar.display's contract: stay silent at
+    least one full dwell so the ambient calendar has a real chance to
+    reclaim the screen in between -- see busybar/display.py and the spec
+    doc's v1.5 section for why). `overlay_state`'s `frame_index`/
+    `last_dwell_end`/`last_shape` only commit once `client.draw` actually
+    returns DRAWN, same discipline as calendar_countdown's transition-state
+    fix: a failed draw must not be mistaken for a completed dwell, or the
+    rotation would silently skip frames / wait a dwell for nothing.
+    `last_shape` also drives an explicit clear() when the overlay switches
+    between the CI badge's element-id shape and a quota frame's (they
+    don't upsert cleanly into each other -- see OVERLAY_FRAME_SHAPE).
     """
     c = cfg["ci_status"]
     timeout_s = int(c["poll_seconds"] * 1.5)
@@ -38,8 +93,14 @@ def run_once(client, poller, cfg: dict, now: datetime,
         if runs is not None:  # None = 304/no-change/error -> keep cached state
             state_cache[repo] = evaluate_runs(repo, runs, now,
                                               c["stale_queued_minutes"])
+    states = list(state_cache.values())
+    has_alert = any(s.failing or s.stuck for s in states)
 
-    running_info = None
+    overlay_payload = None
+    overlay_frame_name = None
+    frame_index = 0
+    stay_silent = False
+
     # running_cache check first: short-circuits before touching c["show_running"],
     # so callers/tests using an older, fully-spelled-out cfg dict that predates
     # this key (and never pass running_cache) don't KeyError.
@@ -49,21 +110,67 @@ def run_once(client, poller, cfg: dict, now: datetime,
             if running_runs is not None:  # None = 304/no-change/error -> keep cached
                 running_cache[repo] = running_runs
         selected = select_running_run(running_cache)
-        if selected is not None:
+
+        if selected is None or has_alert:
+            # Nothing running, or an alert takes precedence this poll --
+            # reset the rotation so the next run to start always begins at
+            # the CI badge (never mid-way into a quota frame).
+            if overlay_state is not None:
+                overlay_state.clear()
+        else:
             run, repo, other_count = selected
             median = poller.fetch_median_eta(repo, run["workflow_id"])
             running_info = RunningInfo(run=run, repo=repo, other_count=other_count,
                                        median_minutes=median, now=now)
+            quota_by_bucket = _refresh_quota(poller, quota_cache, now) if c["show_quota"] else None
 
-    payload = build_ci_payload(list(state_cache.values()), c["show_green"], timeout_s,
-                               running=running_info)
+            sequence = overlay_frame_sequence(c["show_quota"])
+            frame_index = (overlay_state.get("frame_index", 0) if overlay_state is not None else 0) % len(sequence)
+            last_dwell_end = overlay_state.get("last_dwell_end") if overlay_state is not None else None
+
+            if overlay_gap_elapsed(last_dwell_end, now) >= OVERLAY_DWELL_SECONDS:
+                overlay_frame_name = sequence[frame_index]
+                overlay_payload = build_overlay_payload(
+                    overlay_frame_name, OVERLAY_DWELL_SECONDS,
+                    running=running_info, quota_by_bucket=quota_by_bucket)
+                if overlay_payload is None:
+                    # This frame's data wasn't available this cycle (e.g. a
+                    # quota frame with no fresh rate_limit data). Advance
+                    # past it without consuming a dwell -- nothing was
+                    # shown, so there's no gap to protect, and the next
+                    # poll retries the next frame in sequence immediately.
+                    if overlay_state is not None:
+                        overlay_state["frame_index"] = frame_index + 1
+                    overlay_frame_name = None
+            else:
+                stay_silent = True
+
+    if stay_silent:
+        return "overlay dwell gap; staying silent (letting the ambient app reclaim the screen)"
+
+    payload = build_ci_payload(states, c["show_green"], timeout_s, overlay=overlay_payload)
     if dry_run:
         return f"DRY-RUN payload: {payload!r}"
     if payload is None:
         client.clear(APP)
         return "all green; cleared"
+
+    if overlay_frame_name is not None and overlay_state is not None:
+        shape = OVERLAY_FRAME_SHAPE[overlay_frame_name]
+        # clear()'s own success/failure is intentionally not checked here,
+        # same reasoning as calendar_countdown's transition-clear: only
+        # draw()'s result below gates the state commit.
+        if overlay_state.get("last_shape") not in (None, shape):
+            client.clear(APP)
+
     result = client.draw(APP, payload["elements"], priority=payload["priority"],
                          led_notification_color=payload["led"])
+
+    if overlay_frame_name is not None and overlay_state is not None and result == DrawResult.DRAWN:
+        overlay_state["frame_index"] = frame_index + 1
+        overlay_state["last_dwell_end"] = now + timedelta(seconds=OVERLAY_DWELL_SECONDS)
+        overlay_state["last_shape"] = OVERLAY_FRAME_SHAPE[overlay_frame_name]
+
     text = next(e["text"] for e in payload["elements"] if e["type"] == "text")
     return f"{text[:40]!r} -> {result.value}"
 
@@ -101,10 +208,13 @@ def main() -> int:
 
     state_cache: dict[str, RepoState] = {}
     running_cache: dict[str, list[dict]] = {}
+    overlay_state: dict = {}
+    quota_cache: dict = {}
     backoff = 5
     while True:
         summary = run_once(client, poller, cfg, datetime.now(timezone.utc),
-                           state_cache, args.dry_run, running_cache=running_cache)
+                           state_cache, args.dry_run, running_cache=running_cache,
+                           overlay_state=overlay_state, quota_cache=quota_cache)
         log.info(summary)
         if args.once:
             return 0

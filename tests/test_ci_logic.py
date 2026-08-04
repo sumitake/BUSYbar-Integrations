@@ -4,11 +4,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 from ci_status.logic import (
-    RepoState, RunningInfo, evaluate_runs, build_ci_payload,
+    RepoState, RunningInfo, QuotaInfo, evaluate_runs, build_ci_payload,
+    build_overlay_payload, overlay_frame_sequence,
+    OVERLAY_FRAME_CI_BADGE, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST,
+    OVERLAY_FRAME_SHAPE,
     _pr_or_branch, select_running_run, compute_median_duration_minutes,
     _format_eta_text, _progress_width, _build_running_title,
-    RUNNING_PRIORITY, RUNNING_BADGE_TIMEOUT_S,
+    parse_rate_limit, _quota_headroom, _quota_used_width,
 )
+from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS, PRIORITY_ALERT
 
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=timezone.utc)
 
@@ -46,6 +50,20 @@ def success_run(started: str, updated: str) -> dict:
     return {"run_started_at": started, "updated_at": updated}
 
 
+def running_info(**overrides) -> RunningInfo:
+    defaults = dict(run=running_run(), repo="acme/widgets", other_count=0,
+                    median_minutes=None, now=NOW)
+    defaults.update(overrides)
+    return RunningInfo(**defaults)
+
+
+def quota_info(**overrides) -> QuotaInfo:
+    defaults = dict(label="GITHUB REST", limit=5000, remaining=2500, used=2500,
+                    reset_epoch=int(NOW.timestamp()) + 42 * 60, now=NOW)
+    defaults.update(overrides)
+    return QuotaInfo(**defaults)
+
+
 def test_failure_detected_on_latest_run_only():
     runs = [run(1, "tests", "completed", "success"),          # newest for wf 1
             run(1, "tests", "completed", "failure", 60),      # older failure — ignore
@@ -67,7 +85,7 @@ def test_payload_none_when_green_and_quiet():
 
 def test_payload_shows_green_glyph_when_enabled():
     payload = build_ci_payload([RepoState("o/r", [], [])], True, 180)
-    assert payload["priority"] == 60
+    assert payload["priority"] == PRIORITY_ALERT == 60
     text_el = _text_element(payload["elements"])
     assert text_el["color"] == "#00FF00FF"
     # quiet green case has no full-panel background badge
@@ -76,7 +94,7 @@ def test_payload_shows_green_glyph_when_enabled():
 
 def test_payload_red_badge_on_failure():
     payload = build_ci_payload([RepoState("o/r", ["tests"], [])], False, 180)
-    assert payload["priority"] == 60 and payload["led"] == "#FF0000FF"
+    assert payload["priority"] == PRIORITY_ALERT and payload["led"] == "#FF0000FF"
 
     bg = _bg_element(payload["elements"])
     assert bg["x"] == 0 and bg["y"] == 0 and bg["width"] == 72 and bg["height"] == 16
@@ -249,14 +267,14 @@ def test_running_title_no_suffix_when_alone():
     assert "+0" not in _build_running_title(run_, "acme/widgets", 0)
 
 
-# --- build_ci_payload: running badge shape + precedence ------------------------
+# --- build_overlay_payload: running badge (ci_badge frame) ---------------------
 
-def test_payload_running_badge_shape():
+def test_overlay_ci_badge_shape():
     run_ = running_run(name="tests", pr_number=42, started_min_ago=3)
-    info = RunningInfo(run=run_, repo="acme/widgets", other_count=0, median_minutes=14, now=NOW)
-    payload = build_ci_payload([RepoState("o/r", [], [])], False, 180, running=info)
+    info = running_info(run=run_, median_minutes=14)
+    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
 
-    assert payload["priority"] == RUNNING_PRIORITY == 21
+    assert payload["priority"] == PRIORITY_OVERLAY == 21
     assert payload["led"] is None
 
     by_id = _by_id(payload["elements"])
@@ -265,7 +283,7 @@ def test_payload_running_badge_shape():
 
     bg = by_id["bg"]
     assert bg["fill"] == "gradient_v" and bg["border_width"] == 0
-    assert bg["timeout"] == RUNNING_BADGE_TIMEOUT_S == 10   # fixed, NOT the caller's timeout_s=180
+    assert bg["timeout"] == OVERLAY_DWELL_SECONDS == 10
 
     title = by_id["title"]
     assert title["text"] == "ACME/WIDGETS #42 TESTS"
@@ -279,40 +297,162 @@ def test_payload_running_badge_shape():
     assert track_fill["width"] == _progress_width(3, 14)
 
     eta = by_id["eta"]
-    assert eta["font"] == "large" and eta["y"] == 5
+    assert eta["font"] == "large" and eta["y"] == 5   # numeral-floor rule: large font
     assert eta["text"] == _format_eta_text(run_, 14, NOW)
 
-def test_payload_running_badge_title_scrolls_when_long():
+def test_overlay_ci_badge_title_scrolls_when_long():
     run_ = running_run(name="a-very-long-workflow-name-that-will-not-fit", pr_number=12345, started_min_ago=1)
-    info = RunningInfo(run=run_, repo="acme/some-long-widgets-repo-name", other_count=0,
-                       median_minutes=None, now=NOW)
-    payload = build_ci_payload([], False, 180, running=info)
+    info = running_info(run=run_, repo="acme/some-long-widgets-repo-name", median_minutes=None)
+    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
     title = _by_id(payload["elements"])["title"]
     assert title.get("scroll_rate") == 2000
 
-def test_payload_failure_takes_priority_over_running():
-    run_ = running_run()
-    info = RunningInfo(run=run_, repo="o/r", other_count=0, median_minutes=None, now=NOW)
-    payload = build_ci_payload([RepoState("o/r", ["tests"], [])], False, 180, running=info)
-    assert payload["priority"] == 60   # failure wins, not the running badge
+def test_overlay_ci_badge_none_when_no_running_info():
+    assert build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=None) is None
+
+
+# --- build_overlay_payload: quota frames ----------------------------------------
+
+def test_overlay_quota_gql_shape():
+    info = quota_info(label="GITHUB GRAPHQL", limit=5000, remaining=2600, used=2400,
+                      reset_epoch=int(NOW.timestamp()) + 42 * 60)
+    payload = build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
+                                    quota_by_bucket={"graphql": info})
+    assert payload["priority"] == PRIORITY_OVERLAY
+
+    by_id = _by_id(payload["elements"])
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "pct", "reset"}
+    assert [e["id"] for e in payload["elements"]] == \
+        ["bg", "title", "track", "track_fill", "pct", "reset"]
+
+    assert by_id["title"]["text"] == "GITHUB GRAPHQL"
+    assert by_id["title"]["font"] == "small"
+    assert by_id["pct"]["text"] == "52%"    # floor(2600/5000*100) = 52
+    assert by_id["pct"]["font"] == "large"  # numeral-floor rule
+    assert by_id["reset"]["text"] == "42m"
+    assert by_id["reset"]["font"] == "large"
+    assert by_id["track_fill"]["width"] == _quota_used_width(2400, 5000)
+    assert by_id["track"]["y"] == 6 and by_id["track"]["border_width"] == 0
+
+def test_overlay_quota_rest_uses_core_bucket():
+    info = quota_info(label="GITHUB REST", limit=5000, remaining=100, used=4900)
+    payload = build_overlay_payload(OVERLAY_FRAME_QUOTA_REST, OVERLAY_DWELL_SECONDS,
+                                    quota_by_bucket={"core": info})
+    by_id = _by_id(payload["elements"])
+    assert by_id["title"]["text"] == "GITHUB REST"
+    assert by_id["pct"]["text"] == "2%"
+
+def test_overlay_quota_none_when_bucket_missing():
+    assert build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
+                                 quota_by_bucket={}) is None
+    assert build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
+                                 quota_by_bucket=None) is None
+    # Wrong bucket present (core but not graphql) -- still None, not a
+    # silent fallback to the wrong data.
+    assert build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
+                                 quota_by_bucket={"core": quota_info()}) is None
+
+
+# --- headroom color thresholds (boundaries 50/20) -------------------------------
+
+def test_quota_headroom_high_above_50():
+    assert _quota_headroom(50.1) == "high"
+    assert _quota_headroom(100) == "high"
+
+def test_quota_headroom_medium_at_and_below_50_down_to_20():
+    assert _quota_headroom(50) == "medium"    # 50 itself is medium, not high
+    assert _quota_headroom(35) == "medium"
+    assert _quota_headroom(20) == "medium"    # 20 itself is medium, not low
+
+def test_quota_headroom_low_below_20():
+    assert _quota_headroom(19.9) == "low"
+    assert _quota_headroom(0) == "low"
+
+
+# --- used-fraction clamps --------------------------------------------------------
+
+def test_quota_used_width_scales():
+    assert _quota_used_width(2500, 5000) == 36   # half -> half width
+
+def test_quota_used_width_clamped_min_one():
+    assert _quota_used_width(0, 5000) == 1
+    assert _quota_used_width(-1, 5000) == 1
+
+def test_quota_used_width_full_when_limit_non_positive():
+    assert _quota_used_width(10, 0) == 72
+
+
+# --- parse_rate_limit ------------------------------------------------------------
+
+def test_parse_rate_limit_extracts_core_and_graphql():
+    data = {"resources": {
+        "core": {"limit": 5000, "remaining": 4990, "reset": 1000, "used": 10},
+        "graphql": {"limit": 5000, "remaining": 4800, "reset": 2000, "used": 200},
+        "search": {"limit": 30, "remaining": 30, "reset": 3000},  # ignored bucket
+    }}
+    parsed = parse_rate_limit(data)
+    assert parsed["core"] == {"limit": 5000, "remaining": 4990, "used": 10, "reset": 1000}
+    assert parsed["graphql"] == {"limit": 5000, "remaining": 4800, "used": 200, "reset": 2000}
+    assert "search" not in parsed
+
+def test_parse_rate_limit_computes_used_when_absent():
+    data = {"resources": {"core": {"limit": 5000, "remaining": 4990, "reset": 1000}}}
+    assert parse_rate_limit(data)["core"]["used"] == 10
+
+def test_parse_rate_limit_none_when_no_usable_bucket():
+    assert parse_rate_limit({"resources": {}}) is None
+    assert parse_rate_limit({}) is None
+    assert parse_rate_limit({"resources": {"core": {"limit": 5000}}}) is None  # missing fields
+
+def test_parse_rate_limit_returns_partial_result():
+    data = {"resources": {"core": {"limit": 5000, "remaining": 100, "reset": 1000},
+                          "graphql": {"limit": 5000}}}   # malformed, dropped
+    parsed = parse_rate_limit(data)
+    assert "core" in parsed and "graphql" not in parsed
+
+
+# --- overlay_frame_sequence: round-robin sequencing -----------------------------
+
+def test_overlay_frame_sequence_badge_only_when_quota_disabled():
+    assert overlay_frame_sequence(False) == [OVERLAY_FRAME_CI_BADGE]
+
+def test_overlay_frame_sequence_includes_quota_frames_when_enabled():
+    assert overlay_frame_sequence(True) == \
+        [OVERLAY_FRAME_CI_BADGE, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST]
+
+def test_overlay_frame_shape_distinguishes_badge_from_quota():
+    assert OVERLAY_FRAME_SHAPE[OVERLAY_FRAME_CI_BADGE] == "badge"
+    assert OVERLAY_FRAME_SHAPE[OVERLAY_FRAME_QUOTA_GQL] == "quota"
+    assert OVERLAY_FRAME_SHAPE[OVERLAY_FRAME_QUOTA_REST] == "quota"
+    # The two quota frames share a shape (identical element id sets) --
+    # only badge<->quota transitions need the id-shape-change clear.
+    assert OVERLAY_FRAME_SHAPE[OVERLAY_FRAME_QUOTA_GQL] == OVERLAY_FRAME_SHAPE[OVERLAY_FRAME_QUOTA_REST]
+
+
+# --- build_ci_payload: overlay precedence ---------------------------------------
+
+def test_payload_overlay_takes_priority_over_quiet_green():
+    overlay = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=running_info())
+    payload = build_ci_payload([RepoState("o/r", [], [])], True, 180, overlay=overlay)
+    assert payload["priority"] == PRIORITY_OVERLAY   # overlay beats show_green
+    assert payload is overlay
+
+def test_payload_failure_takes_priority_over_overlay():
+    overlay = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=running_info())
+    payload = build_ci_payload([RepoState("o/r", ["tests"], [])], False, 180, overlay=overlay)
+    assert payload["priority"] == PRIORITY_ALERT   # failure wins, not the overlay
     bg = _bg_element(payload["elements"])
     assert bg["fill_colors"] == ["#A32D2DFF"]
 
-def test_payload_stuck_takes_priority_over_running():
-    run_ = running_run()
-    info = RunningInfo(run=run_, repo="o/r", other_count=0, median_minutes=None, now=NOW)
-    payload = build_ci_payload([RepoState("o/r", [], ["tests"])], False, 180, running=info)
-    assert payload["priority"] == 60
+def test_payload_stuck_takes_priority_over_overlay():
+    overlay = build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
+                                    quota_by_bucket={"graphql": quota_info()})
+    payload = build_ci_payload([RepoState("o/r", [], ["tests"])], False, 180, overlay=overlay)
+    assert payload["priority"] == PRIORITY_ALERT
     bg = _bg_element(payload["elements"])
     assert bg["fill_colors"] == ["#BA7517FF"]
 
-def test_payload_running_takes_priority_over_quiet_green():
-    run_ = running_run()
-    info = RunningInfo(run=run_, repo="o/r", other_count=0, median_minutes=None, now=NOW)
-    payload = build_ci_payload([RepoState("o/r", [], [])], True, 180, running=info)
-    assert payload["priority"] == RUNNING_PRIORITY   # running beats show_green
-
-def test_payload_no_running_falls_through_to_quiet_or_green_as_before():
-    assert build_ci_payload([RepoState("o/r", [], [])], False, 180, running=None) is None
-    payload = build_ci_payload([RepoState("o/r", [], [])], True, 180, running=None)
-    assert payload["priority"] == 60
+def test_payload_no_overlay_falls_through_to_quiet_or_green_as_before():
+    assert build_ci_payload([RepoState("o/r", [], [])], False, 180, overlay=None) is None
+    payload = build_ci_payload([RepoState("o/r", [], [])], True, 180, overlay=None)
+    assert payload["priority"] == PRIORITY_ALERT

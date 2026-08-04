@@ -154,3 +154,47 @@ def test_fetch_median_eta_does_not_cache_on_network_exception(mock_get):
     mock_get.return_value = _response(200, {"workflow_runs": [_run(
         "2026-08-03T10:00:00Z", "2026-08-03T10:04:00Z")]})
     assert poller.fetch_median_eta("o/r", 3) == 4.0
+
+
+# --- fetch_rate_limit: free endpoint, no ETag/cache -----------------------------
+
+@patch("ci_status.github.requests.get")
+def test_fetch_rate_limit_returns_raw_response(mock_get):
+    body = {"resources": {"core": {"limit": 5000, "remaining": 4990, "reset": 1000, "used": 10},
+                          "graphql": {"limit": 5000, "remaining": 4800, "reset": 2000, "used": 200}}}
+    mock_get.return_value = _response(200, body)
+    poller = RestPoller("tok")
+    assert poller.fetch_rate_limit() == body
+    assert mock_get.call_args.args[0] == "https://api.github.com/rate_limit"
+    # No params (no status/per_page filter -- this isn't a workflow_runs
+    # endpoint) and no If-None-Match (no ETag caching attempted).
+    assert "If-None-Match" not in mock_get.call_args.kwargs["headers"]
+
+@patch("ci_status.github.requests.get")
+def test_fetch_rate_limit_always_hits_network_even_when_called_twice(mock_get):
+    # Unlike fetch_median_eta, there's no process-lifetime cache here --
+    # remaining quota changes continuously, so every call is a fresh GET.
+    mock_get.return_value = _response(200, {"resources": {}})
+    poller = RestPoller("tok")
+    poller.fetch_rate_limit()
+    poller.fetch_rate_limit()
+    assert mock_get.call_count == 2
+
+@patch("ci_status.github.requests.get")
+def test_fetch_rate_limit_swallows_network_errors(mock_get):
+    mock_get.side_effect = requests.ConnectionError()
+    assert RestPoller("tok").fetch_rate_limit() is None
+
+@patch("ci_status.github.requests.get")
+def test_fetch_rate_limit_none_on_non_200(mock_get):
+    mock_get.return_value = _response(403)
+    assert RestPoller("tok").fetch_rate_limit() is None
+
+@patch("ci_status.github.requests.get")
+def test_fetch_rate_limit_none_on_malformed_json(mock_get):
+    resp = Mock()
+    resp.status_code = 200
+    resp.headers = {}
+    resp.json.side_effect = ValueError("Invalid JSON")
+    mock_get.return_value = resp
+    assert RestPoller("tok").fetch_rate_limit() is None

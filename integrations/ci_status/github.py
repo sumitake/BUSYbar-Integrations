@@ -129,3 +129,30 @@ class RestPoller:
         median = compute_median_duration_minutes(runs)
         self._eta_cache[workflow_id] = median  # cache even if None -- see docstring
         return median
+
+    def fetch_rate_limit(self) -> dict | None:
+        """GET /rate_limit -- explicitly EXEMPT from GitHub's own rate
+        limiting (checking your quota doesn't spend it), so this is a
+        plain fresh GET every call: no ETag/conditional-request caching
+        attempted (there's no quota cost to save) and no per-process cache
+        either (unlike fetch_median_eta's history, remaining quota changes
+        continuously and a cached value would go stale within the poll
+        interval). Returns the raw parsed response (`{"resources":
+        {"core": {...}, "graphql": {...}, ...}, ...}`) for `logic.
+        parse_rate_limit` to extract from -- unlike the other fetch_*
+        methods, no `workflow_runs` unwrapping happens here since the
+        caller needs the whole `resources` object, not one list.
+        """
+        try:
+            resp = requests.get(f"{API}/rate_limit", headers=self._headers(), timeout=(5, 15))
+        except requests.RequestException as exc:
+            log.debug("github unreachable (rate_limit fetch): %s", exc)
+            return None
+        if resp.status_code != 200:
+            log.warning("github %s (rate_limit fetch)", resp.status_code)
+            return None
+        try:
+            return resp.json()
+        except ValueError as exc:
+            log.warning("github returned non-JSON (rate_limit fetch): %s", exc)
+            return None
