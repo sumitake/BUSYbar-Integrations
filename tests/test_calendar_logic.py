@@ -602,9 +602,21 @@ def test_chirp_state_prunes_old_entries():
 
 def test_chirp_stock_path_is_a_firmware_stock_sound_not_an_uploaded_asset():
     # Documents the design choice (v1.5.2): no asset generation/upload
-    # needed -- see logic.py's module comment for the on-device probe that
-    # confirmed this exact stock_path works.
-    assert CHIRP_STOCK_PATH == "shared/calendar_event_starts.wav"
+    # needed -- see logic.py's module comment for why this is a
+    # firmware-shipped stock sound, not a repo-committed binary.
+    assert CHIRP_STOCK_PATH == "shared/calendar_event_starts.snd"
+
+def test_chirp_stock_path_is_snd_not_wav_regression():
+    # Regression, v1.5.2.1: the runtime filename is .snd -- the firmware
+    # build pipeline converts .wav SOURCE files to .snd at packaging time,
+    # invisible from the source tree or the OpenAPI spec. The original
+    # ".wav" stock_path returned 200 from /api/audio/play (a silently
+    # accepted but wrong filename -- see play_audio's docstring for why a
+    # 200 doesn't prove audible playback) and produced no sound at all,
+    # confirmed by operator ear-testing. This test pins the extension
+    # directly so a future edit can't silently regress back to .wav.
+    assert CHIRP_STOCK_PATH.endswith(".snd")
+    assert not CHIRP_STOCK_PATH.endswith(".wav")
 
 
 # --- next_sleep_seconds: T-0 chirp precision --------------------------------------

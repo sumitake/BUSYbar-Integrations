@@ -48,7 +48,7 @@ class BusyBarClient:
                    path: str | None = None) -> bool:
         """POST /api/audio/play (v1.5.2, added for calendar_countdown's
         event-start chirp). Exactly one of `stock_path` (a firmware-shipped
-        sound, e.g. "shared/calendar_event_starts.wav" -- pattern
+        sound, e.g. "shared/calendar_event_starts.snd" -- pattern
         `shared/[a-z0-9_.]+$`, no further subdirectories) or `path` (a file
         previously uploaded into this app's own assets directory) must be
         given, matching the device's own PlayAudio schema. Never touches
@@ -56,6 +56,34 @@ class BusyBarClient:
         deliberately, so a caller can't accidentally change the operator's
         own volume setting; playback always uses whatever volume is
         currently configured on the device.
+
+        **Stock sound filenames are `.snd` at runtime, not `.wav`, even
+        though the source assets in the firmware repo are `.wav` files.**
+        The build pipeline converts `.wav` sources to `.snd` at packaging
+        time; the source tree and the OpenAPI spec never reveal this --
+        the only way to find the real runtime filename is a live `GET
+        /api/storage/list` of the target directory (e.g.
+        `/ext/apps_assets/shared/sounds`) against the actual device.
+        Always verify a stock filename against that listing before
+        shipping it in a `stock_path`, not against the source repo or the
+        API docs.
+
+        **A `True` return does NOT prove audible playback.** This
+        endpoint returns `200` BEFORE the actual file open -- playback is
+        queued behind a short amp holdoff (~100ms), and an open failure
+        at holdoff-fire (e.g. because the filename is wrong) is logged
+        device-side only and otherwise swallowed; nothing comes back over
+        this HTTP response either way. A wrong filename (confirmed with
+        the original, incorrect `.wav` stock_path used here before this
+        was diagnosed) is therefore indistinguishable from a correct one
+        at every layer this codebase can observe -- the request succeeds,
+        the response is `200`, and `play_audio` returns `True`, with no
+        actual sound. The only way to confirm real audibility is a human
+        listening on the actual hardware; log every attempt's outcome
+        (both `True` and `False`) at the call site so a silent-but-
+        "successful" chirp is at least visible in the log for later
+        correlation against an operator report, rather than doubly silent
+        (no sound AND no log line) the way the original bug was.
 
         Returns True on a confirmed 200, False on anything else (network
         unreachable, 400 invalid path, 404 file not found, or any other

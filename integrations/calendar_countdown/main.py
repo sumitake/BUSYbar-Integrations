@@ -118,14 +118,27 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
     # restart-safety and once-per-event reasoning. Placed after the
     # dry_run return so a dry run never plays real audio or touches the
     # chirp bookkeeping.
+    #
+    # Observability (v1.5.2.1): log EVERY attempt at INFO, success or
+    # failure -- not just failures (client.play_audio already logs those
+    # at WARNING). This is what the silent-.wav bug needed and didn't
+    # have: a 200/True response from play_audio does NOT prove audible
+    # playback (see play_audio's docstring for the full deferred-open/
+    # swallowed-failure explanation), so a log line is the only trace
+    # this process can leave for later correlation against an operator's
+    # own ear-test -- a "successful" chirp that nobody heard was
+    # previously doubly silent (no sound AND no log line), which is why
+    # the root cause took device storage forensics to find instead of a
+    # five-second log check.
     if state is not None:
         if should_chirp(event, in_progress, now, state, c["chirp"]):
-            if client.play_audio(APP, stock_path=CHIRP_STOCK_PATH):
+            played = client.play_audio(APP, stock_path=CHIRP_STOCK_PATH)
+            log.info("chirp played (%s) -> %s", CHIRP_STOCK_PATH, played)
+            if played:
                 commit_chirped(event, state)
-            # else: play_audio already logged the failure; leaving
-            # "chirped" uncommitted means the next poll (still
-            # in_progress, same event) retries rather than silently
-            # skipping the chirp forever.
+            # else: leaving "chirped" uncommitted means the next poll
+            # (still in_progress, same event) retries rather than
+            # silently skipping the chirp forever.
 
     if state is not None and state.get("in_progress") not in (None, in_progress):
         # clear()'s own success/failure is intentionally not checked here --

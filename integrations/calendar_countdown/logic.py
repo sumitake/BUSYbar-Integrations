@@ -329,14 +329,33 @@ def resolve_led_value(led_should_be_on: bool, led_was_on: bool) -> str | None:
     return None
 
 
-CHIRP_STOCK_PATH = "shared/calendar_event_starts.wav"
+CHIRP_STOCK_PATH = "shared/calendar_event_starts.snd"
 # ^ A firmware-shipped stock sound (see BusyBarClient.play_audio), not a
-# generated/uploaded asset -- confirmed via a live on-device probe (POST
-# /api/audio/play with this exact stock_path returned 200) before this
-# was chosen. No asset generation, upload, or repo-committed binary is
-# needed for the v1.5.2 chirp; see the spec doc's v1.5.2 section for the
-# probe transcript and why the naming ("calendar event starts") is an
+# generated/uploaded asset -- no asset generation, upload, or
+# repo-committed binary is needed for the chirp; see the spec doc's
+# v1.5.2 section for why the naming ("calendar event starts") is an
 # exact semantic match for the T-0 chirp this feature fires.
+#
+# v1.5.2.1 CORRECTION: this was originally ".wav" -- the v1.5.2 on-device
+# probe (POST /api/audio/play with that stock_path) returned 200, which
+# was WRONGLY taken as confirmation the chirp was audible. It was not.
+# Root cause, confirmed by operator ear-testing plus device storage
+# forensics (a live GET of /api/storage/list against
+# /ext/apps_assets/shared/sounds -- nothing in the source tree or the
+# OpenAPI spec reveals this): the firmware build pipeline converts .wav
+# SOURCE files to **.snd** at packaging time; the runtime filenames are
+# .snd (e.g. calendar_event_starts.snd), never .wav. Compounding this,
+# /api/audio/play returns 200 BEFORE the actual (deferred) file open --
+# playback is queued behind a ~100ms amp holdoff, and an open failure at
+# holdoff-fire is logged device-side only and otherwise swallowed. A
+# `True` from play_audio therefore does NOT prove audible playback; a
+# wrong filename (like the original ".wav" here) is indistinguishable
+# from success at every software layer available to this codebase. The
+# operator's ear-test matrix that confirmed this: stock ".wav" -> silent,
+# an uploaded ".wav" asset -> audible, stock ".snd" -> audible. See
+# BusyBarClient.play_audio's docstring for the same caveat stated at the
+# API-client level, and the spec doc's firmware-facts section for the
+# full writeup.
 
 
 def check_threshold_ordering(cfg: dict) -> str | None:
