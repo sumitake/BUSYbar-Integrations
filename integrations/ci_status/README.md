@@ -4,6 +4,8 @@
 
 This integration monitors GitHub Actions workflows across your repositories and displays CI status on the busybar device. When workflows fail, the device shows a full-panel red badge (rounded background + bold white text) listing the affected `repo:workflow` pairs. When queued runs become stale (stuck due to offline runners or capacity), the device shows a full-panel amber badge with black text instead. Long lists scroll. The integration displays at priority 60, but an active BUSY session (priority 90) will override the display to show a blinking red status LED instead.
 
+**While a run is actively in progress** (and nothing is failing or stuck), the device also shows a cyan/blue "running" badge: the repo, PR number (or branch), and workflow name across the top; an ETA countdown (`~4m`, `~1h05m`, or `soon`/`"3m in"` when there's no history to estimate from yet) below; and a thin progress line tracking elapsed time against the workflow's typical duration. See "Running-Job Badge" below for important timing caveats — the badge does **not** cleanly alternate with the calendar the way the name suggests.
+
 ## Requirements
 
 - **Python 3.12+**, `uv` package manager, and **GitHub CLI** installed and authenticated via `gh auth login` (platform-independent; runs on any OS; the integration reuses your existing auth token, stored securely by GitHub CLI)
@@ -45,6 +47,8 @@ poll_seconds = 120             # how often to check workflows (default: 120)
 repos = ["your-user/your-repo"]  # list of repos to monitor
 show_green = false             # display green builds (default: false)
 # stale_queued_minutes = 15    # optional: alert if runs stuck queued for N minutes
+show_running = true            # show a badge while a run is in progress (default: true)
+running_poll_seconds = 20      # poll interval while a run is active (default: 20)
 ```
 
 At minimum, set `repos` to the repositories you want to monitor (e.g., `["owner/repo1", "owner/repo2"]`).
@@ -72,6 +76,52 @@ Once the foreground test completes, your `config.toml` is in place and GitHub au
 | `repos` | array of strings | — | GitHub repositories to monitor in `owner/repo` format (required) |
 | `show_green` | boolean | false | Display successful/green workflow status (default: off to reduce noise) |
 | `stale_queued_minutes` | integer | (disabled) | Alert if a workflow run has been queued for N minutes without starting (optional; useful to catch offline self-hosted runners) |
+| `show_running` | boolean | true | Show a badge while a run is `in_progress` (across all configured repos; most-recently-started wins, `+N` if others are also running) |
+| `running_poll_seconds` | integer | 20 | Poll interval while a run is active (shortened from `poll_seconds`; also drives the running badge's redraw cadence — see "Running-Job Badge" below) |
+
+## Running-Job Badge
+
+While any configured repo has an `in_progress` run (and nothing is failing
+or stuck), the device shows a cyan/blue badge: `REPO #PR WORKFLOW` (or
+`REPO branch-name WORKFLOW` for fork/push-triggered runs, which don't have
+a PR number) across the top, with `+N` appended if other runs are also
+active; an ETA below (`~4m`, `~1h05m` — reusing the calendar countdown's
+own formatter — or `soon` once the estimate is under a minute, or `3m in`
+when there's no successful-run history yet to estimate from); and a thin
+progress line tracking elapsed time against the workflow's typical
+duration (median of its last 5 successful runs, cached for the life of the
+process).
+
+**Important: this does not cleanly alternate with the calendar.** The
+original design assumed the device would smoothly hand the screen back and
+forth between the two integrations. On-device testing found the firmware
+does not support that: a currently-displayed app's elements are **evicted**
+(not restored) once a higher-priority app's own elements expire or are
+cleared, and equal-priority draws between different apps are flatly
+**rejected**, not treated as a hand-off. Concretely:
+
+- The running badge draws at priority **21**, not 20, because a
+  same-priority draw from a different app is rejected outright by this
+  firmware (contrary to what the device's own API documentation claims).
+- Each badge draw is visible for its own ~10 second timeout, then the
+  panel goes **dark** — the calendar's own last draw does not silently
+  reappear underneath.
+- The calendar only gets the screen back if its independent 60-second
+  redraw happens to land in one of those dark gaps, which is down to
+  unsynchronized timing luck. In on-device testing across a 130-second
+  window (six ~10s gaps, spanning more than two of the calendar's own
+  60-second cycles), this did not happen even once — the observed pattern
+  was simply "badge visible ~10s, dark ~10s," repeating, for the whole
+  time a run was active.
+
+In practice: while CI is running, expect the panel to show the running
+badge roughly half the time and be dark the other half, not to see the
+calendar in between. This is a known limitation of the current
+zero-cross-process-coordination design, not a bug; if it matters for your
+use, the fixed ~10s badge timeout and the `running_poll_seconds` cadence
+are the two knobs that shape the ratio (both currently need a code change
+to adjust, not just config, since the timeout is fixed in
+`ci_status/logic.py`).
 
 ### Stale Queued Detection
 

@@ -552,3 +552,167 @@ divider has at least one blank column on each side (checked directly:
 neither the neighboring text's ink nor the divider's own ink reaches the
 immediately adjacent column). See the implementation report for the
 verbatim check output and captures.
+
+## 2026-08-03 — v1.5 running-CI badge
+
+**Status:** Implemented (branch `dev/claude/ci-running-v1.5`).
+
+New feature: `ci_status` shows an actively-running CI job on the bar,
+alternating with the calendar. The design brief assumed a "clean
+alternation, zero coordination" mechanism based on the OpenAPI doc's
+priority-arbitration description. **Two empirical probes done before any
+implementation found the doc's description doesn't match firmware 1.1.1's
+actual behavior**, which reshaped the whole approach -- see below before
+the feature description, since it changes what "alternating" actually
+means here.
+
+### Probe findings (read this first -- the design depends on it)
+
+**Finding 1: equal priority from a different `application_name` is
+REJECTED, not an override.** The OpenAPI doc states: *"A draw request is
+accepted when its priority is >= the priority of the currently running
+system app. Equal-priority requests from a different application_name
+override whatever is on screen."* Probed directly: with the live
+`calendar_countdown` agent showing at priority 20, a draw from a different
+`application_name` at priority 20 returned `409 {"error":"Not drawn due to
+low priority"}` in every trial (19, 20 both rejected); only priority 21
+(strictly greater) succeeded. **Consequence: the running badge cannot use
+priority 20 as the brief specified -- it must use priority 21
+(`RUNNING_PRIORITY` in `ci_status/logic.py`), a deliberate, evidence-backed
+deviation from the literal brief.**
+
+**Finding 2: occluded elements are EVICTED, not restored.** Probed with
+two test apps (`probe_a` at priority 21, long timeout; `probe_b` at
+priority 22, occluding it) across two scenarios -- (a) `probe_b`'s own
+timeout expiring, (b) `probe_b` being explicitly cleared. In **both**
+cases, `probe_a`'s still-live element (well within its own 30s timeout)
+did **not** reappear; the panel went black instead, and stayed black until
+a fresh draw from any app. A follow-up probe confirmed the "currently
+running app" baseline resets low enough after eviction that a plain
+priority-20 draw from a third app then succeeds again. **Consequence: the
+brief's "if occluded elements restore: clean alternation, zero
+coordination" branch does not apply. This forces the "if evicted" fallback
+design:** the badge occupies the screen for its own timeout, then the
+panel goes blank until *some* app performs a fresh draw -- either the
+badge's own next cycle, or the calendar's independent 60s redraw landing
+in the gap by chance (no cross-process coordination exists, and none was
+added).
+
+**Observed rhythm (on-device, ~130s window against the live
+`calendar_countdown` agent, badge at priority 21/10s timeout/20s cadence,
+sampled every 2s):**
+
+```
+sample counts: {'BADGE': 33, 'BLANK': 31}
+```
+
+The rhythm is **exactly** badge-visible-~10s / blank-~10s, repeating every
+~20s cycle -- and the live calendar agent did **not** reclaim the screen
+even once across six ~10s gaps spanning more than two of its own 60s
+redraw cycles. This is a materially different experience than "badge
+alternates with calendar": in practice, while a run is active, the panel
+shows the badge roughly half the time and is **dark** the other half; the
+calendar effectively does not get airtime back until the CI run finishes
+(cadence reverts to `poll_seconds`) or the calendar's redraw happens to
+land in a gap by chance, which was not observed in this test window. This
+is exactly the kind of deviation the brief asked to be reported
+prominently rather than silently redesigned around -- implemented as
+specified (fixed ~10s badge timeout, `running_poll_seconds` cadence), not
+adjusted to hide the gap, so the operator can judge whether the parameters
+need tuning.
+
+### Feature: running-CI badge (`integrations/ci_status/`)
+
+Per configured repo, `GET .../actions/runs?status=in_progress&per_page=5`
+(separate ETag slot from the existing failure/stuck poll -- different URL,
+`RestPoller._running_etags` not `._etags`). Across all repos, the
+most-recently-started `in_progress` run is selected (`select_running_run`);
+if others are also running, a `+N` suffix is added to the title.
+
+**Title ribbon** (`small` font, `y=-2`, uppercase, scrolls if it doesn't
+fit): `REPO #PR WORKFLOW` (PR number from `run.pull_requests[0].number`;
+fork/push runs with an empty `pull_requests` array fall back to
+`head_branch`), with a `+N` suffix when other runs are active.
+
+**Numeral row** (`large` font, `y=5`): ETA remaining, reusing
+`calendar_countdown.logic._format_countdown` verbatim (imported across
+integrations, along with `ascii_safe`, `_title_fits`,
+`SCROLL_RATE`/`SCROLL_DELAY_MS`, `PANEL_WIDTH`/`PANEL_HEIGHT` -- see the
+comment at the top of `ci_status/logic.py` for why these specific helpers
+are shared while the layout geometry/palette constants are independently
+declared per integration).
+
+- ETA = median duration of the last 5 successful runs of the *same*
+  workflow (`.../workflows/{workflow_id}/runs?status=success&per_page=5`,
+  duration = `updated_at - run_started_at`, cached per `workflow_id` for
+  the process's lifetime in `RestPoller._eta_cache` -- a successful fetch
+  is cached even if the history is confirmed empty; a network/HTTP error is
+  **not** cached, so the next encounter retries rather than permanently
+  locking the workflow into "no history") minus elapsed (`now -
+  run_started_at`), floored at 0.
+- History exists: `"~" + _format_countdown(eta)` (e.g. `"~4m"`,
+  `"~1h05m"`), or `"soon"` once the estimate floors to under a minute
+  (covers both "past the median" and "a few seconds under a minute left" --
+  neither reads sensibly as `"~0m"`).
+- No history: `_format_countdown(elapsed) + " in"` (e.g. `"3m in"`).
+
+**Track row**: repurposed from the calendar's drain metaphor to a
+fill-*up* progress bar: `elapsed / median`, clamped to `[1, PANEL_WIDTH]`,
+full width when the median is unknown (same defensive shape as
+`_track_fill_width`/`_progress_width`). Solid cyan fill (`RUNNING_TRACK_FILL_COLOR`,
+`#29B6F6FF`) -- no gradient, per the brief.
+
+### Palette and geometry
+
+A distinct cyan/blue theme, following the same luminance-contrast
+principle established in v1.4 (near-black gradient background + bright
+saturated text; no mid-luminance "dim-mud" fills):
+
+| Element | Color | Notes |
+|---|---|---|
+| `bg` | `#031A2EFF` → `#00060DFF` gradient | deep blue night, distinct hue from every calendar state |
+| `title` | `#7FDBFFFF` | bright sky-cyan |
+| `track` (groove) | `#0F2A42FF` | decorative, not text-bearing -- same treatment as the calendar's `TRACK_COLOR` |
+| `track_fill` | `#29B6F6FF` | solid, saturated cyan (spec: "solid cyan") |
+| `eta` (numeral) | `#66E1FFFF` | bright cyan, distinguishable from the title for a small hierarchy |
+
+Geometry follows the v1.4 "airy" row template (title ribbon / blank buffer
+row 5 / full-width horizon-line track at row 6 / numeral row) but is
+independently declared in `ci_status/logic.py` (`RUNNING_TITLE_X`,
+`RUNNING_TRACK_Y`, etc.) rather than importing the calendar's geometry
+constants -- only the *algorithms* are shared across integrations, not the
+layout objects, since the two badges are visually similar but structurally
+distinct (no divider, no card, a single numeral).
+
+### Cadence and precedence
+
+`ci_status` shortens its poll interval to `running_poll_seconds` (new
+config key, default 20) while any configured repo has an `in_progress`
+run, reverting to `poll_seconds` when idle (`main.next_poll_seconds`, a
+pure function of the post-poll `running_cache` so it's unit-testable
+without mocking `time.sleep`). The running badge's own element `timeout`
+is a fixed `RUNNING_BADGE_TIMEOUT_S = 10` regardless of
+`running_poll_seconds`'s configured value -- per the brief ("timeout
+~10s"), not derived from the cadence. A much larger or smaller
+`running_poll_seconds` than the default would change the observed ratio of
+badge-visible to dark time; this is a real configuration interaction, not
+a bug, and is called out in the README.
+
+Precedence in `build_ci_payload`: **failure (60) > stuck (60) > running
+(21) > quiet green (60) > nothing**. Failure and stuck are evaluated first
+specifically so an active alert always wins over "just" a running-job
+status update, even if both conditions are true in the same poll.
+
+### Config additions (`src/busybar/config.py`, `config.example.toml`)
+
+Added to `[ci_status]`: `show_running = true`, `running_poll_seconds = 20`.
+
+### Verification
+
+On-device: the two probes above; captured frames of all four badge content
+variants (PR number, branch fallback, `"soon"`, `"3m in"`) passing the
+same ink-overlap + buffer gate used for the v1.4 calendar work (title ⊆
+rows 0-4, `eta` ⊆ rows 7-15, row 5 has no foreground ink, columns 0-1 have
+no text ink); the ~130s alternation-rhythm observation above. See the
+implementation report for verbatim check output, the probe transcripts,
+and captures.
