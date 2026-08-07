@@ -190,22 +190,22 @@ Independent of the priority ladder above, two more signals fire during the final
 
 ## Animation Accents
 
-This integration uses device stock animations to accent the calendar escalation and event-start moments.
+This integration uses device stock animations to accent the calendar escalation and event-start moments. See the design spec (`docs/superpowers/specs/2026-08-06-animation-accents-design.md`) for the technical background and verification results.
 
 ### Pre-Start Icons (Warn and Imminent Stages)
 
 When `escalation_icons` is true (default), animated calendar icons accompany the text-based countdown:
 
-- **Warn stage** (within `warn_minutes` of start, e.g., 5 minutes): a `calendar_event_16x16` icon animates at the top-left corner. The event title shifts rightward to `x=18` and scrolls within the narrowed space; the large countdown numeral remains at its usual position. Palette is red, priority is `PRIORITY_AMBIENT_URGENT` (65).
+- **Warn stage** (within `warn_minutes` of start, e.g., 5 minutes): a `calendar_event_16x16` icon animates at the top-left corner. The event title is shown to the right of the icon, in the reduced space between the icon and the countdown numeral; the large countdown numeral remains at its usual position. The start-time text (`HH:MM`) is dropped to make room. Palette is red, priority is `PRIORITY_AMBIENT_URGENT` (65).
 - **Imminent stage** (within `imminent_minutes` of start, e.g., 1 minute): the animated icon switches to `calendar_reminder_16x16` (calendar + bell). The event title is dropped to give the icon and countdown full prominence. Palette remains red, priority unchanged (65).
 
-Setting `escalation_icons = false` reverts both stages to text-only display (countdown numeral and title only, no icons).
+Setting `escalation_icons = false` reverts both stages to text-only display: title, start-time (`HH:MM`), and countdown numeral, with no icons.
 
 ### Start Takeover (First Minute After Event Begins)
 
 When an event begins and `start_animation` is configured (default `"meeting_72x16"`), the display transitions to a full-panel animated takeover for the first `start_window_seconds` (default 60 seconds):
 
-- **Display**: the entire panel shows the configured stock animation looping continuously (e.g., `meeting_72x16` displays an animated word "MEETING" and occupies ~97% of the 72×16 panel).
+- **Display**: the entire panel shows the configured stock animation looping continuously (e.g., `meeting_72x16` displays an animated word "MEETING" and occupies ~98% of the 72×16 panel).
 - **Priority**: held at `PRIORITY_AMBIENT_URGENT` (65) for the entire window — matching the T-0 chirp's urgency, ensuring the alarm is not silently buried by other displays.
 - **Timing**: aligned with the audio chirp at T-0 (event start). The animation self-loops between the integration's own redraws (every `poll_seconds`), so motion is smooth across the window.
 - **After the window**: reverts to the normal in-progress "ENDS" display at `PRIORITY_AMBIENT` (20).
@@ -215,4 +215,6 @@ When an event begins and `start_animation` is configured (default `"meeting_72x1
 
 ### Stock Animation Paths
 
-All animations are device stock assets referenced by `stock_path` (e.g., `"shared/calendar_event_16x16.anim"`, `"shared/calendar_reminder_16x16.anim"`, `"shared/meeting_72x16.anim"`). No custom animation assets are uploaded or bundled with this integration; the device firmware ships all referenced stock animations at `/ext/apps_assets/shared/animations/`. If you configure a `start_animation` value that is not a device stock animation, the draw will fail gracefully (logged, not a crash) and the event display falls back to the normal text-only in-progress mode.
+All animations are device stock assets referenced by `stock_path` (e.g., `"shared/calendar_event_16x16.anim"`, `"shared/calendar_reminder_16x16.anim"`, `"shared/meeting_72x16.anim"`). No custom animation assets are uploaded or bundled with this integration; the device firmware ships all referenced stock animations at `/ext/apps_assets/shared/animations/`. The `start_animation` value must be a valid device stock animation name — examples include `meeting_72x16`, `booked_72x16`, `wave_invitation_72x16`. Setting `start_animation = ""` disables the takeover. An invalid or misspelled animation name will not render, leaving the panel dark for the takeover window.
+
+See the design spec (`docs/superpowers/specs/2026-08-06-animation-accents-design.md`, § 3) for the full list of verified stock animations and their dimensions.

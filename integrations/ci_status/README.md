@@ -154,7 +154,7 @@ priority table.
 
 While any configured repo has an `in_progress` run (and nothing is failing
 or stuck), the device rotates through up to three overlay-tier frames, one
-per dwell slot (`OVERLAY_DWELL_SECONDS`, 10s), before repeating:
+per dwell slot (`OVERLAY_DWELL_SECONDS`, 10s), before repeating. See the design spec (`docs/superpowers/specs/2026-08-06-animation-accents-design.md`) for the running spinner implementation details.
 
 1. **Running badge** (always first, always present when `show_running` is
    on): `REPO #PR WORKFLOW` (or `REPO branch-name WORKFLOW` for
