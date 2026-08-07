@@ -45,14 +45,22 @@ quiet_hours = "00:00-07:00"   # local time; "" disables quiet hours entirely
 
 ### 2. Test in Foreground
 
-From the repository root, run the integration once:
+From the repository root, run the integration once to validate connectivity and upload the asset:
 
 ```bash
 cd integrations
+uv run python -m nyan_filler.main --once
+```
+
+Verify that the output shows the draw was successful (`nyan @ 5 -> ACCEPTED` or similar). This confirms the device is reachable and the animation asset has been uploaded.
+
+To test configuration without device I/O (dry-run mode only):
+
+```bash
 uv run python -m nyan_filler.main --once --dry-run
 ```
 
-Verify that the output shows the Nyan animation was uploaded (or is already on the device). The `--dry-run` flag prints the display payload without sending it. **This test run confirms the device is reachable and the animation asset is intact before automating.**
+The `--dry-run` flag prints what the integration *would* draw without making any device calls — this is useful for validating config without touching the device.
 
 ### 3. Verify Config
 
@@ -63,7 +71,7 @@ Once the foreground test completes, your `config.toml` is in place. The LaunchAg
 | Key | Type | Default | Purpose |
 |---|---|---|---|
 | `enabled` | boolean | true | Enable or disable the Nyan animation. Set `false` to pause the filler without uninstalling the agent; restart the agent to re-enable. |
-| `poll_seconds` | integer | 1 | Polling interval in seconds. Determines how quickly the agent reclaims a dark gap once higher-priority content disappears. Default 1 second matches the on-device animation frame rate. |
+| `poll_seconds` | integer | 1 | Polling interval in seconds. Determines how quickly the agent wakes to re-assert the filler draw and reclaims a dark gap once higher-priority content disappears. |
 | `quiet_hours` | string | "00:00-07:00" | Local time window during which the filler is suppressed (typically for sleep hours). Format: `"HH:MM-HH:MM"`; use `""` to disable quiet hours entirely. |
 
 ## Autostart
@@ -113,4 +121,4 @@ The Nyan filler draws at priority 5, the lowest tier on the device. The full pri
 - A BUSY/CUSTOM session is active on the device (priority 90).
 - The current time falls inside `quiet_hours`.
 
-**Restart edge case.** If the integration restarts and the animation asset is not yet on the device, it will be uploaded on the first draw attempt. This only happens once, on the first run or after a device reset — subsequent starts reuse the same asset.
+**Startup asset upload.** The integration automatically re-uploads the animation asset (~83 KB POST) on every non-dry-run process start (including KeepAlive-triggered relaunches), but never during polling. This design ensures the asset is always fresh on the device without needing a separate manual upload step. The upload happens before the main polling loop starts, so it's part of process initialization, not per-poll overhead.
