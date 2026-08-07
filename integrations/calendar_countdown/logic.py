@@ -729,8 +729,26 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
         if imminent:
             title_element = None          # drop the title at imminent -> icon + big number
         else:
-            title_element.update({"x": ICON_TITLE_X,
-                                  "width": CD_TEXT_X - ICON_TITLE_X - 2})  # scroll in the gap
+            narrowed_width = CD_TEXT_X - ICON_TITLE_X - 2   # scroll in the gap
+            title_element.update({"x": ICON_TITLE_X, "width": narrowed_width})
+            # The scroll decision above was made against the full
+            # TITLE_WIDTH (68px); the icon block just narrowed the title to
+            # `narrowed_width` (19px), so it must be RE-decided against the
+            # narrowed width here -- a title that fits at 68px commonly does
+            # NOT fit at 19px (e.g. "Standup", "Meeting", "Lunch"), and
+            # without this recompute it would keep the no-scroll flags from
+            # the 68px check and clip statically instead of scrolling in the
+            # gap the comment above promises.
+            if not _title_fits(title, narrowed_width):
+                title_element.update({
+                    "scroll_rate": SCROLL_RATE,
+                    "scroll_start_delay": SCROLL_DELAY_MS,
+                    "scroll_repeat_delay": SCROLL_DELAY_MS,
+                })
+            else:
+                title_element.pop("scroll_rate", None)
+                title_element.pop("scroll_start_delay", None)
+                title_element.pop("scroll_repeat_delay", None)
 
     track_element = {
         "id": "track",
@@ -800,18 +818,25 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
             "timeout": timeout_s,
         })
 
-    elements.append({
-        "id": "divider",
-        "type": "rectangle",
-        "x": DIVIDER_X,
-        "y": DIVIDER_Y,
-        "width": DIVIDER_WIDTH,
-        "height": DIVIDER_HEIGHT,
-        "fill": "solid",
-        "fill_colors": [DIVIDER_COLOR[state]],
-        "border_width": 0,
-        "timeout": timeout_s,
-    })
+    if icon_element is None:
+        # The divider's left neighbor is `time`, which is already dropped
+        # whenever the escalation icon is present (both the warn and
+        # imminent sub-stages, see the `elif icon_element is None` branch
+        # above) -- with `time` gone and `title` narrowed away from it too,
+        # the divider would be orphaned floating alone. Drop it under the
+        # same condition rather than let it draw disconnected from anything.
+        elements.append({
+            "id": "divider",
+            "type": "rectangle",
+            "x": DIVIDER_X,
+            "y": DIVIDER_Y,
+            "width": DIVIDER_WIDTH,
+            "height": DIVIDER_HEIGHT,
+            "fill": "solid",
+            "fill_colors": [DIVIDER_COLOR[state]],
+            "border_width": 0,
+            "timeout": timeout_s,
+        })
 
     elements.append({
         "id": "cd_text",

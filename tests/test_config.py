@@ -113,8 +113,8 @@ def test_device_kwargs_no_warnings_when_all_keys_known(caplog):
     device_kwargs({"device": dict(DEFAULTS["device"])})
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
-def test_animation_accent_defaults():
-    cfg = load_config(path=None)
+def test_animation_accent_defaults(tmp_path):
+    cfg = load_config(tmp_path / "missing.toml")
     cal = cfg["calendar_countdown"]
     assert cal["escalation_icons"] is True
     assert cal["start_animation"] == "meeting_72x16"

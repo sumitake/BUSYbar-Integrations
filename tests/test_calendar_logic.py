@@ -16,6 +16,7 @@ from calendar_countdown.logic import (
     next_sleep_seconds, IMMINENT_LED_COLOR, CHIRP_STOCK_PATH, _chirp_key,
     check_threshold_ordering,
     is_just_started, START_ANIM_ID, CAL_ICON_ID, ICON_EVENT, ICON_REMINDER,
+    SCROLL_RATE, SCROLL_DELAY_MS,
 )
 from busybar.display import (
     PRIORITY_AMBIENT, PRIORITY_AMBIENT_RAISED, PRIORITY_AMBIENT_URGENT,
@@ -742,12 +743,43 @@ def test_icon_present_drops_time_element():
     assert not any(e["id"] == "time" for e in els)
     assert any(e["id"] == CAL_ICON_ID for e in els)
     assert any(e["id"] == "cd_text" for e in els)
+    # `divider` (id "divider", at DIVIDER_X) sits to the right of `time`'s
+    # old position -- with `time` dropped and `title` narrowed, the divider
+    # is orphaned and must be dropped too whenever the icon shows (CODE-BUG,
+    # minor fix wave item 2).
+    assert not any(e["id"] == "divider" for e in els)
 
     imminent_ev = _ev(NOW2 + timedelta(seconds=30))  # 0.5m out -> imminent
     els = build_elements(imminent_ev, NOW2, _cfg(), 15, in_progress=False)
     assert not any(e["id"] == "time" for e in els)
     assert any(e["id"] == CAL_ICON_ID for e in els)
     assert any(e["id"] == "cd_text" for e in els)
+    assert not any(e["id"] == "divider" for e in els)
+
+    # Normal (no-icon) upcoming display is unaffected -- the divider must
+    # still be present when there's no icon to orphan it.
+    no_icon_els = build_elements(_ev(NOW2 + timedelta(minutes=4)), NOW2,
+                                 _cfg(escalation_icons=False), 15, in_progress=False)
+    assert any(e["id"] == "divider" for e in no_icon_els)
+
+
+def test_warn_stage_title_scrolls_in_narrowed_icon_gap():
+    # "STANDUP" (7 chars * SMALL_FONT_CHAR_PX=5 -> 35px) fits the full 68px
+    # TITLE_WIDTH the scroll decision is first made against, but does NOT
+    # fit the icon-narrowed gap the escalation-icon block later shrinks the
+    # title into (CD_TEXT_X - ICON_TITLE_X - 2 = 39 - 18 - 2 = 19px). The
+    # scroll decision must be recomputed against the NARROWED width, or a
+    # title that's the common case (most real meeting titles) gets no
+    # scroll flags and is statically clipped in the 19px band -- contradicting
+    # the code's own "# scroll in the gap" comment (CODE-BUG-A).
+    warn_ev = _ev(NOW2 + timedelta(minutes=4))   # 4m out -> warn, > imminent
+    els = build_elements(warn_ev, NOW2, _cfg(), 15, in_progress=False)
+    title_el = next(e for e in els if e["id"] == "title")
+    assert title_el["text"] == "STANDUP"
+    assert "scroll_rate" in title_el
+    assert title_el["scroll_rate"] == SCROLL_RATE
+    assert title_el["scroll_start_delay"] == SCROLL_DELAY_MS
+    assert title_el["scroll_repeat_delay"] == SCROLL_DELAY_MS
 
 def test_imminent_stage_uses_reminder_icon_and_drops_title():
     ev = _ev(NOW2 + timedelta(seconds=30))  # 0.5m out -> imminent
