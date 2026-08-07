@@ -53,6 +53,19 @@ v1.5 section for both rounds' verbatim results.
 """
 AMBIENT_REDRAW_SECONDS = 10
 
+PRIORITY_FILLER = 5
+"""Decorative screen-filler (e.g. nyan_filler). Strictly below PRIORITY_AMBIENT
+(20) AND below the firmware's built-in-app tier (10), but above the empty/stub
+screen (0). Verified on-device (spec 2026-08-06 §5b, SPK-3): the panel's
+black/resting state -- true idle AND the CI overlay's silence gap -- rests at
+priority 0, so a priority-5 draw fills those gaps; a built-in app at priority 10
+outranks it, so the filler never overrides the clock/desktop. Every other tier
+(ambient 20, overlay 21, raised 25, alert 60, urgent 65, session 90) preempts
+it. Draw with loop=true and re-assert every poll: a same-element redraw
+continues the on-device loop (SPK-2), so unconditional per-poll redraw does not
+stutter.
+"""
+
 
 def ambient_timeout(poll_seconds: float) -> int:
     """Element timeout (seconds) for an ambient-tier draw at the given poll

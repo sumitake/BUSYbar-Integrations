@@ -225,6 +225,21 @@ class BusyBarClient:
                              params={"application_name": application_name})
         return resp is not None and resp.status_code == 200
 
+    def upload_asset(self, application_name: str, filename: str, data: bytes) -> bool:
+        """Upload a raw asset (e.g. a compiled .anim) to the device's app asset
+        store. Local-only: assets live on the physical device, so this never
+        uses the cloud transport. Returns True on HTTP 200."""
+        resp = self._try_local(
+            "POST",
+            f"/api/assets/upload?application_name={application_name}&file={filename}",
+            data=data, headers={"Content-Type": "application/octet-stream"})
+        if resp is None:
+            log.warning("asset upload unreachable: %s/%s", application_name, filename)
+            return False
+        if resp.status_code != 200:
+            log.warning("asset upload failed: HTTP %s %s", resp.status_code, resp.text[:200])
+        return resp.status_code == 200
+
     def status(self) -> dict | None:
         resp = self._request("GET", "/api/status")
         return resp.json() if resp is not None and resp.status_code == 200 else None

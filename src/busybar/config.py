@@ -79,6 +79,12 @@ DEFAULTS: dict = {
         "snooze_minutes": 30,
         "running_spinner": True,        # animated 8x8 spinner on the running badge
     },
+    "nyan_filler": {
+        "enabled": True,
+        "poll_seconds": 1,            # reclaims a dark gap within ~1s; the draw is
+                                      # tiny and mostly-sleeping (see nyan_filler/README)
+        "quiet_hours": "00:00-07:00", # local time; "" disables quiet hours entirely
+    },
 }
 
 

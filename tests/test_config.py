@@ -113,6 +113,16 @@ def test_device_kwargs_no_warnings_when_all_keys_known(caplog):
     device_kwargs({"device": dict(DEFAULTS["device"])})
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
+
+def test_nyan_filler_defaults(tmp_path):
+    # Hermetic: load from an isolated tmp_path with no [nyan_filler] section
+    # (mirrors test_defaults_when_no_file's isolation) rather than path=None,
+    # which would read any real repo-root config.toml and break once the
+    # operator adds a [nyan_filler] section there.
+    cfg = load_config(tmp_path / "missing.toml")["nyan_filler"]
+    assert cfg == {"enabled": True, "poll_seconds": 1, "quiet_hours": "00:00-07:00"}
+
+
 def test_animation_accent_defaults(tmp_path):
     cfg = load_config(tmp_path / "missing.toml")
     cal = cfg["calendar_countdown"]

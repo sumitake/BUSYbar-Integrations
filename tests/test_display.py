@@ -74,3 +74,9 @@ def test_overlay_gap_elapsed_matches_dwell_threshold_semantics():
     # boundary value itself is exact, not off-by-a-rounding-error.
     last_end = NOW - timedelta(seconds=OVERLAY_DWELL_SECONDS)
     assert overlay_gap_elapsed(last_end, NOW) == OVERLAY_DWELL_SECONDS
+
+
+def test_filler_priority_below_builtin_and_ambient():
+    from busybar.display import PRIORITY_FILLER
+    assert PRIORITY_FILLER == 5
+    assert 0 < PRIORITY_FILLER < 10 < PRIORITY_AMBIENT  # 10 = built-in app tier
