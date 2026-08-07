@@ -73,3 +73,8 @@ repo_refresh_minutes = 60    # how often the repo list itself is re-enumerated (
 # change (new failure, different workflow, resolved-then-new) re-alerts
 # immediately. See ci_status/README.md's "Snoozing alerts" section.
 snooze_minutes = 30          # 0 disables the feature
+
+[nyan_filler]
+enabled = true                # set false to disable the animation without uninstalling the agent
+poll_seconds = 1              # how quickly a dark gap is reclaimed (the draw is tiny; see README)
+quiet_hours = "00:00-07:00"   # local time; "" disables quiet hours entirely
