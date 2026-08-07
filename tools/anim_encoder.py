@@ -24,10 +24,14 @@ def encode_anim(frames_bgr: list[bytes], width: int, height: int, fps: int,
             raise ValueError(f"frame {i}: got {len(f)} bytes, expected {expected}")
 
     # Collapse consecutive identical frames into one encoded frame (duration++).
+    # `duration` (and a section's duration_override) is serialized as a single
+    # byte, so a run of >255 identical frames must be split into chunks of at
+    # most 255 -- otherwise `bytes([duration])` raises ValueError. Splitting is
+    # transparent: each chunk is another raw frame with the same pixel data.
     enc: list[list] = []  # [encoding, duration, data]
     last = None
     for f in frames_bgr:
-        if last is not None and f == last:
+        if last is not None and f == last and enc[-1][1] < 255:
             enc[-1][1] += 1
             continue
         last = f

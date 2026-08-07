@@ -35,3 +35,13 @@ def test_first_frame_pixels_roundtrip():
     payload = data[off+4:off+4+length]
     assert encoding == 0 and length == 72*16*3
     assert payload == frame
+
+
+def test_long_identical_run_splits_under_duration_byte():
+    # A run of >255 identical frames must not overflow the 1-byte duration
+    # field (would raise ValueError in bytes([...])). It splits into chunks.
+    frame = _solid(RED_BGR)
+    data = encode_anim([frame] * 300, 72, 16, fps=1)  # must not raise
+    h = parse_header(data)
+    assert h["n_display"] == 300
+    assert h["n_encoded"] == 2  # 255 + 45

@@ -25,6 +25,10 @@ log = logging.getLogger(APP)
 ASSET_PATH = Path(__file__).resolve().parents[2] / "assets" / "nyan" / ASSET_NAME
 
 
+UPLOAD_BACKOFF_START = 5    # seconds; first delay after a failed asset upload
+UPLOAD_BACKOFF_CAP = 300    # seconds; cap on the delay between persistent-failure retries
+
+
 def ensure_asset_uploaded(client, state: dict) -> None:
     """Idempotently make sure the .anim asset is on the device before we draw
     an element that references it. `state` is the same caller-owned dict
@@ -37,9 +41,11 @@ def ensure_asset_uploaded(client, state: dict) -> None:
     of the process referencing an asset that was never uploaded. So we latch on
     success instead: attempt the upload on each active poll until it lands once
     (`state["asset_uploaded"]`), then never upload again -- no per-poll uploads
-    in steady state. In the in-scope transient-unreachable case these retries
-    are naturally spaced out by main()'s exponential UNREACHABLE backoff, and
-    upload_asset logs its own failure reason on each attempt.
+    in steady state. Each retry is throttled by its own exponential backoff
+    (`UPLOAD_BACKOFF_START` -> x2 -> `UPLOAD_BACKOFF_CAP`), so a *persistent*
+    upload failure -- a device that answers draws but keeps rejecting the
+    upload (4xx/5xx) -- can't re-POST the ~76 KB asset and log a warning on
+    every poll; a transient failure that later succeeds still latches and stops.
 
     A locally missing build artifact is a different failure -- polling can't
     fix it -- so it's warned once (naming the rebuild command) and skipped
@@ -52,8 +58,17 @@ def ensure_asset_uploaded(client, state: dict) -> None:
             log.warning("asset %s missing; run `uv run python -m tools.build_nyan_anim`", ASSET_PATH)
             state["asset_missing_warned"] = True
         return
+    now_mono = time.monotonic()
+    if now_mono < state.get("upload_next_try", 0.0):
+        return  # throttled after a recent failed upload attempt
     if client.upload_asset(APP, ASSET_NAME, ASSET_PATH.read_bytes()):
         state["asset_uploaded"] = True
+        state.pop("upload_backoff", None)
+        state.pop("upload_next_try", None)
+    else:
+        backoff = min(max(state.get("upload_backoff", 0) * 2, UPLOAD_BACKOFF_START), UPLOAD_BACKOFF_CAP)
+        state["upload_backoff"] = backoff
+        state["upload_next_try"] = now_mono + backoff
 
 
 def run_once(client, cfg: dict, now: datetime, state: dict, dry_run: bool = False) -> str:

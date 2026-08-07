@@ -78,13 +78,22 @@ def test_no_reupload_in_steady_state():
     assert len(c.uploads) == 1      # uploaded once, never again
     assert len(c.draws) == 5
 
-def test_upload_retried_each_poll_until_it_succeeds():
-    # Device unreachable for the first two upload attempts, then reachable.
+def test_upload_retried_until_it_succeeds_throttled(monkeypatch):
+    # Device rejects the first two upload attempts, then accepts. Retries are
+    # throttled by exponential backoff, so the clock is advanced past each
+    # backoff window between polls; the upload is still retried until it
+    # succeeds, then latched -- the same guarantee as before, just spaced out.
+    import integrations.nyan_filler.main as m
+    clock = {"t": 0.0}
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock["t"])
     c = FakeClient(upload=[False, False, True]); st = {}
-    run_once(c, BASE, ACTIVE, st)   # attempt 1 -> False
-    run_once(c, BASE, ACTIVE, st)   # attempt 2 -> False
-    run_once(c, BASE, ACTIVE, st)   # attempt 3 -> True  (latches)
-    run_once(c, BASE, ACTIVE, st)   # no further attempt
+    run_once(c, BASE, ACTIVE, st)   # t=0:  attempt 1 -> False (backoff)
+    clock["t"] = 10.0
+    run_once(c, BASE, ACTIVE, st)   # t=10: attempt 2 -> False (backoff)
+    clock["t"] = 30.0
+    run_once(c, BASE, ACTIVE, st)   # t=30: attempt 3 -> True  (latches)
+    clock["t"] = 60.0
+    run_once(c, BASE, ACTIVE, st)   # latched: no further attempt
     assert len(c.uploads) == 3      # retried until success, then stopped
     assert st.get("asset_uploaded") is True
 
@@ -128,3 +137,38 @@ def test_should_log_info_true_when_unchanged_past_heartbeat():
                            seconds_since_heartbeat=600, heartbeat_seconds=600) is True
     assert should_log_info("nyan @ 5 -> drawn", "nyan @ 5 -> drawn",
                            seconds_since_heartbeat=599, heartbeat_seconds=600) is False
+
+
+def test_upload_retry_is_throttled_on_persistent_failure(monkeypatch):
+    import integrations.nyan_filler.main as m
+    clock = {"t": 0.0}
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock["t"])
+
+    class UploadFailClient:
+        def __init__(self): self.uploads = 0
+        def upload_asset(self, app, name, data): self.uploads += 1; return False
+
+    c = UploadFailClient(); st = {}
+    m.ensure_asset_uploaded(c, st)      # t=0: attempts, fails, backoff starts
+    assert c.uploads == 1
+    m.ensure_asset_uploaded(c, st)      # t=0 still within backoff: throttled
+    assert c.uploads == 1
+    clock["t"] = 6.0
+    m.ensure_asset_uploaded(c, st)      # past the backoff: retries
+    assert c.uploads == 2
+
+
+def test_upload_success_latches_and_clears_backoff(monkeypatch):
+    import integrations.nyan_filler.main as m
+    monkeypatch.setattr(m.time, "monotonic", lambda: 0.0)
+
+    class OkClient:
+        def __init__(self): self.uploads = 0
+        def upload_asset(self, app, name, data): self.uploads += 1; return True
+
+    c = OkClient(); st = {}
+    m.ensure_asset_uploaded(c, st)
+    assert st["asset_uploaded"] is True and c.uploads == 1
+    assert "upload_next_try" not in st
+    m.ensure_asset_uploaded(c, st)      # latched: no further uploads
+    assert c.uploads == 1
