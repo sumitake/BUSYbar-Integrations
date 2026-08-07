@@ -61,11 +61,13 @@ def main() -> int:
 
     cfg = load_config()
     client = BusyBarClient(**device_kwargs(cfg))
-    client.clear(APP)  # drop any stale element from a previous process
 
-    # Self-healing install: (re)upload the committed asset on startup so the
-    # device always has it. One ~83 KB POST per process start, never per poll.
+    # Startup clear + self-healing asset (re)upload -- both real device
+    # writes, so both are gated behind --dry-run (no device writes at all
+    # in dry-run mode). Upload: one ~83 KB POST per process start, never
+    # per poll.
     if not args.dry_run:
+        client.clear(APP)  # drop any stale element from a previous process
         if ASSET_PATH.exists():
             client.upload_asset(APP, ASSET_NAME, ASSET_PATH.read_bytes())
         else:
