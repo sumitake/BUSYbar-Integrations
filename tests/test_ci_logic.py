@@ -12,7 +12,7 @@ from ci_status.logic import (
     _format_eta_text, _progress_width, _build_running_title,
     parse_rate_limit, _quota_headroom, _quota_used_width,
     resolve_repo_list, _eta_label, RUNNING_NUMERAL_X, RUNNING_LABEL_GAP_PX,
-    compute_alert_fingerprint, update_snooze,
+    compute_alert_fingerprint, update_snooze, RUN_SPINNER_ID,
 )
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS, PRIORITY_ALERT
 from calendar_countdown.logic import _text_width_px
@@ -817,3 +817,36 @@ def test_update_snooze_session_starting_mid_alert_after_continuous_polling():
     assert update_snooze(FP_A, False, t1, 30, state) == (False, False)   # still no session
     t2 = t1 + timedelta(seconds=10)
     assert update_snooze(FP_A, True, t2, 30, state) == (False, True)   # session starts -- pending
+
+
+# --- CI running-badge spinner (v1.6, task 4) ---------------------------------------
+#
+# NOTE: uses SPINNER_NOW (not the module-level NOW) -- a distinct name is
+# used deliberately here rather than reassigning NOW, since NOW is read at
+# call time (late-bound) by dozens of test functions throughout this file;
+# rebinding it at module scope after this point would silently change the
+# "now" every earlier-defined test observes when pytest actually calls them.
+
+SPINNER_NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+
+
+def _running():
+    return RunningInfo(run={"name": "build", "run_started_at": "2026-08-06T11:58:00Z",
+                            "pull_requests": [{"number": 42}], "workflow_id": 1},
+                       repo="me/repo", other_count=0, median_minutes=8.0, now=SPINNER_NOW)
+
+
+def test_spinner_present_and_title_reserved_when_on():
+    p = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, 10, running=_running(), show_spinner=True)
+    els = p["elements"]
+    spin = next(e for e in els if e["id"] == RUN_SPINNER_ID)
+    assert spin["type"] == "animation" and spin["stock_path"] == "shared/spinner_front_8x8.anim"
+    assert spin["x"] == 64 and spin["y"] == 0
+    title = next(e for e in els if e["id"] == "title")
+    assert title["width"] == 60   # reserved so the scrolling title never runs under the spinner
+
+def test_no_spinner_and_full_title_when_off():
+    p = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, 10, running=_running(), show_spinner=False)
+    els = p["elements"]
+    assert not any(e["id"] == RUN_SPINNER_ID for e in els)
+    assert next(e for e in els if e["id"] == "title")["width"] == 68  # unchanged
