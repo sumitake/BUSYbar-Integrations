@@ -730,6 +730,25 @@ def test_warn_stage_adds_event_icon():
     assert icon["x"] == 0 and icon["y"] == 0
     assert any(e["id"] == "title" for e in els)   # title still present at warn
 
+def test_icon_present_drops_time_element():
+    # The icon is 16x16 at (0,0) -- it sits directly on top of the `time`
+    # element (start-time text at TIME_X=2/TIME_Y=5), so `time` must be
+    # excluded whenever the icon shows, in both the warn (icon still
+    # ICON_EVENT, title present) and imminent (icon ICON_REMINDER, title
+    # dropped) sub-stages. cd_text (x=39) already clears the icon and
+    # stays present as the sole countdown readout.
+    warn_ev = _ev(NOW2 + timedelta(minutes=4))   # 4m out -> warn, > imminent
+    els = build_elements(warn_ev, NOW2, _cfg(), 15, in_progress=False)
+    assert not any(e["id"] == "time" for e in els)
+    assert any(e["id"] == CAL_ICON_ID for e in els)
+    assert any(e["id"] == "cd_text" for e in els)
+
+    imminent_ev = _ev(NOW2 + timedelta(seconds=30))  # 0.5m out -> imminent
+    els = build_elements(imminent_ev, NOW2, _cfg(), 15, in_progress=False)
+    assert not any(e["id"] == "time" for e in els)
+    assert any(e["id"] == CAL_ICON_ID for e in els)
+    assert any(e["id"] == "cd_text" for e in els)
+
 def test_imminent_stage_uses_reminder_icon_and_drops_title():
     ev = _ev(NOW2 + timedelta(seconds=30))  # 0.5m out -> imminent
     els = build_elements(ev, NOW2, _cfg(), 15, in_progress=False)

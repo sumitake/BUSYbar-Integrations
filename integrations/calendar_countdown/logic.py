@@ -639,7 +639,10 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
 
     `cfg` is the `[calendar_countdown]` config sub-dict (needs
     progress_window_minutes, notice_minutes, warn_minutes, and, for the v1.6
-    stock-animation accents, escalation_icons/start_animation). `in_progress`
+    stock-animation accents, escalation_icons/start_animation/
+    imminent_minutes -- the icon block reads cfg["imminent_minutes"]
+    directly, so it's a hard requirement whenever escalation_icons is on).
+    `in_progress`
     selects between the "upcoming" layout (countdown to event.start, a
     large start-time numeral) and the "in-progress" layout (countdown to
     event.end, an "ENDS" label, full-width non-draining track fill). No
@@ -710,7 +713,12 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
     # the reminder icon once inside imminent_minutes. At imminent, the
     # title is dropped entirely (icon + big countdown number only); before
     # that, the title just shifts right of the icon (ICON_TITLE_X) with a
-    # narrowed width so it still scrolls in the remaining gap.
+    # narrowed width so it still scrolls in the remaining gap. The `time`
+    # element (start-time text at TIME_X=2/TIME_Y=5) is ALSO dropped
+    # whenever the icon is present -- see the `elif icon_element is None`
+    # branch below -- since it sits under the icon's 16x16 footprint and
+    # would otherwise have its leading digits occluded; this applies to
+    # both the warn and imminent sub-stages, not just imminent.
     icon_element = None
     if not in_progress and cfg.get("escalation_icons") and state == STATE_WARNING:
         imminent = minutes_left <= cfg["imminent_minutes"]
@@ -774,7 +782,13 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
             "y": ENDS_Y,
             "timeout": timeout_s,
         })
-    else:
+    elif icon_element is None:
+        # `time` sits at TIME_X=2, TIME_Y=5 (ink rows 7-15), which overlaps
+        # the escalation icon's 16x16 footprint (x=0..15, y=0..15) -- drop
+        # it whenever the icon is present (both the warn and imminent
+        # sub-stages) rather than let the icon occlude its leading digits.
+        # `cd_text` at CD_TEXT_X=39 already clears the icon and remains the
+        # sole "how much time" readout in that case.
         elements.append({
             "id": "time",
             "type": "text",
