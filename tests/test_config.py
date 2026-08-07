@@ -112,3 +112,8 @@ def test_device_kwargs_no_warnings_when_all_keys_known(caplog):
     caplog.set_level(logging.WARNING, logger="busybar.config")
     device_kwargs({"device": dict(DEFAULTS["device"])})
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_nyan_filler_defaults():
+    cfg = load_config(path=None)["nyan_filler"]
+    assert cfg == {"enabled": True, "poll_seconds": 1, "quiet_hours": "00:00-07:00"}
