@@ -121,3 +121,12 @@ def test_nyan_filler_defaults(tmp_path):
     # operator adds a [nyan_filler] section there.
     cfg = load_config(tmp_path / "missing.toml")["nyan_filler"]
     assert cfg == {"enabled": True, "poll_seconds": 1, "quiet_hours": "00:00-07:00"}
+
+
+def test_animation_accent_defaults(tmp_path):
+    cfg = load_config(tmp_path / "missing.toml")
+    cal = cfg["calendar_countdown"]
+    assert cal["escalation_icons"] is True
+    assert cal["start_animation"] == "meeting_72x16"
+    assert cal["start_window_seconds"] == 60
+    assert cfg["ci_status"]["running_spinner"] is True

@@ -48,6 +48,12 @@ DEFAULTS: dict = {
         "imminent_minutes": 1,    # <= this (and not in_progress): LED blinks on every draw
         "chirp": True,            # one-time audio chirp exactly at event start (T-0);
                                   # set false to disable audio entirely
+        # Stock-animation accents (2026-08-06). Icons/animation are device
+        # stock, referenced by stock_path -- no assets bundled.
+        "escalation_icons": True,       # animated calendar icons at warn (5m) / imminent (1m)
+        "start_animation": "meeting_72x16",  # full-panel takeover for the first minute after
+                                             # start (aligned with the T-0 chirp); "" disables
+        "start_window_seconds": 60,     # how long the start takeover holds (also its urgent-priority window)
     },
     "ci_status": {
         "poll_seconds": 120,
@@ -71,6 +77,7 @@ DEFAULTS: dict = {
         # Alert snooze via the device's native start button (v1.5.2) -- see
         # ci_status/README.md's "Snoozing alerts" section. 0 disables.
         "snooze_minutes": 30,
+        "running_spinner": True,        # animated 8x8 spinner on the running badge
     },
     "nyan_filler": {
         "enabled": True,

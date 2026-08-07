@@ -18,7 +18,14 @@ CFG = {"calendar_countdown": {"poll_seconds": 60, "lookahead_hours": 12,
                               "auto_busy": False, "calendars": [],
                               # v1.5.2 escalation ladder + chirp
                               "approach_minutes": 30, "imminent_minutes": 1,
-                              "chirp": True}}
+                              "chirp": True,
+                              # v1.6 stock-animation accents: run_once reads
+                              # these unconditionally (is_just_started), so
+                              # every fixture using CFG needs them present --
+                              # same defaults as busybar.config.DEFAULTS and
+                              # test_calendar_logic.py's own cfg.
+                              "start_animation": "meeting_72x16",
+                              "start_window_seconds": 60}}
 
 
 def make_event(offset_min: int, dur_min: int = 30, title: str = "Standup") -> CalEvent:
@@ -87,7 +94,11 @@ def test_no_clear_on_first_draw_with_fresh_state():
     state = {}
     run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
     client.clear.assert_not_called()
-    assert state["in_progress"] is False
+    # v1.6: state["in_progress"] was replaced by the unified shape tracker
+    # (state["last_shape"]) -- see main.run_once's docstring. The upcoming
+    # layout's id set (no icon: CFG has no "escalation_icons" key).
+    assert state["last_shape"] == frozenset(
+        {"bg", "title", "track", "track_fill", "time", "divider", "cd_text"})
 
 def test_no_clear_across_polls_with_same_state():
     client = Mock()
@@ -105,7 +116,9 @@ def test_clears_on_upcoming_to_in_progress_transition():
     active = make_event(-5, dur_min=30, title="Active")
     run_once(client, lambda hours: [active], CFG, NOW, dry_run=False, state=state)
     client.clear.assert_called_once_with("calendar_countdown")
-    assert state["in_progress"] is True
+    # v1.6: the in-progress layout's id set ("ends" instead of "time").
+    assert state["last_shape"] == frozenset(
+        {"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"})
 
 def test_clears_on_in_progress_to_upcoming_transition():
     client = Mock()
@@ -135,15 +148,17 @@ def test_failed_draw_leaves_state_unchanged_and_retries_next_poll():
     client = Mock()
     client.draw.return_value = DrawResult.DRAWN
     state = {}
+    upcoming_shape = frozenset({"bg", "title", "track", "track_fill", "time", "divider", "cd_text"})
+    in_progress_shape = frozenset({"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"})
     run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
-    assert state["in_progress"] is False
+    assert state["last_shape"] == upcoming_shape
 
     active = make_event(-5, dur_min=30, title="Active")
     fetch = lambda hours: [active]
 
     client.draw.return_value = DrawResult.UNREACHABLE
     run_once(client, fetch, CFG, NOW, dry_run=False, state=state)
-    assert state["in_progress"] is False   # unchanged: draw never landed
+    assert state["last_shape"] == upcoming_shape   # unchanged: draw never landed
     assert client.clear.call_count == 1    # transition was still detected and clear attempted
     assert client.draw.call_count == 2
 
@@ -153,7 +168,7 @@ def test_failed_draw_leaves_state_unchanged_and_retries_next_poll():
     run_once(client, fetch, CFG, NOW, dry_run=False, state=state)
     assert client.clear.call_count == 2
     assert client.draw.call_count == 3
-    assert state["in_progress"] is True
+    assert state["last_shape"] == in_progress_shape
 
 def test_clear_failure_does_not_block_state_commit_when_draw_succeeds():
     # (b) clear()'s own return value is intentionally ignored -- only
@@ -171,7 +186,8 @@ def test_clear_failure_does_not_block_state_commit_when_draw_succeeds():
     active = make_event(-5, dur_min=30, title="Active")
     run_once(client, lambda hours: [active], CFG, NOW, dry_run=False, state=state)
     client.clear.assert_called_once_with("calendar_countdown")
-    assert state["in_progress"] is True
+    assert state["last_shape"] == frozenset(
+        {"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"})
 
 def test_state_reset_after_no_event_clear():
     client = Mock()
@@ -179,7 +195,7 @@ def test_state_reset_after_no_event_clear():
     state = {}
     run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
     run_once(client, lambda hours: [], CFG, NOW, dry_run=False, state=state)  # clears, resets state
-    assert state["in_progress"] is None
+    assert state["last_shape"] is None
     client.clear.reset_mock()
     run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
     # No stale elements remain after the "no event" clear -- no extra clear needed.
@@ -462,3 +478,151 @@ def test_run_once_next_start_none_when_no_event():
     state: dict = {}
     run_once(client, lambda hours: [], CFG, NOW, dry_run=False, state=state)
     assert state["next_start"] is None
+
+
+# --- v1.6 stock-animation accents: just_started takeover + shape-tracker clear ---
+#
+# NOTE: this block's own `NOW` fixture is named `TAKEOVER_NOW`, not `NOW` --
+# the module already defines `NOW` above (2026-08-03 13:37 UTC, read by
+# every earlier test via make_event/CFG at call time), so reusing that name
+# here would silently reassign it at import time and change every earlier
+# test's clock.
+
+from busybar.client import DrawResult
+from busybar.display import PRIORITY_AMBIENT_URGENT
+from integrations.calendar_countdown.main import run_once
+from integrations.calendar_countdown.logic import CalEvent, START_ANIM_ID
+
+class FakeClient:
+    def __init__(self): self.draws=[]; self.clears=0
+    def draw(self, app, elements, priority=50, led_notification_color=None):
+        self.draws.append((elements, priority)); return DrawResult.DRAWN
+    def clear(self, app): self.clears += 1; return True
+    def get_busy(self): return {}
+    def play_audio(self, *a, **k): return True
+    def set_busy_simple(self, *a, **k): return True
+
+TAKEOVER_NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+def _cfg(**o):
+    b={"poll_seconds":10,"lookahead_hours":12,"warn_minutes":5,"notice_minutes":15,
+       "approach_minutes":30,"imminent_minutes":1,"progress_window_minutes":60,"include_all_day":False,
+       "auto_busy":False,"calendars":[],"chirp":False,"escalation_icons":True,
+       "start_animation":"meeting_72x16","start_window_seconds":60}
+    b.update(o); return {"calendar_countdown": b}
+def _fetch(ev):  # fetch(lookahead) -> [ev]
+    return lambda hours: [ev]
+
+def test_just_started_draws_takeover_at_urgent():
+    ev = CalEvent("Standup", TAKEOVER_NOW - timedelta(seconds=15), TAKEOVER_NOW + timedelta(minutes=29), False)
+    c = FakeClient(); st = {}
+    run_once(c, _fetch(ev), _cfg(), TAKEOVER_NOW, dry_run=False, state=st)
+    elements, priority = c.draws[-1]
+    assert priority == PRIORITY_AMBIENT_URGENT
+    assert any(e["id"] == START_ANIM_ID for e in elements)
+
+def test_shape_change_triggers_clear():
+    # First poll: warn stage (icon+title). Second poll: takeover (different id-set) -> clear.
+    ev = CalEvent("Standup", TAKEOVER_NOW + timedelta(minutes=4), TAKEOVER_NOW + timedelta(minutes=34), False)
+    c = FakeClient(); st = {}
+    run_once(c, _fetch(ev), _cfg(), TAKEOVER_NOW, dry_run=False, state=st)            # warn
+    ev2 = CalEvent("Standup", TAKEOVER_NOW - timedelta(seconds=10), TAKEOVER_NOW + timedelta(minutes=29), False)
+    run_once(c, _fetch(ev2), _cfg(), TAKEOVER_NOW, dry_run=False, state=st)          # takeover
+    assert c.clears >= 1   # id-set changed -> cleared before the takeover draw
+
+
+# --- v1.6.1 start-takeover graceful degradation on a bad start_animation ---------
+#
+# A mistyped start_animation names a stock animation the device doesn't have,
+# so the live device rejects the full-panel takeover draw with
+# DrawResult.ERROR every poll. Without the fallback in main.run_once, `state`
+# never commits and the panel stays DARK for the whole start_window_seconds
+# (the takeover is the ONLY thing on screen). The fallback redraws the normal
+# in-progress "ENDS" layout for that poll instead. These tests drive a
+# FakeClient that returns a chosen DrawResult for the takeover draw (the one
+# carrying START_ANIM_ID) and DRAWN for everything else.
+
+IN_PROGRESS_SHAPE = frozenset({"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"})
+
+
+class ResultFakeClient:
+    def __init__(self, takeover_result):
+        self.takeover_result = takeover_result
+        self.draws = []; self.clears = 0
+    def draw(self, app, elements, priority=50, led_notification_color=None):
+        self.draws.append((elements, priority))
+        if any(e["id"] == START_ANIM_ID for e in elements):
+            return self.takeover_result
+        return DrawResult.DRAWN
+    def clear(self, app): self.clears += 1; return True
+    def get_busy(self): return {}
+    def play_audio(self, *a, **k): return True
+    def set_busy_simple(self, *a, **k): return True
+
+
+def _just_started_event():
+    # In-progress and within start_window_seconds (60) -> just_started True.
+    return CalEvent("Standup", TAKEOVER_NOW - timedelta(seconds=15),
+                    TAKEOVER_NOW + timedelta(minutes=29), False)
+
+
+def test_start_takeover_error_falls_back_to_in_progress():
+    c = ResultFakeClient(DrawResult.ERROR); st = {}
+    summary = run_once(c, _fetch(_just_started_event()), _cfg(), TAKEOVER_NOW,
+                       dry_run=False, state=st)
+    # Exactly two draws: the failed takeover, then the in-progress fallback.
+    assert len(c.draws) == 2
+    takeover_elements, takeover_priority = c.draws[0]
+    assert takeover_priority == PRIORITY_AMBIENT_URGENT
+    assert any(e["id"] == START_ANIM_ID for e in takeover_elements)
+    fallback_elements, fallback_priority = c.draws[1]
+    assert fallback_priority == PRIORITY_AMBIENT     # in-progress baseline, not urgent
+    fb_ids = frozenset(e["id"] for e in fallback_elements)
+    assert START_ANIM_ID not in fb_ids
+    assert fb_ids == IN_PROGRESS_SHAPE
+    # Fallback landed (DRAWN) -> state commits the in-progress shape, so the
+    # window-exit poll sees no shape change and doesn't re-clear.
+    assert st["last_shape"] == IN_PROGRESS_SHAPE
+    assert "fallback" in summary and summary.endswith("drawn")
+
+
+def test_start_takeover_rejected_does_not_fall_back():
+    # REJECTED (a strictly-higher-priority app owns the screen) must NOT
+    # trigger the fallback: the in-progress layout draws at a LOWER priority
+    # and would be rejected too -- a pointless second draw. Only ERROR falls
+    # back.
+    c = ResultFakeClient(DrawResult.REJECTED); st = {}
+    summary = run_once(c, _fetch(_just_started_event()), _cfg(), TAKEOVER_NOW,
+                       dry_run=False, state=st)
+    assert len(c.draws) == 1                         # takeover only, no fallback draw
+    assert any(e["id"] == START_ANIM_ID for e in c.draws[0][0])
+    assert st.get("last_shape") is None              # not DRAWN -> not committed, retries next poll
+    assert summary.endswith("rejected")
+
+
+def test_start_takeover_unreachable_does_not_fall_back():
+    # UNREACHABLE (device down) is handled by main()'s backoff loop, not by a
+    # second (equally-unreachable) draw.
+    c = ResultFakeClient(DrawResult.UNREACHABLE); st = {}
+    summary = run_once(c, _fetch(_just_started_event()), _cfg(), TAKEOVER_NOW,
+                       dry_run=False, state=st)
+    assert len(c.draws) == 1
+    assert st.get("last_shape") is None
+    assert summary.endswith("unreachable")
+
+
+def test_start_takeover_fallback_is_per_poll_not_latched():
+    # Not latched: once the operator fixes the config value (or the stock
+    # animation later appears), the very next poll draws the takeover again
+    # with no restart -- matching the module's retry-not-assume discipline.
+    c = ResultFakeClient(DrawResult.ERROR); st = {}
+    run_once(c, _fetch(_just_started_event()), _cfg(), TAKEOVER_NOW,
+             dry_run=False, state=st)                # poll 1: falls back
+    assert st["last_shape"] == IN_PROGRESS_SHAPE
+
+    c.takeover_result = DrawResult.DRAWN             # animation now drawable
+    c.draws.clear()
+    later = TAKEOVER_NOW + timedelta(seconds=10)     # still inside the 60s window
+    run_once(c, _fetch(_just_started_event()), _cfg(), later, dry_run=False, state=st)
+    assert len(c.draws) == 1                         # takeover, drawn straight away
+    assert any(e["id"] == START_ANIM_ID for e in c.draws[0][0])
+    assert st["last_shape"] == frozenset({"bg", START_ANIM_ID})

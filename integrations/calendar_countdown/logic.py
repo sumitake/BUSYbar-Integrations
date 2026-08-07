@@ -175,6 +175,23 @@ SMALL_FONT_CHAR_PX = 5
 SCROLL_RATE = 2000
 SCROLL_DELAY_MS = 800
 
+# --- v1.6 stock-animation accents: escalation icons + start-takeover -------
+#
+# ICON_EVENT/ICON_REMINDER are 16x16 stock animations drawn at the panel's
+# top-left corner (ICON_X/ICON_Y) during the upcoming path's WARNING state
+# (see build_elements): ICON_EVENT while still outside imminent_minutes,
+# ICON_REMINDER once inside it (title dropped at that point -- see
+# ICON_TITLE_X below). START_ANIM_ID/CAL_ICON_ID are the element ids these
+# accents draw under; ICON_TITLE_X is where the title shifts to when an
+# icon is present but the title is still shown (leaving x=0..15 clear for
+# the 16x16 icon).
+ICON_EVENT = "calendar_event_16x16"
+ICON_REMINDER = "calendar_reminder_16x16"
+ICON_X, ICON_Y = 0, 0
+ICON_TITLE_X = 18          # title shifts right of the 16x16 icon (icon occupies x=0..15)
+CAL_ICON_ID = "cal_icon"
+START_ANIM_ID = "cal_start_anim"
+
 
 @dataclass
 class CalEvent:
@@ -404,8 +421,18 @@ def check_threshold_ordering(cfg: dict) -> str | None:
     return None
 
 
+def is_just_started(event: CalEvent, now: datetime, in_progress: bool,
+                    start_window_seconds: int, start_animation: str) -> bool:
+    """True for the first `start_window_seconds` after an event begins, when a
+    start-takeover animation is configured. The window aligns with the T-0
+    chirp and holds the display at urgent priority as a 'running late' alarm."""
+    if not in_progress or not start_animation:
+        return False
+    return (now - event.start).total_seconds() < start_window_seconds
+
+
 def select_priority(minutes_left: float, approach_minutes: int, notice_minutes: int,
-                    in_progress: bool) -> int:
+                    in_progress: bool, just_started: bool = False) -> int:
     """The draw priority for this poll (v1.5.2 escalation ladder) --
     deliberately a SEPARATE ladder from `_state_for`'s visual-palette
     selection, not a 1:1 mapping of it: the "approach" window changes
@@ -415,8 +442,12 @@ def select_priority(minutes_left: float, approach_minutes: int, notice_minutes: 
     persistent alert -- the whole point of this tier) even though they're
     visually distinct.
 
-    - in_progress: PRIORITY_AMBIENT (20) -- see the module-level comment
-      above for why elevation doesn't apply here.
+    - just_started (v1.6): PRIORITY_AMBIENT_URGENT (65), checked first --
+      the start-takeover window (see is_just_started) is itself a "running
+      late" alarm and must be able to preempt a persistent alert exactly
+      like the NOTICE/WARNING tiers below do.
+    - in_progress (and not just_started): PRIORITY_AMBIENT (20) -- see the
+      module-level comment above for why elevation doesn't apply here.
     - <= notice_minutes (covers both NOTICE and WARNING visually):
       PRIORITY_AMBIENT_URGENT (65) -- strictly above PRIORITY_ALERT, so a
       persistent CI failure/stuck alert no longer permanently buries an
@@ -428,6 +459,8 @@ def select_priority(minutes_left: float, approach_minutes: int, notice_minutes: 
       -- a genuine alert still wins over a merely-approaching event.
     - otherwise (normal, > approach_minutes): PRIORITY_AMBIENT (20).
     """
+    if just_started:
+        return PRIORITY_AMBIENT_URGENT
     if in_progress:
         return PRIORITY_AMBIENT
     if minutes_left <= notice_minutes:
@@ -601,11 +634,15 @@ def _format_countdown(minutes_left: float) -> str:
 
 
 def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
-                   in_progress: bool) -> list[dict]:
+                   in_progress: bool, just_started: bool = False) -> list[dict]:
     """Build the v1.4 "airy" Color Horizon layout.
 
     `cfg` is the `[calendar_countdown]` config sub-dict (needs
-    progress_window_minutes, notice_minutes, warn_minutes). `in_progress`
+    progress_window_minutes, notice_minutes, warn_minutes, and, for the v1.6
+    stock-animation accents, escalation_icons/start_animation/
+    imminent_minutes -- the icon block reads cfg["imminent_minutes"]
+    directly, so it's a hard requirement whenever escalation_icons is on).
+    `in_progress`
     selects between the "upcoming" layout (countdown to event.start, a
     large start-time numeral) and the "in-progress" layout (countdown to
     event.end, an "ENDS" label, full-width non-draining track fill). No
@@ -615,7 +652,21 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
     from `minutes_left` each poll -- not the native `countdown` element (see
     the CD_TEXT_X comment above for why). Draw order below is z-order,
     first = behind.
+
+    `just_started` (v1.6, default False) short-circuits everything above: a
+    full-panel takeover animation (see is_just_started) replaces the normal
+    layout entirely for the start-takeover window, so it's checked first and
+    returns before any of the upcoming/in-progress element-building below.
     """
+    if just_started:
+        bg = {"id": "bg", "type": "rectangle", "x": 0, "y": 0,
+              "width": PANEL_WIDTH, "height": PANEL_HEIGHT, "fill": "gradient_v",
+              "fill_colors": BG_GRADIENT[STATE_IN_PROGRESS], "border_width": 0, "timeout": timeout_s}
+        anim = {"id": START_ANIM_ID, "type": "animation",
+                "stock_path": f"shared/{cfg['start_animation']}.anim",
+                "x": 0, "y": 0, "loop": True, "timeout": timeout_s}
+        return [bg, anim]
+
     # Uppercase kills descenders (g, y, p, ...), which is what let the title
     # collide with the track below it before the ink-offset fix -- see the
     # geometry comment above TITLE_Y.
@@ -656,6 +707,49 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
             "scroll_repeat_delay": SCROLL_DELAY_MS,
         })
 
+    # v1.6 escalation icons: a 16x16 stock animation in the WARNING state
+    # (upcoming path only -- in_progress never reaches this state visually
+    # the same way, see _state_for), swapping from the plain event icon to
+    # the reminder icon once inside imminent_minutes. At imminent, the
+    # title is dropped entirely (icon + big countdown number only); before
+    # that, the title just shifts right of the icon (ICON_TITLE_X) with a
+    # narrowed width so it still scrolls in the remaining gap. The `time`
+    # element (start-time text at TIME_X=2/TIME_Y=5) is ALSO dropped
+    # whenever the icon is present -- see the `elif icon_element is None`
+    # branch below -- since it sits under the icon's 16x16 footprint and
+    # would otherwise have its leading digits occluded; this applies to
+    # both the warn and imminent sub-stages, not just imminent.
+    icon_element = None
+    if not in_progress and cfg.get("escalation_icons") and state == STATE_WARNING:
+        imminent = minutes_left <= cfg["imminent_minutes"]
+        icon_name = ICON_REMINDER if imminent else ICON_EVENT
+        icon_element = {"id": CAL_ICON_ID, "type": "animation",
+                        "stock_path": f"shared/{icon_name}.anim",
+                        "x": ICON_X, "y": ICON_Y, "loop": True, "timeout": timeout_s}
+        if imminent:
+            title_element = None          # drop the title at imminent -> icon + big number
+        else:
+            narrowed_width = CD_TEXT_X - ICON_TITLE_X - 2   # scroll in the gap
+            title_element.update({"x": ICON_TITLE_X, "width": narrowed_width})
+            # The scroll decision above was made against the full
+            # TITLE_WIDTH (68px); the icon block just narrowed the title to
+            # `narrowed_width` (19px), so it must be RE-decided against the
+            # narrowed width here -- a title that fits at 68px commonly does
+            # NOT fit at 19px (e.g. "Standup", "Meeting", "Lunch"), and
+            # without this recompute it would keep the no-scroll flags from
+            # the 68px check and clip statically instead of scrolling in the
+            # gap the comment above promises.
+            if not _title_fits(title, narrowed_width):
+                title_element.update({
+                    "scroll_rate": SCROLL_RATE,
+                    "scroll_start_delay": SCROLL_DELAY_MS,
+                    "scroll_repeat_delay": SCROLL_DELAY_MS,
+                })
+            else:
+                title_element.pop("scroll_rate", None)
+                title_element.pop("scroll_start_delay", None)
+                title_element.pop("scroll_repeat_delay", None)
+
     track_element = {
         "id": "track",
         "type": "rectangle",
@@ -689,7 +783,11 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
         **track_fill,
     }
 
-    elements = [bg_element, title_element, track_element, track_fill_element]
+    elements = [bg_element]
+    if title_element is not None:
+        elements.append(title_element)
+    elements.append(track_element)
+    elements.append(track_fill_element)
 
     if in_progress:
         elements.append({
@@ -702,7 +800,13 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
             "y": ENDS_Y,
             "timeout": timeout_s,
         })
-    else:
+    elif icon_element is None:
+        # `time` sits at TIME_X=2, TIME_Y=5 (ink rows 7-15), which overlaps
+        # the escalation icon's 16x16 footprint (x=0..15, y=0..15) -- drop
+        # it whenever the icon is present (both the warn and imminent
+        # sub-stages) rather than let the icon occlude its leading digits.
+        # `cd_text` at CD_TEXT_X=39 already clears the icon and remains the
+        # sole "how much time" readout in that case.
         elements.append({
             "id": "time",
             "type": "text",
@@ -714,18 +818,25 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
             "timeout": timeout_s,
         })
 
-    elements.append({
-        "id": "divider",
-        "type": "rectangle",
-        "x": DIVIDER_X,
-        "y": DIVIDER_Y,
-        "width": DIVIDER_WIDTH,
-        "height": DIVIDER_HEIGHT,
-        "fill": "solid",
-        "fill_colors": [DIVIDER_COLOR[state]],
-        "border_width": 0,
-        "timeout": timeout_s,
-    })
+    if icon_element is None:
+        # The divider's left neighbor is `time`, which is already dropped
+        # whenever the escalation icon is present (both the warn and
+        # imminent sub-stages, see the `elif icon_element is None` branch
+        # above) -- with `time` gone and `title` narrowed away from it too,
+        # the divider would be orphaned floating alone. Drop it under the
+        # same condition rather than let it draw disconnected from anything.
+        elements.append({
+            "id": "divider",
+            "type": "rectangle",
+            "x": DIVIDER_X,
+            "y": DIVIDER_Y,
+            "width": DIVIDER_WIDTH,
+            "height": DIVIDER_HEIGHT,
+            "fill": "solid",
+            "fill_colors": [DIVIDER_COLOR[state]],
+            "border_width": 0,
+            "timeout": timeout_s,
+        })
 
     elements.append({
         "id": "cd_text",
@@ -737,5 +848,8 @@ def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
         "y": CD_TEXT_Y,
         "timeout": timeout_s,
     })
+
+    if icon_element is not None:
+        elements.append(icon_element)
 
     return elements
