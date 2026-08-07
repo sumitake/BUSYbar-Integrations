@@ -186,6 +186,46 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
             client.clear(APP)
 
     result = client.draw(APP, elements=elements, priority=priority, led_notification_color=led)
+
+    # v1.6.1 start-takeover graceful degradation: the just_started takeover
+    # is a FULL-PANEL swap -- its only two elements are `bg` + the stock
+    # animation named by start_animation (see build_elements). If that name
+    # doesn't match a stock animation on the device (an operator typo; the
+    # default meeting_72x16 is valid), the live device rejects the draw with
+    # DrawResult.ERROR every poll, `state` never commits, and run_once
+    # re-clears + re-fails each poll -- leaving the panel DARK for the whole
+    # start_window_seconds (~60s) instead of showing anything. Nothing else
+    # is on screen to mask it, because the takeover IS the whole screen.
+    #
+    # Fall back to the normal in-progress ("ENDS") layout for THIS poll so a
+    # mistyped start_animation degrades to a live countdown rather than a
+    # blank panel. Only ERROR triggers this, deliberately:
+    #   - REJECTED means a strictly-higher-priority app already owns the
+    #     screen; the in-progress layout draws at a LOWER priority
+    #     (PRIORITY_AMBIENT vs the takeover's PRIORITY_AMBIENT_URGENT) and
+    #     would be rejected too -- a pointless second draw.
+    #   - UNREACHABLE means the device is down; the loop's backoff (main())
+    #     handles that, and a retry would just be unreachable again.
+    # Per-poll, not latched: if the operator fixes the config value or the
+    # stock animation later appears, the very next poll's takeover draw
+    # succeeds with no restart -- the same retry-not-assume discipline the
+    # led_on/chirp commits follow (commit only on confirmed success). No
+    # extra clear() is needed before the fallback draw: the failed takeover
+    # draw landed nothing, and the shape-tracker clear above already fired
+    # for any real id-set change (last_shape is never the takeover shape,
+    # since a takeover ERROR never commits it), so the device is already
+    # blank whenever it mattered -- see this function's docstring on the
+    # upsert-by-id model and why only draw() gates the state commit.
+    if just_started and result == DrawResult.ERROR:
+        log.warning("start-takeover animation %r not drawable; falling back to "
+                    "in-progress layout for this poll", c["start_animation"])
+        elements = build_elements(event, now, c, timeout_s, in_progress, just_started=False)
+        priority = select_priority(minutes_left, c["approach_minutes"], c["notice_minutes"],
+                                   in_progress, just_started=False)
+        new_shape = frozenset(e["id"] for e in elements)
+        result = client.draw(APP, elements=elements, priority=priority, led_notification_color=led)
+        label = f"{label} [start-anim fallback]"
+
     if state is not None and result == DrawResult.DRAWN:
         # Only commit the transition once it actually lands on the device.
         # If draw() failed (UNREACHABLE/REJECTED/ERROR), leave `state`

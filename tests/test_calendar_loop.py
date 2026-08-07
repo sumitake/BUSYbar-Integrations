@@ -528,3 +528,101 @@ def test_shape_change_triggers_clear():
     ev2 = CalEvent("Standup", TAKEOVER_NOW - timedelta(seconds=10), TAKEOVER_NOW + timedelta(minutes=29), False)
     run_once(c, _fetch(ev2), _cfg(), TAKEOVER_NOW, dry_run=False, state=st)          # takeover
     assert c.clears >= 1   # id-set changed -> cleared before the takeover draw
+
+
+# --- v1.6.1 start-takeover graceful degradation on a bad start_animation ---------
+#
+# A mistyped start_animation names a stock animation the device doesn't have,
+# so the live device rejects the full-panel takeover draw with
+# DrawResult.ERROR every poll. Without the fallback in main.run_once, `state`
+# never commits and the panel stays DARK for the whole start_window_seconds
+# (the takeover is the ONLY thing on screen). The fallback redraws the normal
+# in-progress "ENDS" layout for that poll instead. These tests drive a
+# FakeClient that returns a chosen DrawResult for the takeover draw (the one
+# carrying START_ANIM_ID) and DRAWN for everything else.
+
+IN_PROGRESS_SHAPE = frozenset({"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"})
+
+
+class ResultFakeClient:
+    def __init__(self, takeover_result):
+        self.takeover_result = takeover_result
+        self.draws = []; self.clears = 0
+    def draw(self, app, elements, priority=50, led_notification_color=None):
+        self.draws.append((elements, priority))
+        if any(e["id"] == START_ANIM_ID for e in elements):
+            return self.takeover_result
+        return DrawResult.DRAWN
+    def clear(self, app): self.clears += 1; return True
+    def get_busy(self): return {}
+    def play_audio(self, *a, **k): return True
+    def set_busy_simple(self, *a, **k): return True
+
+
+def _just_started_event():
+    # In-progress and within start_window_seconds (60) -> just_started True.
+    return CalEvent("Standup", TAKEOVER_NOW - timedelta(seconds=15),
+                    TAKEOVER_NOW + timedelta(minutes=29), False)
+
+
+def test_start_takeover_error_falls_back_to_in_progress():
+    c = ResultFakeClient(DrawResult.ERROR); st = {}
+    summary = run_once(c, _fetch(_just_started_event()), _cfg(), TAKEOVER_NOW,
+                       dry_run=False, state=st)
+    # Exactly two draws: the failed takeover, then the in-progress fallback.
+    assert len(c.draws) == 2
+    takeover_elements, takeover_priority = c.draws[0]
+    assert takeover_priority == PRIORITY_AMBIENT_URGENT
+    assert any(e["id"] == START_ANIM_ID for e in takeover_elements)
+    fallback_elements, fallback_priority = c.draws[1]
+    assert fallback_priority == PRIORITY_AMBIENT     # in-progress baseline, not urgent
+    fb_ids = frozenset(e["id"] for e in fallback_elements)
+    assert START_ANIM_ID not in fb_ids
+    assert fb_ids == IN_PROGRESS_SHAPE
+    # Fallback landed (DRAWN) -> state commits the in-progress shape, so the
+    # window-exit poll sees no shape change and doesn't re-clear.
+    assert st["last_shape"] == IN_PROGRESS_SHAPE
+    assert "fallback" in summary and summary.endswith("drawn")
+
+
+def test_start_takeover_rejected_does_not_fall_back():
+    # REJECTED (a strictly-higher-priority app owns the screen) must NOT
+    # trigger the fallback: the in-progress layout draws at a LOWER priority
+    # and would be rejected too -- a pointless second draw. Only ERROR falls
+    # back.
+    c = ResultFakeClient(DrawResult.REJECTED); st = {}
+    summary = run_once(c, _fetch(_just_started_event()), _cfg(), TAKEOVER_NOW,
+                       dry_run=False, state=st)
+    assert len(c.draws) == 1                         # takeover only, no fallback draw
+    assert any(e["id"] == START_ANIM_ID for e in c.draws[0][0])
+    assert st.get("last_shape") is None              # not DRAWN -> not committed, retries next poll
+    assert summary.endswith("rejected")
+
+
+def test_start_takeover_unreachable_does_not_fall_back():
+    # UNREACHABLE (device down) is handled by main()'s backoff loop, not by a
+    # second (equally-unreachable) draw.
+    c = ResultFakeClient(DrawResult.UNREACHABLE); st = {}
+    summary = run_once(c, _fetch(_just_started_event()), _cfg(), TAKEOVER_NOW,
+                       dry_run=False, state=st)
+    assert len(c.draws) == 1
+    assert st.get("last_shape") is None
+    assert summary.endswith("unreachable")
+
+
+def test_start_takeover_fallback_is_per_poll_not_latched():
+    # Not latched: once the operator fixes the config value (or the stock
+    # animation later appears), the very next poll draws the takeover again
+    # with no restart -- matching the module's retry-not-assume discipline.
+    c = ResultFakeClient(DrawResult.ERROR); st = {}
+    run_once(c, _fetch(_just_started_event()), _cfg(), TAKEOVER_NOW,
+             dry_run=False, state=st)                # poll 1: falls back
+    assert st["last_shape"] == IN_PROGRESS_SHAPE
+
+    c.takeover_result = DrawResult.DRAWN             # animation now drawable
+    c.draws.clear()
+    later = TAKEOVER_NOW + timedelta(seconds=10)     # still inside the 60s window
+    run_once(c, _fetch(_just_started_event()), _cfg(), later, dry_run=False, state=st)
+    assert len(c.draws) == 1                         # takeover, drawn straight away
+    assert any(e["id"] == START_ANIM_ID for e in c.draws[0][0])
+    assert st["last_shape"] == frozenset({"bg", START_ANIM_ID})
