@@ -83,6 +83,7 @@ Once the foreground test completes, your `config.toml` is in place and GitHub au
 | `show_running` | boolean | true | Show the running-CI badge while a run is `in_progress` (across all configured repos; most-recently-started wins, `+N` if others are also running) |
 | `running_poll_seconds` | integer | 20 | Poll interval while a run is active (shortened from `poll_seconds`) |
 | `show_quota` | boolean | true | Join two GitHub API quota frames (GraphQL, REST) to the overlay rotation while a run is active. No effect if `show_running` is false — the quota frames only ever appear as part of that same rotation. |
+| `running_spinner` | boolean | true | Show an animated 8×8 spinner in the top-right corner of the running badge. Reduces the title's available width to prevent overlap. Set false for text-only running badge. No effect if `show_running` is false. |
 | `watch_account_repos` | boolean | false | Auto-discover and watch every repo you own, in addition to `repos`. See "Account-wide watching" below. |
 | `repos_exclude` | array of strings | `[]` | Repos to never watch, regardless of mode — silences a specific repo without leaving account mode (or, less commonly, without editing `repos`). Applied last, unconditionally; a no-op when empty. |
 | `active_within_days` | integer | 30 | In account mode, only auto-discovered repos pushed within this many days are watched (caps request volume on large accounts). Repos in `repos` are never subject to this filter. |
@@ -171,6 +172,14 @@ per dwell slot (`OVERLAY_DWELL_SECONDS`, 10s), before repeating:
    remaining-time label would be wrong, not just superfluous). Whether it
    fits at all, and which word if so, is a width-based decision (see
    `ci_status/logic.py`'s `_eta_label`); nothing to configure.
+   
+   **When `running_spinner` is true (default)**, an animated 8×8 spinner is
+   displayed in the top-right corner of the badge, indicating work in
+   progress. The spinner uses a device stock animation (`spinner_front_8x8`)
+   and animates continuously throughout the run. The title's available width
+   is automatically reduced from 68 to 60 pixels to prevent overlap with the
+   spinner. Set `running_spinner = false` to disable the spinner and revert
+   to text-only display (title width restored to full 68 pixels).
 2. **GraphQL quota** (`show_quota`): title ribbon `GITHUB GRAPHQL`, a track bar
    showing the fraction of the bucket used, and two numerals — percentage
    *remaining* on the left, reset-in on the right (e.g. `18%` / `42m`).

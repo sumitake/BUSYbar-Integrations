@@ -94,6 +94,9 @@ Verify that the output shows your next upcoming event with the correct countdown
 | `approach_minutes` | integer | 30 | v1.5.2 escalation ladder: inside this window (and outside `notice_minutes`) the draw priority rises above the overlay tier. See "Escalation ladder" below. |
 | `imminent_minutes` | integer | 1 | Inside this window (event not yet started), the LED blinks on every draw. |
 | `chirp` | boolean | true | Play a one-time audio chirp exactly at event start (T-0). Set false to disable audio entirely. |
+| `escalation_icons` | boolean | true | Show animated calendar icons at the warn (5-min, `calendar_event_16x16`) and imminent (1-min, `calendar_reminder_16x16`) stages. Set false for text-only display. |
+| `start_animation` | string | `"meeting_72x16"` | Full-panel stock animation for the first `start_window_seconds` after an event begins. Set to `""` to disable. The animation's baked word (e.g., "MEETING") displays for every event; no per-event-type mapping. |
+| `start_window_seconds` | integer | 60 | Duration the start takeover animation holds after an event begins (and at urgent priority, aligned with the T-0 chirp). |
 
 ## Autostart
 
@@ -184,3 +187,32 @@ Independent of the priority ladder above, two more signals fire during the final
 **Verifying the LED assumption.** To confirm the LED-during-a-session assumption on real hardware: with `notice_minutes`/`warn_minutes`/`imminent_minutes` set low enough to reach the imminent window quickly (or just wait for a real event to approach), start a BUSY/CUSTOM session on the device (the physical start button) while an event is inside its `imminent_minutes` window, and watch the LED. If it keeps blinking through the session, the assumption holds and no further action is needed. If it goes dark once the session starts, the assumption in `busybar/display.py`'s `PRIORITY_AMBIENT_URGENT` docstring is wrong and should be corrected (and the LED can no longer be relied on as a session-safe signal for this or any future integration).
 
 **Once-per-event semantics.** The chirp fires on the transition edge only -- the poll where this *process* observes an event go from upcoming to started -- tracked in memory, keyed by `(start timestamp, title)`, not the start timestamp alone (two distinct events that happen to share the exact same start -- two all-day events both effectively at midnight, or two calendars firing something simultaneously -- are tracked independently, so chirping one never silently marks the other as already handled). It will not repeat on subsequent polls while the same event stays in progress. **Restart edge case**: this tracking is in-memory only, so a process restart during an event's final minute (or any time after it has already started) does not re-fire the chirp for that event -- the new process never observed it as "upcoming," so the edge is never detected. This is a deliberate tradeoff (documented, not a bug): the alternative (chirping on level-detection alone) would risk a spurious chirp on every restart during an active event.
+
+## Animation Accents
+
+This integration uses device stock animations to accent the calendar escalation and event-start moments.
+
+### Pre-Start Icons (Warn and Imminent Stages)
+
+When `escalation_icons` is true (default), animated calendar icons accompany the text-based countdown:
+
+- **Warn stage** (within `warn_minutes` of start, e.g., 5 minutes): a `calendar_event_16x16` icon animates at the top-left corner. The event title shifts rightward to `x=18` and scrolls within the narrowed space; the large countdown numeral remains at its usual position. Palette is red, priority is `PRIORITY_AMBIENT_URGENT` (65).
+- **Imminent stage** (within `imminent_minutes` of start, e.g., 1 minute): the animated icon switches to `calendar_reminder_16x16` (calendar + bell). The event title is dropped to give the icon and countdown full prominence. Palette remains red, priority unchanged (65).
+
+Setting `escalation_icons = false` reverts both stages to text-only display (countdown numeral and title only, no icons).
+
+### Start Takeover (First Minute After Event Begins)
+
+When an event begins and `start_animation` is configured (default `"meeting_72x16"`), the display transitions to a full-panel animated takeover for the first `start_window_seconds` (default 60 seconds):
+
+- **Display**: the entire panel shows the configured stock animation looping continuously (e.g., `meeting_72x16` displays an animated word "MEETING" and occupies ~97% of the 72×16 panel).
+- **Priority**: held at `PRIORITY_AMBIENT_URGENT` (65) for the entire window — matching the T-0 chirp's urgency, ensuring the alarm is not silently buried by other displays.
+- **Timing**: aligned with the audio chirp at T-0 (event start). The animation self-loops between the integration's own redraws (every `poll_seconds`), so motion is smooth across the window.
+- **After the window**: reverts to the normal in-progress "ENDS" display at `PRIORITY_AMBIENT` (20).
+- **Disabled**: set `start_animation = ""` to skip the takeover entirely — in-progress will behave as before, showing the "ENDS" label from T-0 without an animated accent.
+
+**Note on the baked word.** Stock animations carry a fixed visual word (e.g., "MEETING" in the default `meeting_72x16`). This animation displays the same word for every event start, regardless of event title, calendar, or type. No per-event-type mapping or dynamic text insertion is performed — it is a configurable static announcement.
+
+### Stock Animation Paths
+
+All animations are device stock assets referenced by `stock_path` (e.g., `"shared/calendar_event_16x16.anim"`, `"shared/calendar_reminder_16x16.anim"`, `"shared/meeting_72x16.anim"`). No custom animation assets are uploaded or bundled with this integration; the device firmware ships all referenced stock animations at `/ext/apps_assets/shared/animations/`. If you configure a `start_animation` value that is not a device stock animation, the draw will fail gracefully (logged, not a crash) and the event display falls back to the normal text-only in-progress mode.
