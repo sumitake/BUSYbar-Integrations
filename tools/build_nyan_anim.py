@@ -4,7 +4,7 @@ Renderer geometry adapted from the community reference app
 (maxswinkels/busybar-apps, apps/nyan-cat). Deterministic (seeded RNG) so the
 committed asset is reproducible. Build-time only.
 
-    uv run python tools/build_nyan_anim.py
+    uv run python -m tools.build_nyan_anim
 """
 from __future__ import annotations
 

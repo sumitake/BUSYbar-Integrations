@@ -19,6 +19,7 @@ from .logic import (FILLER_APP, ASSET_NAME, build_filler_elements,
                     in_quiet_hours, parse_quiet_hours)
 
 APP = FILLER_APP
+HEARTBEAT_SECONDS = 600
 log = logging.getLogger(APP)
 
 ASSET_PATH = Path(__file__).resolve().parents[2] / "assets" / "nyan" / ASSET_NAME
@@ -52,6 +53,21 @@ def run_once(client, cfg: dict, now: datetime, state: dict, dry_run: bool = Fals
     return f"nyan @ {PRIORITY_FILLER} -> {result.value}"
 
 
+def should_log_info(summary: str, last_logged_summary: str | None,
+                    seconds_since_heartbeat: float,
+                    heartbeat_seconds: int = HEARTBEAT_SECONDS) -> bool:
+    """Log-noise control, mirroring calendar_countdown's should_log_info: at
+    nyan_filler's default poll_seconds=1, logging every summary at INFO
+    would produce ~86,400 near-identical lines/day to an un-rotated log for
+    no new information on most polls (the summary is almost always
+    identical poll to poll). INFO only when the summary actually changed
+    since the last INFO line, or a heartbeat interval has elapsed (so a
+    long unchanging run still leaves a periodic "yes, I'm alive" trail) --
+    DEBUG otherwise.
+    """
+    return summary != last_logged_summary or seconds_since_heartbeat >= heartbeat_seconds
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="BUSY Bar Nyan dark-filler")
     parser.add_argument("--once", action="store_true")
@@ -60,6 +76,19 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cfg = load_config()
+
+    # Clean-startup validation (mirrors ci_status's config_requires_repos):
+    # a malformed quiet_hours would otherwise raise ValueError from inside
+    # run_once() on every poll, and main()'s while True loop has no guard --
+    # under launchd KeepAlive that's a silent crash-loop instead of one
+    # clear, actionable failure at startup. Parsed once here and discarded;
+    # run_once's own parse_quiet_hours call is unaffected.
+    try:
+        parse_quiet_hours(cfg["nyan_filler"]["quiet_hours"])
+    except ValueError as exc:
+        log.error("invalid [nyan_filler] quiet_hours config: %s", exc)
+        return 1
+
     client = BusyBarClient(**device_kwargs(cfg))
 
     # Startup clear + self-healing asset (re)upload -- both real device
@@ -71,13 +100,21 @@ def main() -> int:
         if ASSET_PATH.exists():
             client.upload_asset(APP, ASSET_NAME, ASSET_PATH.read_bytes())
         else:
-            log.warning("asset %s missing; run `uv run python tools/build_nyan_anim.py`", ASSET_PATH)
+            log.warning("asset %s missing; run `uv run python -m tools.build_nyan_anim`", ASSET_PATH)
 
     state: dict = {}
     backoff = 5
+    last_logged_summary: str | None = None
+    last_heartbeat = time.monotonic()
     while True:
         summary = run_once(client, cfg, datetime.now(), state, args.dry_run)
-        log.info(summary)
+        now_monotonic = time.monotonic()
+        if args.once or should_log_info(summary, last_logged_summary, now_monotonic - last_heartbeat):
+            log.info(summary)
+            last_logged_summary = summary
+            last_heartbeat = now_monotonic
+        else:
+            log.debug(summary)
         if args.once:
             return 0
         if summary == "device unreachable":

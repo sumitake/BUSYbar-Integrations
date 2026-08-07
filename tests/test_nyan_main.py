@@ -1,7 +1,7 @@
 from datetime import datetime
 from busybar.client import DrawResult
 from busybar.display import PRIORITY_FILLER
-from integrations.nyan_filler.main import run_once
+from integrations.nyan_filler.main import run_once, should_log_info
 from integrations.nyan_filler.logic import FILLER_APP, ASSET_NAME
 
 class FakeClient:
@@ -42,3 +42,20 @@ def test_disabled_is_noop():
     cfg = {"nyan_filler": {**BASE["nyan_filler"], "enabled": False}}
     summary = run_once(c, cfg, datetime(2026, 8, 6, 12, 0), st)
     assert c.draws == [] and "disabled" in summary
+
+
+# --- log-noise control (I-1: default poll_seconds=1 would otherwise sixfold
+# calendar_countdown's own worst case -- ~86,400 near-identical lines/day at
+# INFO). should_log_info mirrors calendar_countdown.main.should_log_info.
+
+def test_should_log_info_true_when_summary_changes():
+    assert should_log_info("nyan @ 5 -> drawn", "nyan @ 5 -> reused", seconds_since_heartbeat=0) is True
+
+def test_should_log_info_false_when_summary_unchanged_and_no_heartbeat_due():
+    assert should_log_info("nyan @ 5 -> drawn", "nyan @ 5 -> drawn", seconds_since_heartbeat=1) is False
+
+def test_should_log_info_true_when_unchanged_past_heartbeat():
+    assert should_log_info("nyan @ 5 -> drawn", "nyan @ 5 -> drawn",
+                           seconds_since_heartbeat=600, heartbeat_seconds=600) is True
+    assert should_log_info("nyan @ 5 -> drawn", "nyan @ 5 -> drawn",
+                           seconds_since_heartbeat=599, heartbeat_seconds=600) is False
