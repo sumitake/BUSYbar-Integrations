@@ -25,10 +25,43 @@ log = logging.getLogger(APP)
 ASSET_PATH = Path(__file__).resolve().parents[2] / "assets" / "nyan" / ASSET_NAME
 
 
+def ensure_asset_uploaded(client, state: dict) -> None:
+    """Idempotently make sure the .anim asset is on the device before we draw
+    an element that references it. `state` is the same caller-owned dict
+    run_once threads through the loop.
+
+    The upload is conceptually a one-shot install step (~83 KB, not per-poll).
+    But a single startup attempt that happens to land while the device is
+    transiently unreachable used to be discarded silently (upload_asset returns
+    False and nothing retried it), leaving every subsequent draw for the life
+    of the process referencing an asset that was never uploaded. So we latch on
+    success instead: attempt the upload on each active poll until it lands once
+    (`state["asset_uploaded"]`), then never upload again -- no per-poll uploads
+    in steady state. In the in-scope transient-unreachable case these retries
+    are naturally spaced out by main()'s exponential UNREACHABLE backoff, and
+    upload_asset logs its own failure reason on each attempt.
+
+    A locally missing build artifact is a different failure -- polling can't
+    fix it -- so it's warned once (naming the rebuild command) and skipped
+    without retry bookkeeping; if the file later appears it uploads on the next
+    poll."""
+    if state.get("asset_uploaded"):
+        return
+    if not ASSET_PATH.exists():
+        if not state.get("asset_missing_warned"):
+            log.warning("asset %s missing; run `uv run python -m tools.build_nyan_anim`", ASSET_PATH)
+            state["asset_missing_warned"] = True
+        return
+    if client.upload_asset(APP, ASSET_NAME, ASSET_PATH.read_bytes()):
+        state["asset_uploaded"] = True
+
+
 def run_once(client, cfg: dict, now: datetime, state: dict, dry_run: bool = False) -> str:
     """One poll cycle. `state` is a caller-owned dict mutated in place:
     `quiet_cleared` records whether we've already released the panel for the
-    current quiet window (so we clear once on entry, not every poll)."""
+    current quiet window (so we clear once on entry, not every poll);
+    `asset_uploaded` latches once the .anim asset has landed on the device
+    (see ensure_asset_uploaded)."""
     c = cfg["nyan_filler"]
     if not c["enabled"]:
         return "disabled; no-op"
@@ -47,6 +80,7 @@ def run_once(client, cfg: dict, now: datetime, state: dict, dry_run: bool = Fals
     elements = build_filler_elements(ASSET_NAME, timeout_s)
     if dry_run:
         return f"DRY-RUN draw @ {PRIORITY_FILLER}: {elements!r}"
+    ensure_asset_uploaded(client, state)  # retries until it lands once; then a no-op
     result = client.draw(APP, elements, priority=PRIORITY_FILLER)
     if result == DrawResult.UNREACHABLE:
         return "device unreachable"
@@ -91,16 +125,14 @@ def main() -> int:
 
     client = BusyBarClient(**device_kwargs(cfg))
 
-    # Startup clear + self-healing asset (re)upload -- both real device
-    # writes, so both are gated behind --dry-run (no device writes at all
-    # in dry-run mode). Upload: one ~83 KB POST per process start, never
-    # per poll.
+    # Startup clear -- a real device write, so gated behind --dry-run (no
+    # device writes at all in dry-run mode). The asset (re)upload is no longer
+    # done here: run_once owns it now (ensure_asset_uploaded), attempting the
+    # ~83 KB POST on each active poll only until it lands once, so a device
+    # that is transiently unreachable at process start self-heals within the
+    # same process instead of never uploading for its lifetime.
     if not args.dry_run:
         client.clear(APP)  # drop any stale element from a previous process
-        if ASSET_PATH.exists():
-            client.upload_asset(APP, ASSET_NAME, ASSET_PATH.read_bytes())
-        else:
-            log.warning("asset %s missing; run `uv run python -m tools.build_nyan_anim`", ASSET_PATH)
 
     state: dict = {}
     backoff = 5
