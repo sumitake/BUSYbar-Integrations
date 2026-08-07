@@ -15,6 +15,8 @@ from calendar_countdown.logic import (
     _minutes_left, select_priority, select_led, resolve_led_value, should_chirp, commit_chirped,
     next_sleep_seconds, IMMINENT_LED_COLOR, CHIRP_STOCK_PATH, _chirp_key,
     check_threshold_ordering,
+    is_just_started, START_ANIM_ID, CAL_ICON_ID, ICON_EVENT, ICON_REMINDER,
+    SCROLL_RATE, SCROLL_DELAY_MS,
 )
 from busybar.display import (
     PRIORITY_AMBIENT, PRIORITY_AMBIENT_RAISED, PRIORITY_AMBIENT_URGENT,
@@ -685,3 +687,115 @@ def test_check_threshold_ordering_missing_keys_returns_none():
     # An old-style cfg dict predating the v1.5.2 keys -- nothing to check,
     # must not KeyError.
     assert check_threshold_ordering({"notice_minutes": 15, "warn_minutes": 5}) is None
+
+
+# --- v1.6 stock-animation accents: is_just_started, priority, icons, takeover ----
+#
+# NOW2 (not the module's own `NOW`) is deliberately a distinct local
+# constant here -- reassigning the module-level `NOW` at this point in the
+# file would retroactively change the reference time every test ABOVE this
+# point sees at call time (Python resolves a function's globals when it
+# RUNS, not when it's defined), since pytest collects and runs the whole
+# module in one process. `_ev`/`_cfg` are local helpers distinct from the
+# top-of-file `ev`/`CFG` for the same reason -- this section is self-
+# contained and must not perturb anything above it.
+
+def _ev(start):  # 30-min event
+    return CalEvent(title="Standup", start=start, end=start + timedelta(minutes=30), all_day=False)
+
+def _cfg(**over):
+    base = {"poll_seconds": 10, "lookahead_hours": 12, "warn_minutes": 5, "notice_minutes": 15,
+            "approach_minutes": 30, "imminent_minutes": 1, "progress_window_minutes": 60,
+            "escalation_icons": True, "start_animation": "meeting_72x16", "start_window_seconds": 60}
+    base.update(over); return base
+
+NOW2 = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+
+def test_is_just_started_window():
+    ev = _ev(NOW2 - timedelta(seconds=30))   # started 30s ago
+    assert is_just_started(ev, NOW2, True, 60, "meeting_72x16") is True
+    ev2 = _ev(NOW2 - timedelta(seconds=90))  # started 90s ago
+    assert is_just_started(ev2, NOW2, True, 60, "meeting_72x16") is False
+    assert is_just_started(ev, NOW2, True, 60, "") is False       # disabled
+    assert is_just_started(ev, NOW2, False, 60, "meeting_72x16") is False  # not in progress
+
+def test_priority_just_started_is_urgent():
+    assert select_priority(0.0, 30, 15, True, just_started=True) == PRIORITY_AMBIENT_URGENT
+    assert select_priority(0.0, 30, 15, True, just_started=False) == PRIORITY_AMBIENT  # unchanged
+
+def test_warn_stage_adds_event_icon():
+    ev = _ev(NOW2 + timedelta(minutes=4))   # 4m out -> warn, > imminent
+    els = build_elements(ev, NOW2, _cfg(), 15, in_progress=False)
+    icon = next(e for e in els if e["id"] == CAL_ICON_ID)
+    assert icon["type"] == "animation" and icon["stock_path"] == f"shared/{ICON_EVENT}.anim"
+    assert icon["x"] == 0 and icon["y"] == 0
+    assert any(e["id"] == "title" for e in els)   # title still present at warn
+
+def test_icon_present_drops_time_element():
+    # The icon is 16x16 at (0,0) -- it sits directly on top of the `time`
+    # element (start-time text at TIME_X=2/TIME_Y=5), so `time` must be
+    # excluded whenever the icon shows, in both the warn (icon still
+    # ICON_EVENT, title present) and imminent (icon ICON_REMINDER, title
+    # dropped) sub-stages. cd_text (x=39) already clears the icon and
+    # stays present as the sole countdown readout.
+    warn_ev = _ev(NOW2 + timedelta(minutes=4))   # 4m out -> warn, > imminent
+    els = build_elements(warn_ev, NOW2, _cfg(), 15, in_progress=False)
+    assert not any(e["id"] == "time" for e in els)
+    assert any(e["id"] == CAL_ICON_ID for e in els)
+    assert any(e["id"] == "cd_text" for e in els)
+    # `divider` (id "divider", at DIVIDER_X) sits to the right of `time`'s
+    # old position -- with `time` dropped and `title` narrowed, the divider
+    # is orphaned and must be dropped too whenever the icon shows (CODE-BUG,
+    # minor fix wave item 2).
+    assert not any(e["id"] == "divider" for e in els)
+
+    imminent_ev = _ev(NOW2 + timedelta(seconds=30))  # 0.5m out -> imminent
+    els = build_elements(imminent_ev, NOW2, _cfg(), 15, in_progress=False)
+    assert not any(e["id"] == "time" for e in els)
+    assert any(e["id"] == CAL_ICON_ID for e in els)
+    assert any(e["id"] == "cd_text" for e in els)
+    assert not any(e["id"] == "divider" for e in els)
+
+    # Normal (no-icon) upcoming display is unaffected -- the divider must
+    # still be present when there's no icon to orphan it.
+    no_icon_els = build_elements(_ev(NOW2 + timedelta(minutes=4)), NOW2,
+                                 _cfg(escalation_icons=False), 15, in_progress=False)
+    assert any(e["id"] == "divider" for e in no_icon_els)
+
+
+def test_warn_stage_title_scrolls_in_narrowed_icon_gap():
+    # "STANDUP" (7 chars * SMALL_FONT_CHAR_PX=5 -> 35px) fits the full 68px
+    # TITLE_WIDTH the scroll decision is first made against, but does NOT
+    # fit the icon-narrowed gap the escalation-icon block later shrinks the
+    # title into (CD_TEXT_X - ICON_TITLE_X - 2 = 39 - 18 - 2 = 19px). The
+    # scroll decision must be recomputed against the NARROWED width, or a
+    # title that's the common case (most real meeting titles) gets no
+    # scroll flags and is statically clipped in the 19px band -- contradicting
+    # the code's own "# scroll in the gap" comment (CODE-BUG-A).
+    warn_ev = _ev(NOW2 + timedelta(minutes=4))   # 4m out -> warn, > imminent
+    els = build_elements(warn_ev, NOW2, _cfg(), 15, in_progress=False)
+    title_el = next(e for e in els if e["id"] == "title")
+    assert title_el["text"] == "STANDUP"
+    assert "scroll_rate" in title_el
+    assert title_el["scroll_rate"] == SCROLL_RATE
+    assert title_el["scroll_start_delay"] == SCROLL_DELAY_MS
+    assert title_el["scroll_repeat_delay"] == SCROLL_DELAY_MS
+
+def test_imminent_stage_uses_reminder_icon_and_drops_title():
+    ev = _ev(NOW2 + timedelta(seconds=30))  # 0.5m out -> imminent
+    els = build_elements(ev, NOW2, _cfg(), 15, in_progress=False)
+    icon = next(e for e in els if e["id"] == CAL_ICON_ID)
+    assert icon["stock_path"] == f"shared/{ICON_REMINDER}.anim"
+    assert not any(e["id"] == "title" for e in els)   # title dropped at imminent
+
+def test_just_started_returns_takeover_animation():
+    ev = _ev(NOW2 - timedelta(seconds=10))
+    els = build_elements(ev, NOW2, _cfg(), 15, in_progress=True, just_started=True)
+    anim = next(e for e in els if e["id"] == START_ANIM_ID)
+    assert anim["type"] == "animation" and anim["stock_path"] == "shared/meeting_72x16.anim"
+    assert not any(e["id"] in ("cd_text", "ends") for e in els)   # takeover replaces the countdown
+
+def test_escalation_icons_off_is_unchanged():
+    ev = _ev(NOW2 + timedelta(minutes=4))
+    els = build_elements(ev, NOW2, _cfg(escalation_icons=False), 15, in_progress=False)
+    assert not any(e["id"] == CAL_ICON_ID for e in els)

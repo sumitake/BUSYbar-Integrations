@@ -112,3 +112,11 @@ def test_device_kwargs_no_warnings_when_all_keys_known(caplog):
     caplog.set_level(logging.WARNING, logger="busybar.config")
     device_kwargs({"device": dict(DEFAULTS["device"])})
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+def test_animation_accent_defaults(tmp_path):
+    cfg = load_config(tmp_path / "missing.toml")
+    cal = cfg["calendar_countdown"]
+    assert cal["escalation_icons"] is True
+    assert cal["start_animation"] == "meeting_72x16"
+    assert cal["start_window_seconds"] == 60
+    assert cfg["ci_status"]["running_spinner"] is True

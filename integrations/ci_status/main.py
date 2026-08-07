@@ -263,7 +263,8 @@ def run_once(client, poller, cfg: dict, now: datetime,
                 frame_name = sequence[frame_index]
                 overlay_payload = build_overlay_payload(
                     frame_name, OVERLAY_DWELL_SECONDS,
-                    running=running_info, quota_by_bucket=quota_by_bucket)
+                    running=running_info, quota_by_bucket=quota_by_bucket,
+                    show_spinner=c.get("running_spinner", False))
                 if overlay_payload is None:
                     # This frame's data wasn't available this cycle (e.g. a
                     # quota frame with no fresh rate_limit data). Advance

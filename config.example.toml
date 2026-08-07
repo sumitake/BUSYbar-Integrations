@@ -47,6 +47,9 @@ approach_minutes = 30        # inside this (outside notice_minutes): priority ri
                               # overlay tier (PRIORITY_AMBIENT_RAISED) -- normal palette, unchanged
 imminent_minutes = 1         # inside this (and not yet started): LED blinks on every draw
 chirp = true                 # one-time audio chirp exactly at event start (T-0); false disables audio
+escalation_icons = true      # animated calendar icons at the 5-min / 1-min stages
+start_animation = "meeting_72x16"  # full-panel takeover for the first minute after an event starts; "" disables
+start_window_seconds = 60    # how long that takeover holds
 
 [ci_status]
 poll_seconds = 120
@@ -57,6 +60,7 @@ show_running = true          # show a badge (alternating with the calendar) whil
 running_poll_seconds = 20    # poll interval while a run is active (shortened from poll_seconds)
 show_quota = true            # GraphQL/REST quota frames join the overlay rotation while a run
                               # is active (no effect if show_running is false)
+running_spinner = true       # animated 8x8 spinner on the running badge
 
 # Account-wide watching (v1.5.1) -- off by default. When on, the watch list
 # becomes auto-discovered account repos UNION `repos` above, MINUS

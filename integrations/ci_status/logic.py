@@ -189,6 +189,16 @@ RUNNING_NUMERAL_Y = OVERLAY_NUMERAL_Y
 RUNNING_NUMERAL_X = OVERLAY_TITLE_X  # the running badge's single numeral sits at the
                                     # same left margin as the title/quota "pct" numeral
 
+# Running-badge spinner (v1.6, config-gated via cfg["ci_status"]["running_spinner"]):
+# an animated 8x8 stock asset in the panel's top-right corner. RUNNING_TITLE_WIDTH_SPINNER
+# reserves that corner from the scrolling title so it never runs underneath the spinner --
+# used in place of RUNNING_TITLE_WIDTH, in both the title element's own width and the
+# _title_fits scroll-decision call, whenever show_spinner is on (quota frames never get a
+# spinner, so OVERLAY_TITLE_WIDTH there is untouched).
+RUN_SPINNER_ID = "run_spinner"
+SPINNER_STOCK = "shared/spinner_front_8x8.anim"
+RUNNING_TITLE_WIDTH_SPINNER = 60   # reserve the top-right 8x8 corner (spinner at x=64)
+
 
 # --- running-job badge -----------------------------------------------------------
 
@@ -352,17 +362,25 @@ def _build_running_title(run: dict, repo: str, other_count: int) -> str:
     return ascii_safe(text).upper()
 
 
-def _build_running_elements(info: RunningInfo, timeout_s: int) -> list[dict]:
+def _build_running_elements(info: RunningInfo, timeout_s: int, show_spinner: bool = False) -> list[dict]:
     """v1.4-language badge: gradient bg, title ribbon (scrolls if it
     doesn't fit), full-width horizon-line track repurposed as elapsed/
     median progress, and a large ETA numeral -- no card surfaces, no
     native countdown element, same design lineage as the v1.4 calendar
     layout. Draw order is z-order, first = behind.
+
+    `show_spinner` (v1.6, config-gated): when true, reserves the panel's
+    top-right 8x8 corner from the title ribbon (RUNNING_TITLE_WIDTH_SPINNER
+    in place of RUNNING_TITLE_WIDTH, for both the element's own width and
+    the scroll-fit decision, so the two stay consistent) and appends an
+    animated spinner element there. Defaults to False so existing callers
+    are unaffected.
     """
     title_text = _build_running_title(info.run, info.repo, info.other_count)
     eta_text = _format_eta_text(info.run, info.median_minutes, info.now)
     elapsed = _elapsed_minutes(info.run, info.now)
     track_width = _progress_width(elapsed, info.median_minutes)
+    title_width = RUNNING_TITLE_WIDTH_SPINNER if show_spinner else RUNNING_TITLE_WIDTH
 
     bg_element = {
         "id": "bg", "type": "rectangle", "x": 0, "y": 0,
@@ -373,9 +391,9 @@ def _build_running_elements(info: RunningInfo, timeout_s: int) -> list[dict]:
     title_element = {
         "id": "title", "type": "text", "text": title_text, "font": "small",
         "color": RUNNING_TITLE_COLOR, "x": RUNNING_TITLE_X, "y": RUNNING_TITLE_Y,
-        "width": RUNNING_TITLE_WIDTH, "timeout": timeout_s,
+        "width": title_width, "timeout": timeout_s,
     }
-    if not _title_fits(title_text, RUNNING_TITLE_WIDTH):
+    if not _title_fits(title_text, title_width):
         title_element.update({
             "scroll_rate": SCROLL_RATE,
             "scroll_start_delay": SCROLL_DELAY_MS,
@@ -414,6 +432,10 @@ def _build_running_elements(info: RunningInfo, timeout_s: int) -> list[dict]:
             "x": RUNNING_NUMERAL_X + _text_width_px(eta_text) + RUNNING_LABEL_GAP_PX,
             "y": RUNNING_LABEL_Y, "timeout": timeout_s,
         })
+
+    if show_spinner:
+        elements.append({"id": RUN_SPINNER_ID, "type": "animation", "stock_path": SPINNER_STOCK,
+                         "x": 64, "y": 0, "loop": True, "timeout": timeout_s})
     return elements
 
 
@@ -619,7 +641,8 @@ def overlay_frame_sequence(show_quota: bool) -> list[str]:
 
 def build_overlay_payload(frame_name: str, timeout_s: int, *,
                          running: RunningInfo | None = None,
-                         quota_by_bucket: dict[str, QuotaInfo] | None = None) -> dict | None:
+                         quota_by_bucket: dict[str, QuotaInfo] | None = None,
+                         show_spinner: bool = False) -> dict | None:
     """Build the {"elements", "priority", "led"} payload for one overlay-
     tier dwell slot, or `None` if this frame's data isn't available this
     cycle -- the caller must treat `None` as "skip this dwell slot
@@ -628,11 +651,15 @@ def build_overlay_payload(frame_name: str, timeout_s: int, *,
     quota frame from rotation for a cycle instead of crashing or showing
     minutes-old numbers (see main.py's 5-minute staleness check, which
     is what actually keeps `quota_by_bucket` fresh enough to trust here).
+
+    `show_spinner` (v1.6) is threaded through ONLY on the CI-badge branch
+    -- quota frames never get a spinner, regardless of this flag. Defaults
+    to False so existing callers are unaffected.
     """
     if frame_name == OVERLAY_FRAME_CI_BADGE:
         if running is None:
             return None
-        return {"elements": _build_running_elements(running, timeout_s),
+        return {"elements": _build_running_elements(running, timeout_s, show_spinner=show_spinner),
                 "priority": PRIORITY_OVERLAY, "led": None}
     if frame_name in (OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST):
         bucket_key = "graphql" if frame_name == OVERLAY_FRAME_QUOTA_GQL else "core"
