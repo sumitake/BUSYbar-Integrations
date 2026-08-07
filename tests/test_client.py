@@ -312,6 +312,32 @@ def test_no_recovery_probe_before_window_when_never_degraded(mock_request):
     assert mock_request.call_args.args[1] == "http://192.0.2.1/api/display/draw"
 
 
+# --- upload_asset (nyan_filler, local-only) ---------------------------------
+
+@patch("busybar.client.requests.request")
+def test_upload_asset_success(mock_request):
+    mock_request.return_value = _response(200)
+    data = b"\x00\x01\x02binarydata"
+    assert BusyBarClient().upload_asset("nyan_filler", "nyan_72x16.anim", data) is True
+    method, url = mock_request.call_args.args
+    assert method == "POST"
+    assert "application_name=nyan_filler" in url and "file=nyan_72x16.anim" in url
+    assert mock_request.call_args.kwargs["headers"] == {"Content-Type": "application/octet-stream"}
+    assert mock_request.call_args.kwargs["data"] == data
+
+
+@patch("busybar.client.requests.request")
+def test_upload_asset_false_on_non_200(mock_request):
+    mock_request.return_value = _response(500)
+    assert BusyBarClient().upload_asset("nyan_filler", "nyan_72x16.anim", b"x") is False
+
+
+@patch("busybar.client.requests.request")
+def test_upload_asset_false_when_unreachable(mock_request):
+    mock_request.side_effect = requests.ConnectionError()
+    assert BusyBarClient().upload_asset("nyan_filler", "nyan_72x16.anim", b"x") is False
+
+
 # --- token never logged (v1.6 security requirement) -------------------------
 
 @patch("busybar.client.time.monotonic")
