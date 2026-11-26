@@ -47,6 +47,10 @@ MAX_WARNING_KEYS = 64
 # request per cap interval.
 RATE_LIMIT_MIN_PAUSE_SECONDS = 60
 RATE_LIMIT_MAX_PAUSE_SECONDS = 900
+# The default-branch page is GitHub's largest: verdicts are remembered once
+# read, so its size only decides how far back a freshly started process can
+# see. A new body is downloaded only when a default-branch run changes.
+DEFAULT_BRANCH_RUNS_PER_PAGE = 100
 
 
 def get_token() -> str:
@@ -73,6 +77,13 @@ class RestPoller:
         # by fetch_runs), so it gets its own conditional-request cache
         # rather than sharing (and corrupting) fetch_runs's ETag.
         self._running_etags: dict[str, str] = {}
+        # Third slot, for the default-branch page (fetch_default_runs), and
+        # the branch name each ETag was issued for.
+        self._default_etags: dict[str, str] = {}
+        self._default_etag_branch: dict[str, str] = {}
+        # repo -> (ETag, default branch) from GET /repos/{repo}, kept as one
+        # value so a 304 can always be answered (fetch_default_branch).
+        self._repo_meta: dict[str, tuple[str | None, str]] = {}
         # ETA history is cached per workflow_id for the process's lifetime
         # (not per-poll): a workflow's recent successful-run durations don't
         # change fast enough to be worth re-fetching every poll, unlike the
@@ -234,6 +245,49 @@ class RestPoller:
                                     {"status": "in_progress", "per_page": 5},
                                     f"for {repo} (running poll)")
 
+    def fetch_default_runs(self, repo: str, branch: str) -> list[dict] | None | _NoAnswer:
+        """GET .../actions/runs?branch=<branch>&per_page=100: the newest runs
+        whose head branch is `branch`, in a third ETag slot. Same three-way
+        result as fetch_runs. A branch that does not exist is an empty list,
+        not a refusal. An ETag issued for another branch name (the default
+        branch was renamed) is discarded rather than sent."""
+        if self._default_etag_branch.get(repo) != branch:
+            self._default_etags.pop(repo, None)
+            self._default_etag_branch[repo] = branch
+        return self._fetch_run_list(repo, self._default_etags,
+                                    {"branch": branch, "per_page": DEFAULT_BRANCH_RUNS_PER_PAGE},
+                                    f"for {repo} ({branch} branch)")
+
+    def forget_default_runs(self, repo: str) -> None:
+        """Drop only the default-branch page's ETag, so that page is read
+        again next poll while the other slots keep earning 304s."""
+        self._default_etags.pop(repo, None)
+        self._default_etag_branch.pop(repo, None)
+
+    def fetch_default_branch(self, repo: str) -> str | _NoAnswer:
+        """The repo's default branch name from GET /repos/{repo}, or
+        FETCH_DENIED / FETCH_FAILED. Conditional: a 304 returns the name read
+        earlier. The ETag and the name are stored together, and only once
+        the name proved usable."""
+        what = f"for {repo} (default branch)"
+        cached = self._repo_meta.get(repo)
+        resp = self._get(f"{API}/repos/{repo}", what, None,
+                         etag=cached[0] if cached else None)
+        if not _answered(resp):
+            return resp
+        if resp.status_code == 304:
+            # Only reachable with an ETag, which is only sent from `cached`.
+            return cached[1] if cached else FETCH_FAILED
+        body = self._json_object(resp, what)
+        if body is None:
+            return FETCH_FAILED
+        name = body.get("default_branch")
+        if not isinstance(name, str) or not name:
+            self.warn(f"body {what}", f"github returned an unusable body {what}")
+            return FETCH_FAILED
+        self._repo_meta[repo] = (resp.headers.get("ETag"), name)
+        return name
+
     def fetch_median_eta(self, repo: str, workflow_id: int) -> float | None:
         """Median duration (minutes) of the last 5 successful runs of
         `workflow_id`, cached for the process's lifetime once successfully
@@ -362,15 +416,20 @@ class RestPoller:
         return repos
 
     def forget_repo(self, repo: str, *, runs: bool = True, running: bool = True) -> None:
-        """Drop cached conditional-request state for a repo: both ETag slots
+        """Drop cached conditional-request state for a repo: every slot
         by default, for a repo that has left the effective watch list --
         excluded, aged out of `active_within_days`, or deleted upstream
         (v1.5.1) -- so a repo that's later re-added starts with a clean
         conditional-request slate. `runs=False` / `running=False` keep that
         slot: main.run_once drops only the slot whose body it could not use
         or whose cached state it expired, so the other slot's just-validated
-        ETag keeps earning free 304s."""
+        ETag keeps earning free 304s. `runs` covers both run pages that feed
+        that state (all branches and the default branch). The default-branch
+        lookup is dropped only with everything else."""
         if runs:
             self._etags.pop(repo, None)
+            self.forget_default_runs(repo)
         if running:
             self._running_etags.pop(repo, None)
+        if runs and running:
+            self._repo_meta.pop(repo, None)

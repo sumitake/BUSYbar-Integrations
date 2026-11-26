@@ -9,6 +9,7 @@ except ImportError:  # bare clone / broken editable install: use the repo's src/
 import argparse
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from busybar.client import BusyBarClient, DrawResult
@@ -19,7 +20,7 @@ from busybar.presentation import modern_display, prepare_frame, commit_frame, ci
 from .github import FETCH_DENIED, FETCH_FAILED, RestPoller, get_token
 from .logic import (
     RepoState, RunningInfo, QuotaInfo,
-    build_overlay_payload, build_overlay_sequence, evaluate_runs,
+    build_overlay_payload, build_overlay_sequence, default_branch_verdicts, evaluate_runs,
     LED_OFF_COLOR, LED_OFF_ELEMENTS, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST,
     parse_rate_limit, repo_labels, resolve_ci_led_value, resolve_repo_list, running_runs_usable,
     select_running_run,
@@ -37,7 +38,18 @@ QUOTA_STALE_SECONDS = 300  # never show rate_limit data older than 5 minutes
 # (outage, rate limit, server error, unreadable body) never counts: cached
 # state then stays for as long as the outage lasts.
 STALE_STATE_SECONDS = 900
-HEARTBEAT_SECONDS = 600  # INFO heartbeat when the poll summary is unchanged
+HEARTBEAT_SECONDS = 600  # each distinct summary is logged at INFO once per this window
+# How often main() gives the display its turn. GitHub is asked far less often
+# (next_poll_seconds); this only decides how promptly a card that has become
+# due is drawn, so the 10 s on / 10 s off rotation is the same at any poll
+# cadence. A tick with nothing due sends nothing anywhere.
+DISPLAY_TICK_SECONDS = 1
+# One rotation slot: a dwell on screen plus the dwell of silence after it. A
+# draw the device refused is retried after this long, never once per tick.
+OVERLAY_SLOT_SECONDS = 2 * OVERLAY_DWELL_SECONDS
+# How long to wait before asking again for a default branch name that could
+# not be read (a known name is re-checked every repo_refresh_minutes).
+DEFAULT_BRANCH_RETRY_SECONDS = 300
 
 
 def _denied_too_long(fetch_health: dict, key: tuple[str, str], result,
@@ -64,7 +76,7 @@ def _refresh_account_repos(poller, repo_cache: dict | None, now: datetime,
     empty watch list (an empty result from `fetch_account_repos` is
     indistinguishable from "genuinely zero repos," so `None` is the only
     signal treated as "keep what we had"; see that method's docstring).
-    Mirrors `_refresh_quota`'s cache-freshness pattern.
+    Mirrors the quota cache's freshness pattern (`_fetch_quota` / `_quota_infos`).
     """
     if repo_cache is None:
         return None
@@ -84,23 +96,28 @@ def _refresh_account_repos(poller, repo_cache: dict | None, now: datetime,
     return repo_cache.get("repos")
 
 
-def _refresh_quota(poller, quota_cache: dict | None, now: datetime) -> dict[str, QuotaInfo] | None:
+def _fetch_quota(poller, quota_cache: dict | None, now: datetime) -> None:
     """Fetch /rate_limit fresh (it's exempt from GitHub's own rate
     limiting, so there's no cost to calling it every poll) and update
-    `quota_cache` on success. Returns the current bucket->QuotaInfo mapping
-    if `quota_cache` holds data no older than QUOTA_STALE_SECONDS (whether
-    from this fetch or an earlier one that succeeded when this one
-    didn't), else None -- callers must treat None as "no quota frames this
-    cycle," never fall back to stale numbers.
-    """
+    `quota_cache` on success. A failed fetch leaves the cache as it was;
+    `_quota_infos` decides whether what it holds is still fresh enough."""
     if quota_cache is None:
-        return None
+        return
     raw = poller.fetch_rate_limit()
     if raw is not None:
         parsed = parse_rate_limit(raw)
         if parsed is not None:
             quota_cache["buckets"] = parsed
             quota_cache["fetched_at"] = now
+
+
+def _quota_infos(quota_cache: dict | None, now: datetime) -> dict[str, QuotaInfo] | None:
+    """The bucket->QuotaInfo mapping if `quota_cache` holds data no older
+    than QUOTA_STALE_SECONDS, else None -- callers must treat None as "no
+    quota frames this cycle," never fall back to stale numbers. Makes no
+    request, so display ticks between polls can call it."""
+    if quota_cache is None:
+        return None
     fetched_at = quota_cache.get("fetched_at")
     if fetched_at is None or (now - fetched_at).total_seconds() > QUOTA_STALE_SECONDS:
         return None
@@ -113,24 +130,124 @@ def _refresh_quota(poller, quota_cache: dict | None, now: datetime) -> dict[str,
     }
 
 
+def _default_branches(poller, repos: list[str], account_repos: list[dict] | None,
+                      branch_cache: dict | None, now: datetime,
+                      refresh_minutes: int) -> dict[str, str]:
+    """repo -> default branch name, for every repo whose name is known.
+
+    The account enumeration already carries it, so a repo listed there costs
+    nothing; with `branch_cache` given, that name is also remembered. Any other repo (one named in `repos` that the account does not
+    own) is looked up with `poller.fetch_default_branch` -- only when
+    `branch_cache` is given -- and re-checked every `refresh_minutes` to
+    notice a rename. While the name is unknown the lookup is retried every
+    DEFAULT_BRANCH_RETRY_SECONDS, never once per poll. A failed re-check
+    keeps the name already learned.
+
+    A repo missing from the result is judged without default-branch
+    tracking: the newest run of each workflow across all branches decides,
+    as it did before that tracking existed.
+    """
+    from_account = {
+        r["full_name"].lower(): r["default_branch"] for r in account_repos or []
+        if isinstance(r, dict) and isinstance(r.get("full_name"), str)
+        and isinstance(r.get("default_branch"), str) and r["default_branch"]
+    }
+    names: dict[str, str] = {}
+    for repo in repos:
+        name = from_account.get(repo.lower())
+        if name is not None and branch_cache is not None:
+            # Remembered, so a repo that later drops out of the enumeration
+            # (it stays watched through `repos`) keeps a known name.
+            branch_cache[repo] = {"name": name, "checked_at": now}
+        if name is None and branch_cache is not None:
+            entry = branch_cache.get(repo)
+            wait = refresh_minutes * 60 if entry and entry["name"] else DEFAULT_BRANCH_RETRY_SECONDS
+            if entry is None or (now - entry["checked_at"]).total_seconds() >= wait:
+                fetched = poller.fetch_default_branch(repo)
+                known = fetched if isinstance(fetched, str) else (entry["name"] if entry else None)
+                entry = branch_cache[repo] = {"name": known, "checked_at": now}
+                if known is None:
+                    poller.warn(f"default branch {repo}",
+                                f"default branch of {repo} is unknown; until it can be read, "
+                                "its failures are judged by the newest run on any branch")
+            name = entry["name"]
+        if name:
+            names[repo] = name
+    return names
+
+
+@dataclass
+class _View:
+    """What one GitHub poll decided belongs on screen. Display ticks between
+    polls rotate from this without asking GitHub again; time-dependent text
+    (the running badge's countdown, quota freshness) is rebuilt from it
+    against the tick's own `now`."""
+    states: list[RepoState]
+    labels: dict[str, str]
+    show_green: bool
+    # (run, repo label, other_count, median minutes) of the selected running run.
+    running: tuple[dict, str, int, float | None] | None
+    show_quota: bool
+
+
 def run_once(client, poller, cfg: dict, now: datetime,
              state_cache: dict[str, RepoState], dry_run: bool,
              running_cache: dict[str, list[dict]] | None = None,
              overlay_state: dict | None = None,
              quota_cache: dict | None = None,
              repo_cache: dict | None = None,
-             fetch_health: dict | None = None) -> str:
-    """`running_cache`, `overlay_state`, `quota_cache`, `repo_cache`, and
-    `fetch_health`, when passed, are caller-owned dicts this function
-    mutates in place (mirroring `state_cache`'s existing pattern) so
-    `main()` can hold one instance of each across loop iterations while
-    `run_once` itself stays a pure function of its arguments plus those
-    dicts. Omitting `running_cache` (the default) skips running-job/overlay
-    detection entirely; omitting `repo_cache` (the default) skips
-    account-wide discovery entirely and falls back to the pre-v1.5.1
-    behavior of polling exactly `cfg["ci_status"]["repos"]` every cycle;
-    omitting `fetch_health` (the default) means failure runs are not
-    remembered between calls, so cached state never expires.
+             fetch_health: dict | None = None,
+             branch_cache: dict | None = None,
+             view_cache: dict | None = None,
+             poll: bool = True,
+             clock=None) -> str:
+    """One loop iteration: ask GitHub if this iteration is a poll, then give
+    the display its turn.
+
+    `running_cache`, `overlay_state`, `quota_cache`, `repo_cache`,
+    `fetch_health`, `branch_cache` and `view_cache`, when passed, are
+    caller-owned dicts this function mutates in place (mirroring
+    `state_cache`'s existing pattern) so `main()` can hold one instance of
+    each across loop iterations while `run_once` itself stays a pure
+    function of its arguments plus those dicts. Omitting `running_cache`
+    (the default) skips running-job/overlay detection entirely; omitting
+    `repo_cache` (the default) skips account-wide discovery entirely and
+    falls back to the pre-v1.5.1 behavior of polling exactly
+    `cfg["ci_status"]["repos"]` every cycle; omitting `fetch_health` (the
+    default) means failure runs are not remembered between calls, so cached
+    state never expires; omitting `branch_cache` (the default) means a
+    default branch is known only for repos the account enumeration lists.
+
+    Poll and display are separate so cards rotate on the display's own
+    rhythm whatever the GitHub cadence is. `poll=False` with a `view_cache`
+    that holds an earlier poll's result is a display tick: it sends nothing
+    to GitHub and rotates from that result. Every other call polls first
+    (see `_poll_github`) and stores the result in `view_cache` when given.
+    `main()` calls this every DISPLAY_TICK_SECONDS and sets `poll` only when
+    `next_poll_seconds` has elapsed. See `_show` for the display half.
+
+    `clock`, when given, returns the current time; the display half then
+    uses it instead of `now`, so a card's dwell is timed from when it is
+    actually drawn rather than from when a slow poll before it began.
+    """
+    c = cfg["ci_status"]
+    view = view_cache.get("view") if view_cache is not None and not poll else None
+    polled = view is None
+    if polled:
+        view = _poll_github(poller, c, now, state_cache, running_cache, quota_cache,
+                            repo_cache, fetch_health, branch_cache)
+        if view_cache is not None:
+            view_cache["view"] = view
+        if clock is not None:
+            now = clock()
+    return _show(client, c, now, view, overlay_state, quota_cache, dry_run, polled)
+
+
+def _poll_github(poller, c: dict, now: datetime, state_cache: dict[str, RepoState],
+                 running_cache: dict[str, list[dict]] | None, quota_cache: dict | None,
+                 repo_cache: dict | None, fetch_health: dict | None,
+                 branch_cache: dict | None) -> _View:
+    """Ask GitHub about every watched repo and update the caller's caches.
 
     GitHub answers four ways per repo (see `github.FETCH_FAILED`): a list
     (new body), None (304: the cached copy is current), FETCH_FAILED (could
@@ -146,6 +263,16 @@ def run_once(client, poller, cfg: dict, now: datetime,
     withheld: it is a claim about every repo, not about the ones that
     happened to answer.
 
+    Default branch: a repo whose default branch is known (`_default_branches`)
+    gets a second conditional request, for that branch only. Its verdicts
+    (`logic.default_branch_verdicts`) are remembered in the repo's state and
+    decide the default-branch failure cards, so a failure there stays until
+    that workflow passes on the default branch -- whatever runs elsewhere,
+    and however many newer runs there are. That request's 304, failure or
+    refusal leaves the remembered verdicts standing; they are dropped only
+    with the rest of the repo's state. A repo with no known default branch
+    makes only the first request and is judged across all branches.
+
     Account-wide watching (v1.5.1): when `repo_cache` is given, the
     effective repo list for this poll is resolved fresh each call via
     `resolve_repo_list` (cheap -- it's a set operation over already-cached
@@ -158,43 +285,8 @@ def run_once(client, poller, cfg: dict, now: datetime,
     -- has its cached state dropped (and the poller's own per-repo ETag
     slots forgotten via `forget_repo`) so a stale failure/stuck alert or
     running badge can't linger for a repo that's no longer being watched.
-
-    Overlay rotation: the overlay tier draws one frame per dwell slot,
-    cycling through `build_overlay_sequence(...)`'s ordered frame list (see
-    the "Failure/stuck/green rotation" paragraph below for what populates
-    it). A dwell slot only fires once `overlay_gap_elapsed(last_dwell_end, now) >=
-    OVERLAY_DWELL_SECONDS` (busybar.display's contract: stay silent at
-    least one full dwell so the ambient calendar has a real chance to
-    reclaim the screen in between -- see busybar/display.py and the spec
-    doc's v1.5 section for why). `overlay_state`'s `frame_index` and
-    `last_dwell_end` only commit once `client.draw` actually returns
-    DRAWN, same discipline as calendar_countdown's transition-state fix: a
-    failed draw must not be mistaken for a completed dwell, or the
-    rotation would silently skip frames / wait a dwell for nothing.
-
-    The shared presentation helper remembers the last accepted shape, types
-    and priority. Modern local firmware removes obsolete IDs at same-priority
-    transitions; legacy or incompatible transitions clear this app's canvas.
-    Rotation bookkeeping resets must retain that display state until the
-    next successful draw or clear. Complete payloads still renew all TTLs and
-    recover evicted content. CI bitmap icons are optional cosmetic additions.
-
-    Failure/stuck/green rotation (v1.6, Request B): the overlay tier's
-    rotation is no longer gated on a run being active -- `build_overlay_sequence`
-    folds in one frame per failing run, one per stuck run, the running CI
-    badge (only while a run is active), each available quota frame, and a
-    single quiet-green frame (only when nothing else is present and
-    `show_green` is on), and the dwell/silence gate above applies uniformly
-    across all of them. This means a failure rotates into view and keeps
-    rotating even with no CI run currently in progress, instead of only
-    showing while `running_cache`/`show_running` happened to have something
-    active. `overlay_state["led_was_on"]` tracks the failure-driven LED
-    across polls (see `resolve_ci_led_value`): it commits to
-    `led_should_be_on` only once a draw actually lands (DRAWN), same DRAWN
-    discipline as `frame_index`/`last_dwell_end`.
     """
-    c = cfg["ci_status"]
-
+    account_repos = None
     if repo_cache is not None:
         account_repos = (_refresh_account_repos(poller, repo_cache, now,
                                                  c.get("repo_refresh_minutes", 60))
@@ -219,8 +311,15 @@ def run_once(client, poller, cfg: dict, now: datetime,
             poller.forget_repo(repo)
     for key in [k for k in fetch_health if k[1] not in effective_repos]:
         del fetch_health[key]
+    if branch_cache is not None:
+        for repo in set(branch_cache) - set(effective_repos):
+            del branch_cache[repo]
+            poller.forget_repo(repo)
 
     labels = repo_labels(list(effective_repos))  # display names only; API calls keep the full name
+    branches = _default_branches(poller, effective_repos, account_repos, branch_cache, now,
+                                 c.get("repo_refresh_minutes", 60))
+    unreadable = (LookupError, TypeError, ValueError, AttributeError)
 
     dropped: set[str] = set()   # repos whose cached state expired this poll
     for repo in effective_repos:
@@ -229,11 +328,44 @@ def run_once(client, poller, cfg: dict, now: datetime,
         cached = state_cache.get(repo)
         # A new body, else the runs behind the cached state (304 or failure).
         runs = fetched if answered and fetched is not None else (cached.runs if cached else None)
+
+        branch = branches.get(repo)
+        verdicts = cached.default_verdicts if cached else None
+        if branch is not None and verdicts is not None and isinstance(fetched, list):
+            # A new all-branches page is the newest view there is: its newest
+            # default-branch run of a workflow is that workflow's newest
+            # default-branch run. Folding it in first keeps a fresh failure
+            # showing while the default-branch page itself cannot be read; the
+            # default-branch page, read after it, then has the last word. A
+            # cached (304) page is never folded again, since it may be older
+            # than the default-branch page already applied.
+            try:
+                verdicts = default_branch_verdicts(repo, fetched, branch, verdicts)
+            except unreadable:
+                pass   # evaluate_runs below reports this body as unreadable
+        if branch is not None:
+            default_runs = poller.fetch_default_runs(repo, branch)
+            if isinstance(default_runs, list):
+                try:
+                    verdicts = default_branch_verdicts(repo, default_runs, branch, verdicts)
+                except unreadable as exc:
+                    # Same ETag reasoning as below: re-read it next poll.
+                    poller.forget_default_runs(repo)
+                    poller.warn(f"default runs {repo}",
+                                f"skipping {repo}'s {branch} branch this poll: "
+                                f"unreadable run data ({exc!r})")
+                else:
+                    if runs is None:
+                        # No state yet to hold these verdicts. Forget the ETag
+                        # so the page is read again rather than answered 304.
+                        poller.forget_default_runs(repo)
+
         if runs is not None:
             try:
-                state_cache[repo] = evaluate_runs(repo, runs, now,
-                                                  c["stale_queued_minutes"])
-            except (LookupError, TypeError, ValueError, AttributeError) as exc:
+                state_cache[repo] = evaluate_runs(repo, runs, now, c["stale_queued_minutes"],
+                                                  default_branch=branch,
+                                                  default_verdicts=verdicts)
+            except unreadable as exc:
                 fetched = FETCH_FAILED   # could not read it: says nothing about the repo
                 # The poller already committed this body's ETag; forget it so
                 # the next poll re-reads the body instead of getting a 304.
@@ -245,15 +377,10 @@ def run_once(client, poller, cfg: dict, now: datetime,
             poller.forget_repo(repo, running=False)
             dropped.add(repo)
 
-    states = list(state_cache.values())
-
     # Running detection (unchanged gating): a live run enables the CI badge and,
     # with show_quota, the quota frames. Independent of failures, which rotate
     # regardless of whether anything is running.
-    running_info = None
-    running_present = False
-    quota_by_bucket = None
-    quota_frames: list[str] = []
+    running = None
     if running_cache is not None and c["show_running"]:
         for repo in effective_repos:
             running_runs = poller.fetch_running_runs(repo)
@@ -273,19 +400,10 @@ def run_once(client, poller, cfg: dict, now: datetime,
         if selected is not None:
             run, repo, other_count = selected
             median = poller.fetch_median_eta(repo, run["workflow_id"])
-            running_info = RunningInfo(run=run, repo=labels.get(repo, repo), other_count=other_count,
-                                       median_minutes=median, now=now)
-            running_present = True
+            running = (run, labels.get(repo, repo), other_count, median)
             if c["show_quota"]:
-                quota_by_bucket = _refresh_quota(poller, quota_cache, now)
-                if quota_by_bucket:
-                    if "graphql" in quota_by_bucket:
-                        quota_frames.append(OVERLAY_FRAME_QUOTA_GQL)
-                    if "core" in quota_by_bucket:
-                        quota_frames.append(OVERLAY_FRAME_QUOTA_REST)
+                _fetch_quota(poller, quota_cache, now)
 
-    # "ALL CLEAR" only when every watched repo has actually been read.
-    show_green = c["show_green"] and all(repo in state_cache for repo in effective_repos)
     if dropped:
         # One line per poll, not per repo: a revoked token refuses every repo
         # at once. Each repo is dropped once; it reappears only after a good
@@ -293,8 +411,80 @@ def run_once(client, poller, cfg: dict, now: datetime,
         log.warning("GitHub has refused %s for %d min; dropped cached CI state",
                     ", ".join(sorted(dropped)), STALE_STATE_SECONDS // 60)
 
-    sequence = build_overlay_sequence(states, running_present=running_present,
-                                      quota_frames=quota_frames, show_green=show_green)
+    return _View(
+        states=list(state_cache.values()), labels=labels,
+        # "ALL CLEAR" only when every watched repo has actually been read.
+        show_green=c["show_green"] and all(repo in state_cache for repo in effective_repos),
+        running=running, show_quota=bool(running and c["show_quota"]))
+
+
+def _show(client, c: dict, now: datetime, view: _View, overlay_state: dict | None,
+          quota_cache: dict | None, dry_run: bool, polled: bool) -> str:
+    """Give the display its turn: draw the next card if one is due.
+
+    Overlay rotation: the overlay tier draws one frame per dwell slot,
+    cycling through `build_overlay_sequence(...)`'s ordered frame list (see
+    the "Failure/stuck/green rotation" paragraph below for what populates
+    it). A dwell slot only fires once `overlay_gap_elapsed(last_dwell_end, now) >=
+    OVERLAY_DWELL_SECONDS` (busybar.display's contract: stay silent at
+    least one full dwell so the ambient calendar has a real chance to
+    reclaim the screen in between -- see busybar/display.py and the spec
+    doc's v1.5 section for why). `overlay_state`'s `frame_index` and
+    `last_dwell_end` only commit once `client.draw` actually returns
+    DRAWN, same discipline as calendar_countdown's transition-state fix: a
+    failed draw must not be mistaken for a completed dwell, or the
+    rotation would silently skip frames / wait a dwell for nothing.
+
+    Called every DISPLAY_TICK_SECONDS, so the rhythm is one card for a
+    dwell, then a dwell of silence, at any GitHub poll cadence. Most ticks
+    fall inside a dwell or its silence and touch nothing. Two rules keep
+    the faster tick from sending the device more requests than one per
+    slot: with nothing to show, the device is cleared on polls only
+    (`polled`), as it was before the tick existed; and a draw the device
+    refused or failed (REJECTED while the calendar holds a higher tier, or
+    ERROR) is retried after OVERLAY_SLOT_SECONDS, not on the next tick. An
+    UNREACHABLE draw is not held back here: `main()` already sleeps its
+    backoff before calling again.
+
+    The shared presentation helper remembers the last accepted shape, types
+    and priority. Modern local firmware removes obsolete IDs at same-priority
+    transitions; legacy or incompatible transitions clear this app's canvas.
+    Rotation bookkeeping resets must retain that display state until the
+    next successful draw or clear. Complete payloads still renew all TTLs and
+    recover evicted content. CI bitmap icons are optional cosmetic additions.
+
+    Failure/stuck/green rotation (v1.6, Request B): the overlay tier's
+    rotation is no longer gated on a run being active -- `build_overlay_sequence`
+    folds in one frame per failing run, one per stuck run, the running CI
+    badge (only while a run is active), each available quota frame, and a
+    single quiet-green frame (only when nothing else is present and
+    `show_green` is on), and the dwell/silence gate above applies uniformly
+    across all of them. This means a failure rotates into view and keeps
+    rotating even with no CI run currently in progress, instead of only
+    showing while `running_cache`/`show_running` happened to have something
+    active. `overlay_state["led_was_on"]` tracks the failure-driven LED
+    across calls (see `resolve_ci_led_value`): it commits to
+    `led_should_be_on` only once a draw actually lands (DRAWN), same DRAWN
+    discipline as `frame_index`/`last_dwell_end`.
+    """
+    states = view.states
+    running_info = None
+    quota_by_bucket = None
+    quota_frames: list[str] = []
+    if view.running is not None:
+        run, repo_label, other_count, median = view.running
+        running_info = RunningInfo(run=run, repo=repo_label, other_count=other_count,
+                                   median_minutes=median, now=now)
+        if view.show_quota:
+            quota_by_bucket = _quota_infos(quota_cache, now)
+            if quota_by_bucket:
+                if "graphql" in quota_by_bucket:
+                    quota_frames.append(OVERLAY_FRAME_QUOTA_GQL)
+                if "core" in quota_by_bucket:
+                    quota_frames.append(OVERLAY_FRAME_QUOTA_REST)
+
+    sequence = build_overlay_sequence(states, running_present=running_info is not None,
+                                      quota_frames=quota_frames, show_green=view.show_green)
 
     # Failure-driven LED (Request B keeps a gentle cue). led_should_be_on is
     # driven by FAILURES only -- stuck keeps its historical LED-None behavior.
@@ -308,8 +498,11 @@ def run_once(client, poller, cfg: dict, now: datetime,
         if overlay_state is not None:
             overlay_state.pop("frame_index", None)
             overlay_state.pop("last_dwell_end", None)
+            overlay_state.pop("retry_at", None)
         if dry_run:
             return "DRY-RUN: nothing to show"
+        if not polled:
+            return "nothing to show"   # the poll already cleared; leave the device alone
         if led_value == LED_OFF_COLOR:
             result = client.draw(APP, LED_OFF_ELEMENTS, priority=PRIORITY_OVERLAY,
                                  led_notification_color=LED_OFF_COLOR)
@@ -329,11 +522,14 @@ def run_once(client, poller, cfg: dict, now: datetime,
     last_dwell_end = overlay_state.get("last_dwell_end") if overlay_state is not None else None
     if overlay_gap_elapsed(last_dwell_end, now) < OVERLAY_DWELL_SECONDS:
         return "overlay dwell gap; staying silent (letting the ambient app reclaim the screen)"
+    retry_at = overlay_state.get("retry_at") if overlay_state is not None else None
+    if retry_at is not None and now < retry_at:
+        return "overlay draw was refused; waiting for the next slot"
 
     payload = build_overlay_payload(sequence[frame_index], OVERLAY_DWELL_SECONDS,
                                     running=running_info, quota_by_bucket=quota_by_bucket,
                                     show_spinner=c.get("running_spinner", False),
-                                    repo_labels=labels)
+                                    repo_labels=view.labels)
 
     if dry_run:
         return f"DRY-RUN payload: {payload!r} led={led_value}"
@@ -348,11 +544,15 @@ def run_once(client, poller, cfg: dict, now: datetime,
 
     result = client.draw(APP, payload["elements"], priority=payload["priority"],
                          led_notification_color=led_value)
-    if result == DrawResult.DRAWN and overlay_state is not None:
-        commit_frame(overlay_state, payload["elements"], payload["priority"], result)
-        overlay_state["led_was_on"] = led_should_be_on
-        overlay_state["frame_index"] = frame_index + 1
-        overlay_state["last_dwell_end"] = now + timedelta(seconds=OVERLAY_DWELL_SECONDS)
+    if overlay_state is not None:
+        if result == DrawResult.DRAWN:
+            commit_frame(overlay_state, payload["elements"], payload["priority"], result)
+            overlay_state["led_was_on"] = led_should_be_on
+            overlay_state["frame_index"] = frame_index + 1
+            overlay_state["last_dwell_end"] = now + timedelta(seconds=OVERLAY_DWELL_SECONDS)
+            overlay_state.pop("retry_at", None)
+        elif result != DrawResult.UNREACHABLE:
+            overlay_state["retry_at"] = now + timedelta(seconds=OVERLAY_SLOT_SECONDS)
 
     text = next(e["text"] for e in payload["elements"]
                 if e["type"] == "text" and e["id"] != "ci_header")
@@ -371,6 +571,8 @@ def next_poll_seconds(cfg_ci: dict, running_cache: dict[str, list[dict]]) -> int
     silently miss an active run on any of those and never shorten the
     poll interval for it. A pure function of `running_cache`'s
     post-`run_once` state so it's testable without mocking `time.sleep`.
+    This is the interval between GitHub polls only; main() gives the display
+    a turn every DISPLAY_TICK_SECONDS regardless.
     """
     any_running = any(running_cache.values())
     return cfg_ci["running_poll_seconds"] if any_running else cfg_ci["poll_seconds"]
@@ -392,15 +594,19 @@ def config_requires_repos(cfg: dict) -> str | None:
     return None
 
 
-def should_log_info(summary: str, last_logged_summary: str | None,
-                    seconds_since_heartbeat: float,
+def should_log_info(summary: str, logged: set[str], seconds_since_window_start: float,
                     heartbeat_seconds: int = HEARTBEAT_SECONDS) -> bool:
-    """Log-noise control, mirroring calendar_countdown's and nyan_filler's
-    should_log_info: INFO only when the summary changed since the last INFO
-    line, or a heartbeat interval has elapsed (so a long unchanging run
-    still leaves a periodic "yes, I'm alive" trail) -- DEBUG otherwise.
+    """Log-noise control: INFO for a summary not yet logged in the current
+    heartbeat window, or once the window has run out (so a long unchanging
+    run still leaves a periodic "yes, I'm alive" trail) -- DEBUG otherwise.
+
+    calendar_countdown and nyan_filler compare against the last line only.
+    Here cards alternate with silence every few seconds, so "changed since
+    the last line" would log every card every time it came round; `logged`
+    holds every summary logged this window instead. main() empties it when
+    the window runs out, which also bounds its size.
     """
-    return summary != last_logged_summary or seconds_since_heartbeat >= heartbeat_seconds
+    return summary not in logged or seconds_since_window_start >= heartbeat_seconds
 
 
 def main() -> int:
@@ -430,30 +636,41 @@ def main() -> int:
     quota_cache: dict = {}
     repo_cache: dict = {}
     fetch_health: dict = {}
+    branch_cache: dict = {}
+    view_cache: dict = {}
     backoff = 5
-    last_logged_summary: str | None = None
-    last_heartbeat = time.monotonic()
+    logged: set[str] = set()
+    window_start = time.monotonic()
+    next_poll_at = window_start   # the first iteration polls
     while True:
+        # The display gets a turn every iteration; GitHub only when a poll is due.
+        poll = time.monotonic() >= next_poll_at
         summary = run_once(client, poller, cfg, datetime.now(timezone.utc),
                            state_cache, args.dry_run, running_cache=running_cache,
                            overlay_state=overlay_state, quota_cache=quota_cache,
-                           repo_cache=repo_cache, fetch_health=fetch_health)
+                           repo_cache=repo_cache, fetch_health=fetch_health,
+                           branch_cache=branch_cache, view_cache=view_cache, poll=poll,
+                           clock=lambda: datetime.now(timezone.utc))
         now_monotonic = time.monotonic()
-        if args.once or should_log_info(summary, last_logged_summary,
-                                        now_monotonic - last_heartbeat):
+        if poll:
+            next_poll_at = now_monotonic + next_poll_seconds(cfg["ci_status"], running_cache)
+        in_window = now_monotonic - window_start
+        if args.once or should_log_info(summary, logged, in_window):
+            if in_window >= HEARTBEAT_SECONDS:
+                logged.clear()
+                window_start = now_monotonic
             log.info(summary)
-            last_logged_summary = summary
-            last_heartbeat = now_monotonic
+            logged.add(summary)
         else:
             log.debug(summary)
         if args.once:
             return 0
-        if summary.endswith("unreachable"):  # device offline: back off, not full poll
+        if summary.endswith("unreachable"):  # device offline: back off, not every tick
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)
         else:
             backoff = 5
-            time.sleep(next_poll_seconds(cfg["ci_status"], running_cache))
+            time.sleep(DISPLAY_TICK_SECONDS)
 
 
 if __name__ == "__main__":

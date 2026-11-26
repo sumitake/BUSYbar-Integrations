@@ -9,7 +9,8 @@ from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS
 from ci_status.logic import FailingRun, RepoState
 from ci_status.github import FETCH_DENIED, FETCH_FAILED, RestPoller
 from ci_status.main import (run_once, next_poll_seconds, config_requires_repos,
-                            should_log_info, STALE_STATE_SECONDS)
+                            should_log_info, STALE_STATE_SECONDS,
+                            DEFAULT_BRANCH_RETRY_SECONDS, DISPLAY_TICK_SECONDS)
 
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=timezone.utc)
 CFG = {"ci_status": {"poll_seconds": 120, "repos": ["o/r"],
@@ -434,7 +435,7 @@ def test_rotation_shape_change_clears_first():
 
 def test_quota_frame_skipped_without_crashing_when_fetch_fails():
     # No successful rate_limit fetch ever (and quota_cache starts empty),
-    # so _refresh_quota keeps returning None -- build_overlay_sequence never
+    # so _quota_infos keeps returning None -- build_overlay_sequence never
     # includes a quota frame in the rotation at all (it only folds in frames
     # whose data is already on hand), so the CI badge just keeps redrawing
     # in its place, no crash, no stale/placeholder quota numbers ever shown.
@@ -457,7 +458,7 @@ def test_quota_frame_skipped_without_crashing_when_fetch_fails():
 
 def test_quota_stale_data_not_shown_after_5_minutes():
     # Cached quota data older than QUOTA_STALE_SECONDS is treated as
-    # unavailable by _refresh_quota -- same as a fetch failure -- so it
+    # unavailable by _quota_infos -- same as a fetch failure -- so it
     # never surfaces in the rotation; the CI badge draws again instead of
     # showing minutes-old numbers.
     client = Mock(); client.draw.return_value = DrawResult.DRAWN
@@ -709,11 +710,11 @@ def test_overlay_dwell_rejected_during_calendar_elevation_resumes_after():
 
     # Poll 2: calendar has dropped back down -- the SAME dwell slot (never
     # consumed, since the rejected attempt didn't commit) draws successfully.
-    # This is the "no crash, rotation resumes after" requirement -- an
-    # immediate retry lands, not a wait for a phantom dwell that never
-    # actually rendered anything.
+    # This is the "no crash, rotation resumes after" requirement. The retry
+    # comes one rotation slot later, not on the next 1 s display tick: see
+    # test_refused_draw_is_retried_once_per_slot_not_once_per_tick.
     client.draw.return_value = DrawResult.DRAWN
-    soon_after = NOW + timedelta(seconds=1)
+    soon_after = NOW + timedelta(seconds=2 * OVERLAY_DWELL_SECONDS)   # the next rotation slot
     summary2 = run_once(client, poller, CFG_RUNNING, soon_after, {}, dry_run=False,
                         running_cache={}, overlay_state=overlay_state)
     assert "drawn" in summary2
@@ -956,16 +957,23 @@ def test_unusable_running_data_skips_the_repo_and_keeps_previous_runs():
 # --- log-noise control (the other two agents' change-or-heartbeat gate) ----------
 
 def test_should_log_info_true_when_summary_changes():
-    assert should_log_info("'CI FAIL o/r' -> drawn", "nothing to show; cleared", 0) is True
+    assert should_log_info("'CI FAIL o/r' -> drawn", {"nothing to show; cleared"}, 0) is True
 
 def test_should_log_info_false_when_unchanged_and_no_heartbeat_due():
-    assert should_log_info("nothing to show; cleared", "nothing to show; cleared", 1) is False
+    assert should_log_info("nothing to show; cleared", {"nothing to show; cleared"}, 1) is False
 
 def test_should_log_info_true_when_unchanged_past_heartbeat():
-    assert should_log_info("nothing to show; cleared", "nothing to show; cleared", 600) is True
+    assert should_log_info("nothing to show; cleared", {"nothing to show; cleared"}, 600) is True
 
 def test_should_log_info_true_on_first_summary():
-    assert should_log_info("nothing to show; cleared", None, 0) is True
+    assert should_log_info("nothing to show; cleared", set(), 0) is True
+
+
+def test_should_log_info_false_for_any_summary_already_logged_this_window():
+    # Cards alternate every 20 s; each distinct line is logged once per
+    # heartbeat window, not once per appearance.
+    logged = {"'CI FAIL r main tests' -> drawn", "'CI FAIL r main lint' -> drawn"}
+    assert should_log_info("'CI FAIL r main tests' -> drawn", logged, 40) is False
 
 
 def test_main_logs_an_unchanged_summary_once_not_every_poll(monkeypatch, caplog):
@@ -1141,3 +1149,450 @@ def test_unusable_run_data_warns_once_with_a_real_poller(caplog):
             run_once(client, poller, CFG, NOW + timedelta(minutes=minutes), {}, False)
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1 and "skipping o/r this poll" in warnings[0]
+
+
+# --- default-branch failures stay visible until the default branch is green -----
+
+def _branch_run(conclusion, branch="main", workflow_id=1, name="tests", pr=None,
+                status="completed") -> dict:
+    d = {"workflow_id": workflow_id, "name": name, "status": status, "conclusion": conclusion,
+         "created_at": "2026-08-03T13:30:00Z", "head_branch": branch,
+         "head_repository": {"full_name": "o/r"}}
+    if pr is not None:
+        d["pull_requests"] = [{"number": pr}]
+    return d
+
+
+def _branch_poller(all_runs, default_runs, branch="main") -> Mock:
+    poller = Mock()
+    poller.fetch_default_branch.return_value = branch
+    poller.fetch_runs.return_value = all_runs
+    poller.fetch_default_runs.return_value = default_runs
+    return poller
+
+
+MAIN_FAIL = FailingRun("tests", "main")
+
+
+def test_default_branch_failure_shows_despite_a_newer_pr_success():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([_branch_run("success", branch="feature", pr=7)],
+                            [_branch_run("failure")])
+    summary = run_once(client, poller, CFG, NOW, {}, dry_run=False, branch_cache={})
+    assert "CI FAIL" in summary
+    assert any("main tests" in t for t in _drawn_texts(client))
+    poller.fetch_default_runs.assert_called_once_with("o/r", "main")
+
+
+def test_default_branch_failure_outlives_newer_runs_304s_and_outages_until_green():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([_branch_run("success", branch="feature")], [_branch_run("failure")])
+    state_cache: dict = {}; branch_cache: dict = {}
+
+    def poll(minutes):
+        run_once(client, poller, CFG, NOW + timedelta(minutes=minutes), state_cache,
+                 dry_run=False, branch_cache=branch_cache)
+        return state_cache["o/r"].failing
+
+    assert poll(0) == [MAIN_FAIL]
+    # The failing run falls off both pages: 100 newer default-branch runs of
+    # other workflows, and 10 newer runs on other branches.
+    poller.fetch_default_runs.return_value = [
+        _branch_run("success", workflow_id=100 + i, name=f"wf{i}") for i in range(100)]
+    poller.fetch_runs.return_value = [
+        _branch_run("success", branch="feature", workflow_id=200 + i) for i in range(10)]
+    assert poll(2) == [MAIN_FAIL]
+    poller.fetch_default_runs.return_value = None      # 304
+    poller.fetch_runs.return_value = None
+    assert poll(4) == [MAIN_FAIL]
+    poller.fetch_default_runs.return_value = FETCH_FAILED
+    assert poll(6) == [MAIN_FAIL]
+    poller.fetch_default_runs.return_value = [_branch_run(None, status="in_progress")]  # re-run started
+    assert poll(8) == [MAIN_FAIL]
+    poller.fetch_default_runs.return_value = [_branch_run("success")]
+    assert poll(10) == []
+
+
+def test_pr_failure_keeps_showing_next_to_default_branch_tracking():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([_branch_run("failure", branch="feature", pr=7)],
+                            [_branch_run("success")])
+    state_cache: dict = {}
+    run_once(client, poller, CFG, NOW, state_cache, dry_run=False, branch_cache={})
+    assert state_cache["o/r"].failing == [FailingRun("tests", "#7")]
+
+
+def test_unknown_default_branch_keeps_the_all_branch_rule_and_retries_slowly():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_default_branch.return_value = FETCH_FAILED
+    poller.fetch_runs.return_value = [_branch_run("failure")]
+    state_cache: dict = {}; branch_cache: dict = {}
+    for seconds in (0, 120, 240):
+        run_once(client, poller, CFG, NOW + timedelta(seconds=seconds), state_cache,
+                 dry_run=False, branch_cache=branch_cache)
+    assert state_cache["o/r"].failing == [MAIN_FAIL]        # judged as before this feature
+    poller.fetch_default_runs.assert_not_called()
+    assert poller.fetch_default_branch.call_count == 1      # not once per poll
+    assert any("default branch" in call.args[1] for call in poller.warn.call_args_list)
+
+    poller.fetch_default_branch.return_value = "main"
+    poller.fetch_default_runs.return_value = []
+    run_once(client, poller, CFG, NOW + timedelta(seconds=DEFAULT_BRANCH_RETRY_SECONDS),
+             state_cache, dry_run=False, branch_cache=branch_cache)
+    assert poller.fetch_default_branch.call_count == 2
+    poller.fetch_default_runs.assert_called_once_with("o/r", "main")
+
+
+def test_known_default_branch_is_looked_up_once_per_refresh_interval():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([], [])
+    branch_cache: dict = {}
+    for minutes in range(0, 60, 2):
+        run_once(client, poller, CFG, NOW + timedelta(minutes=minutes), {}, dry_run=False,
+                 branch_cache=branch_cache)
+    assert poller.fetch_default_branch.call_count == 1
+    assert poller.fetch_default_runs.call_count == 30       # one conditional request per poll
+    # A failed re-check keeps the name already learned.
+    poller.fetch_default_branch.return_value = FETCH_FAILED
+    run_once(client, poller, CFG, NOW + timedelta(minutes=60), {}, dry_run=False,
+             branch_cache=branch_cache)
+    assert poller.fetch_default_branch.call_count == 2
+    assert poller.fetch_default_runs.call_args.args == ("o/r", "main")
+
+
+def test_account_enumeration_supplies_the_default_branch_without_a_lookup():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([], [])
+    poller.fetch_account_repos.return_value = [{**_account_repo("o/r"), "default_branch": "trunk"}]
+    cfg = {"ci_status": {**CFG["ci_status"], "repos": [], "watch_account_repos": True}}
+    run_once(client, poller, cfg, NOW, {}, dry_run=False, repo_cache={}, branch_cache={})
+    poller.fetch_default_branch.assert_not_called()
+    poller.fetch_default_runs.assert_called_once_with("o/r", "trunk")
+
+
+def test_no_default_branch_requests_without_a_branch_cache_or_account_list():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_run("failure")]
+    run_once(client, poller, CFG, NOW, {}, dry_run=False)
+    poller.fetch_default_branch.assert_not_called()
+    poller.fetch_default_runs.assert_not_called()
+
+
+def test_default_branch_page_read_before_any_state_exists_is_read_again():
+    # Its verdicts have nowhere to live yet, so the ETag must not turn the
+    # next poll into a 304 for a page that was never used.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller(FETCH_FAILED, [_branch_run("failure")])
+    state_cache: dict = {}
+    run_once(client, poller, CFG, NOW, state_cache, dry_run=False, branch_cache={})
+    assert "o/r" not in state_cache
+    poller.forget_default_runs.assert_called_with("o/r")
+
+
+def test_unreadable_default_branch_page_keeps_the_verdicts_and_is_read_again():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([], [_branch_run("failure")])
+    state_cache: dict = {}; branch_cache: dict = {}
+    run_once(client, poller, CFG, NOW, state_cache, dry_run=False, branch_cache=branch_cache)
+    poller.fetch_default_runs.return_value = ["not a run"]
+    run_once(client, poller, CFG, NOW + timedelta(minutes=2), state_cache, dry_run=False,
+             branch_cache=branch_cache)
+    assert state_cache["o/r"].failing == [MAIN_FAIL]
+    poller.forget_default_runs.assert_called_with("o/r")
+    assert any("o/r" in call.args[1] for call in poller.warn.call_args_list)
+
+
+def test_branch_cache_pruned_with_the_repo():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([], [])
+    branch_cache: dict = {}
+    run_once(client, poller, CFG, NOW, {}, dry_run=False, repo_cache={}, branch_cache=branch_cache)
+    assert "o/r" in branch_cache
+    cfg = {"ci_status": {**CFG["ci_status"], "repos": ["o/other"]}}
+    run_once(client, poller, cfg, NOW, {}, dry_run=False, repo_cache={}, branch_cache=branch_cache)
+    assert "o/r" not in branch_cache
+
+
+# --- card rotation is independent of the GitHub poll cadence --------------------
+
+def test_display_tick_rotates_from_the_last_poll_without_asking_github():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_run("failure")]
+    state_cache: dict = {}; overlay_state: dict = {}; view_cache: dict = {}
+    run_once(client, poller, CFG, NOW, state_cache, dry_run=False,
+             overlay_state=overlay_state, view_cache=view_cache)
+    poller.reset_mock(); client.reset_mock()
+    drawn_at = []
+    for second in range(1, 121):
+        run_once(client, poller, CFG, NOW + timedelta(seconds=second), state_cache,
+                 dry_run=False, overlay_state=overlay_state, view_cache=view_cache, poll=False)
+        if client.draw.called:
+            drawn_at.append(second)
+        else:
+            assert client.mock_calls == []      # the silent half: no draw, no clear
+        client.reset_mock()
+    # 10 s on, 10 s off, for the whole 120 s between two idle polls.
+    assert drawn_at == [20, 40, 60, 80, 100, 120]
+    assert poller.mock_calls == []
+
+
+def test_display_tick_rotates_the_running_badge_with_a_live_eta():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    poller.fetch_running_runs.return_value = [_running_run(started_min_ago=3)]
+    poller.fetch_median_eta.return_value = 10.0
+    state_cache: dict = {}; overlay_state: dict = {}; view_cache: dict = {}
+    kwargs = dict(dry_run=False, running_cache={}, overlay_state=overlay_state,
+                  view_cache=view_cache)
+    run_once(client, poller, CFG_RUNNING, NOW, state_cache, **kwargs)
+    first = _drawn_texts(client)
+    poller.reset_mock()
+    run_once(client, poller, CFG_RUNNING, NOW + timedelta(minutes=2), state_cache,
+             poll=False, **kwargs)
+    assert _drawn_texts(client) != first        # the countdown moved on without a poll
+    assert poller.mock_calls == []
+
+
+def test_display_tick_with_nothing_cached_polls():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_run("failure")]
+    run_once(client, poller, CFG, NOW, {}, dry_run=False, view_cache={}, poll=False)
+    poller.fetch_runs.assert_called_once()
+
+
+def test_display_tick_with_nothing_to_show_leaves_the_device_alone():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_run("success")]
+    state_cache: dict = {}; overlay_state: dict = {}; view_cache: dict = {}
+    run_once(client, poller, CFG, NOW, state_cache, dry_run=False,
+             overlay_state=overlay_state, view_cache=view_cache)
+    client.clear.assert_called_once()           # on the poll, as before
+    client.reset_mock()
+    for second in range(1, 30):
+        run_once(client, poller, CFG, NOW + timedelta(seconds=second), state_cache,
+                 dry_run=False, overlay_state=overlay_state, view_cache=view_cache, poll=False)
+    assert client.mock_calls == []
+
+
+def test_refused_draw_is_retried_once_per_slot_not_once_per_tick():
+    # While the calendar holds a higher tier every draw is refused. A 1 s
+    # tick must not turn that into one device request per second.
+    client = Mock(); client.draw.return_value = DrawResult.REJECTED
+    poller = Mock(); poller.fetch_runs.return_value = [_run("failure")]
+    state_cache: dict = {}; overlay_state: dict = {}; view_cache: dict = {}
+    for second in range(0, 61):
+        run_once(client, poller, CFG, NOW + timedelta(seconds=second), state_cache,
+                 dry_run=False, overlay_state=overlay_state, view_cache=view_cache,
+                 poll=second == 0)
+    assert client.draw.call_count == 4          # t = 0, 20, 40, 60
+    assert "frame_index" not in overlay_state and "led_was_on" not in overlay_state
+    client.draw.return_value = DrawResult.DRAWN
+    run_once(client, poller, CFG, NOW + timedelta(seconds=80), state_cache, dry_run=False,
+             overlay_state=overlay_state, view_cache=view_cache, poll=False)
+    assert overlay_state["frame_index"] == 1 and overlay_state["led_was_on"] is True
+
+
+def _simulate_main(monkeypatch, cfg_ci, poller, client, seconds, draw_result=DrawResult.DRAWN,
+                   poll_duration=0.0):
+    """Run the real main() loop against a fake clock for `seconds`; returns
+    (times of draw attempts, sleeps requested). Each poll takes
+    `poll_duration` seconds of fake time."""
+    import ci_status.main as ci_main
+
+    class Stop(Exception):
+        pass
+
+    clock = {"t": 0.0}
+    draws: list[float] = []
+    sleeps: list[float] = []
+
+    def fake_sleep(duration):
+        sleeps.append(duration)
+        clock["t"] += duration
+        if clock["t"] >= seconds:
+            raise Stop
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW + timedelta(seconds=clock["t"])
+
+    def draw(*args, **kwargs):
+        draws.append(clock["t"])
+        return draw_result
+
+    client.draw.side_effect = draw
+    runs = poller.fetch_runs.return_value
+
+    def slow_fetch_runs(repo):
+        clock["t"] += poll_duration
+        return runs
+
+    poller.fetch_runs.side_effect = slow_fetch_runs
+    monkeypatch.setattr("sys.argv", ["ci_status"])
+    monkeypatch.setattr(ci_main, "load_config", lambda: {"ci_status": cfg_ci, "device": {}})
+    monkeypatch.setattr(ci_main, "device_kwargs", lambda cfg: {})
+    monkeypatch.setattr(ci_main, "BusyBarClient", lambda **kwargs: client)
+    monkeypatch.setattr(ci_main, "get_token", lambda: "tok")
+    monkeypatch.setattr(ci_main, "RestPoller", lambda token: poller)
+    monkeypatch.setattr(ci_main, "datetime", FakeDatetime)
+    monkeypatch.setattr(ci_main.time, "sleep", fake_sleep)
+    monkeypatch.setattr(ci_main.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(ci_main.logging, "basicConfig", lambda **kwargs: None)
+    try:
+        ci_main.main()
+    except Stop:
+        pass
+    return draws, sleeps
+
+
+def _main_poller(running: bool) -> Mock:
+    poller = Mock()
+    poller.fetch_default_branch.return_value = FETCH_FAILED
+    poller.fetch_runs.return_value = [_run("failure")]
+    poller.fetch_running_runs.return_value = [_running_run()] if running else []
+    poller.fetch_median_eta.return_value = None
+    return poller
+
+
+def test_main_rotates_every_20s_while_polling_github_only_every_poll_seconds(monkeypatch):
+    poller = _main_poller(running=False)
+    draws, sleeps = _simulate_main(monkeypatch, CFG_RUNNING["ci_status"], poller, Mock(), 600)
+    assert draws == [float(t) for t in range(0, 600, 20)]           # 10 s on / 10 s off
+    assert set(sleeps) == {DISPLAY_TICK_SECONDS}
+    # GitHub request volume is what poll_seconds = 120 always meant.
+    assert poller.fetch_runs.call_count == 600 // 120
+    assert poller.fetch_running_runs.call_count == 600 // 120
+    assert poller.fetch_default_branch.call_count <= 600 // DEFAULT_BRANCH_RETRY_SECONDS
+
+
+def test_main_rotation_and_request_volume_at_the_running_cadence(monkeypatch):
+    poller = _main_poller(running=True)
+    draws, _ = _simulate_main(monkeypatch, CFG_RUNNING["ci_status"], poller, Mock(), 600)
+    assert draws == [float(t) for t in range(0, 600, 20)]
+    assert poller.fetch_runs.call_count == 600 // 20                # running_poll_seconds
+    assert poller.fetch_running_runs.call_count == 600 // 20
+
+
+def test_main_keeps_the_backoff_while_the_device_is_unreachable(monkeypatch):
+    poller = _main_poller(running=False)
+    draws, sleeps = _simulate_main(monkeypatch, CFG_RUNNING["ci_status"], poller, Mock(), 900,
+                                   draw_result=DrawResult.UNREACHABLE)
+    assert sleeps[:7] == [5, 10, 20, 40, 80, 160, 300]
+    assert len(draws) == len(sleeps)                                # one attempt per backoff step
+    assert poller.fetch_runs.call_count <= 900 // 120 + 1           # still one poll per poll_seconds
+
+
+def test_main_logs_each_rotating_card_once_per_heartbeat_window(monkeypatch, caplog):
+    import logging
+    poller = _main_poller(running=False)
+    poller.fetch_runs.return_value = [_run("failure"),
+                                      {**_run("failure"), "workflow_id": 2, "name": "lint"}]
+    with caplog.at_level(logging.DEBUG, logger="ci_status"):
+        _simulate_main(monkeypatch, CFG_RUNNING["ci_status"], poller, Mock(), 500)
+    info = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert len(info) == 3 and len(set(info)) == 3   # two cards and the silent gap, once each
+
+
+def test_a_slow_poll_delays_the_card_but_keeps_its_silence(monkeypatch):
+    # The dwell is timed from when the card is actually drawn, not from when
+    # the poll that preceded it started.
+    for duration in (3.0, 12.0, 25.0):
+        poller = _main_poller(running=False)
+        draws, _ = _simulate_main(monkeypatch, CFG_RUNNING["ci_status"], poller, Mock(), 400,
+                                  poll_duration=duration)
+        assert draws[0] == duration
+        gaps = [b - a for a, b in zip(draws, draws[1:])]
+        assert gaps and min(gaps) >= 2 * OVERLAY_DWELL_SECONDS, (duration, draws)
+
+
+def test_new_default_branch_failure_shows_while_the_default_page_cannot_be_read():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([_branch_run("success")], [_branch_run("success")])
+    state_cache: dict = {}; branch_cache: dict = {}
+    run_once(client, poller, CFG, NOW, state_cache, dry_run=False, branch_cache=branch_cache)
+    assert state_cache["o/r"].failing == []
+    # The all-branches page shows a fresh default-branch failure; the
+    # default-branch page fails in the same poll (a rate-limit pause began).
+    poller.fetch_runs.return_value = [_branch_run("failure")]
+    for result in (FETCH_FAILED, FETCH_DENIED, None):
+        poller.fetch_default_runs.return_value = result
+        run_once(client, poller, CFG, NOW + timedelta(minutes=2), state_cache, dry_run=False,
+                 branch_cache=branch_cache)
+        assert state_cache["o/r"].failing == [MAIN_FAIL], result
+    # Once the all-branches page moves on, the failure is held by the verdicts.
+    poller.fetch_runs.return_value = [_branch_run("success", branch="feature")]
+    poller.fetch_default_runs.return_value = None
+    run_once(client, poller, CFG, NOW + timedelta(minutes=4), state_cache, dry_run=False,
+             branch_cache=branch_cache)
+    assert state_cache["o/r"].failing == [MAIN_FAIL]
+
+
+def test_a_newer_default_page_is_not_undone_by_an_older_all_branches_page():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([_branch_run("failure")], [_branch_run("failure")])
+    state_cache: dict = {}; branch_cache: dict = {}
+    run_once(client, poller, CFG, NOW, state_cache, dry_run=False, branch_cache=branch_cache)
+    poller.fetch_runs.return_value = None                       # 304: still shows the failure
+    poller.fetch_default_runs.return_value = [_branch_run("success")]
+    run_once(client, poller, CFG, NOW + timedelta(minutes=2), state_cache, dry_run=False,
+             branch_cache=branch_cache)
+    assert state_cache["o/r"].failing == []
+
+
+def test_verdicts_survive_a_poll_in_which_the_default_branch_is_unknown():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([_branch_run("success", branch="feature")], [_branch_run("failure")])
+    poller.fetch_default_branch.return_value = FETCH_FAILED
+    owned = {**_account_repo("o/r"), "default_branch": "main"}
+    poller.fetch_account_repos.return_value = [owned]
+    cfg = {"ci_status": {**CFG["ci_status"], "watch_account_repos": True,
+                         "repo_refresh_minutes": 1}}
+    state_cache: dict = {}; branch_cache: dict = {}; repo_cache: dict = {}
+    run_once(client, poller, cfg, NOW, state_cache, dry_run=False, repo_cache=repo_cache,
+             branch_cache=branch_cache)
+    assert state_cache["o/r"].failing == [MAIN_FAIL]
+    # The enumeration stops listing the repo (it stays watched through
+    # `repos`) and the lookup fails: the name learned earlier is kept.
+    poller.fetch_account_repos.return_value = []
+    poller.fetch_default_runs.return_value = None               # 304 for the page already read
+    for minutes in (2, 4, 30):
+        run_once(client, poller, cfg, NOW + timedelta(minutes=minutes), state_cache,
+                 dry_run=False, repo_cache=repo_cache, branch_cache=branch_cache)
+        assert state_cache["o/r"].failing == [MAIN_FAIL], minutes
+
+
+def test_verdicts_are_carried_while_untracked_and_resume_when_the_branch_returns():
+    from ci_status.logic import Verdict, evaluate_runs
+    previous = {1: Verdict(11, MAIN_FAIL)}
+    untracked = evaluate_runs("o/r", [], NOW, 0, default_branch=None, default_verdicts=previous)
+    assert untracked.default_verdicts == previous
+
+
+def test_unreadable_default_page_keeps_the_all_branches_etag():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = _branch_poller([], ["not a run"])
+    run_once(client, poller, CFG, NOW, {}, dry_run=False, branch_cache={})
+    poller.forget_default_runs.assert_called_with("o/r")
+    assert all(call.kwargs.get("running", True) for call in poller.forget_repo.call_args_list)
+
+
+def test_retrying_the_failed_default_branch_run_keeps_the_card_and_led():
+    # The Codex review case through run_once: [11 failure, 10 success], then
+    # [11 in_progress, 10 success] must keep the card and the LED.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    fail = {**_branch_run("failure"), "id": 11}
+    older_ok = {**_branch_run("success"), "id": 10}
+    poller = _branch_poller([fail, older_ok], [fail, older_ok])
+    state_cache: dict = {}; branch_cache: dict = {}; overlay_state: dict = {}
+    run_once(client, poller, CFG, NOW, state_cache, dry_run=False, branch_cache=branch_cache,
+             overlay_state=overlay_state)
+    retrying = {**_branch_run(None, status="in_progress"), "id": 11}
+    poller.fetch_runs.return_value = [retrying, older_ok]
+    poller.fetch_default_runs.return_value = [retrying, older_ok]
+    run_once(client, poller, CFG, NOW + timedelta(minutes=2), state_cache, dry_run=False,
+             branch_cache=branch_cache, overlay_state=overlay_state)
+    assert state_cache["o/r"].failing == [MAIN_FAIL]
+    assert client.draw.call_args.kwargs["led_notification_color"] == "#FF0000FF"
