@@ -107,12 +107,14 @@ From the repository root, run these commands to install the calendar integration
 ```bash
 cd integrations/calendar_countdown
 mkdir -p ~/Library/Logs/busybar
-sed -e "s|__REPO__|$(git rev-parse --show-toplevel)|" -e "s|__UV__|$(command -v uv)|" -e "s|__HOME__|$HOME|" \
+sed -e "s|__REPO__|$(git rev-parse --show-toplevel)|" -e "s|__HOME__|$HOME|" \
   com.busybar.calendar-countdown.plist > ~/Library/LaunchAgents/com.busybar.calendar-countdown.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.busybar.calendar-countdown.plist
 ```
 
 The agent will start automatically at your next login and run continuously, polling your calendar at the interval specified in `config.toml`. The agent sets PYTHONPATH to the repo's src/ directory so the busybar package resolves even without a healthy editable install.
+
+The agent runs the project's own virtual-environment interpreter (`.venv/bin/python`), so run `uv sync` from the repository root before installing and again whenever dependencies change. It deliberately does not launch through `uv run`: macOS ties a background agent's Local Network, Files and Calendar permissions, and launchd's own launch record, to the identity of the program it starts, and a package-manager upgrade of `uv` replaces that program. A running agent then loses access to the bar's USB address and to the repository folder, and cannot be restarted until it is re-registered. The interpreter under `.venv` only changes when Python itself is upgraded; after that, or after recreating `.venv`, re-register the agent with the uninstall and install commands below and approve the permission prompts again.
 
 ### Uninstall LaunchAgent
 
