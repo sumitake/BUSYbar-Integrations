@@ -33,6 +33,10 @@ from calendar_countdown.logic import (  # noqa: E402
 from busybar.display import PRIORITY_OVERLAY  # noqa: E402
 
 FAILING = {"failure", "timed_out", "startup_failure"}
+# Conclusions that mean a default-branch workflow is green again. Anything
+# else that is not FAILING -- cancelled, still queued or running -- is no
+# verdict: it says nothing about the branch, so the last verdict stands.
+PASSING = {"success", "neutral", "skipped"}
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,11 @@ class RepoState:
     # run that never changes still has to age into "stuck". None on a
     # hand-built state with nothing to re-evaluate.
     runs: list[dict] | None = field(default=None, repr=False, compare=False)
+    # workflow_id -> the failure currently standing on the default branch
+    # (see default_branch_verdicts). None until the default-branch page has
+    # been read once; until then every branch is judged by `runs` alone.
+    default_verdicts: dict[int, FailingRun] | None = field(default=None, repr=False,
+                                                           compare=False)
 
 
 @dataclass
@@ -145,25 +154,82 @@ def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_
     return sorted(names)
 
 
+def _on_default_branch(run: dict, repo: str, default_branch: str) -> bool:
+    """True for a run of `repo`'s own default branch. A fork's pull request
+    from a branch that happens to share the name is not one: its
+    head_repository names the fork. A run with no readable head_repository
+    counts as the repo's own, so a body without that field cannot hide every
+    default-branch failure."""
+    if run.get("head_branch") != default_branch:
+        return False
+    head_repo = run.get("head_repository")
+    full_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+    # GitHub reports its canonical casing, which need not match the config.
+    return not isinstance(full_name, str) or full_name.lower() == repo.lower()
+
+
+def default_branch_verdicts(repo: str, runs: list[dict], default_branch: str,
+                            previous: dict[int, FailingRun] | None) -> dict[int, FailingRun]:
+    """The failures standing on `repo`'s default branch, by workflow_id:
+    `previous` updated from `runs` (newest first, as GitHub returns them).
+
+    For each workflow the newest default-branch run that carries a verdict
+    decides: a FAILING conclusion records the failure, a PASSING one removes
+    it. A workflow with no such run in `runs` keeps its previous entry, which
+    is what keeps a failure showing after it has left the page and while a
+    re-run is still in progress. Returns a new dict; `previous` is not
+    modified. Raises like evaluate_runs on a run it cannot read."""
+    verdicts = dict(previous or {})
+    decided: set[int] = set()
+    for r in runs:
+        workflow_id = r["workflow_id"]
+        if workflow_id in decided or not _on_default_branch(r, repo, default_branch):
+            continue
+        conclusion = r.get("conclusion")
+        if conclusion in FAILING:
+            verdicts[workflow_id] = FailingRun(r.get("name") or "", _pr_or_branch(r))
+        elif conclusion in PASSING:
+            verdicts.pop(workflow_id, None)
+        else:
+            continue
+        decided.add(workflow_id)
+    return verdicts
+
+
 def evaluate_runs(repo: str, runs: list[dict], now: datetime,
-                  stale_queued_minutes: int) -> RepoState:
-    """Raises LookupError/TypeError/ValueError/AttributeError on a run it
+                  stale_queued_minutes: int, *, default_branch: str | None = None,
+                  default_verdicts: dict[int, FailingRun] | None = None) -> RepoState:
+    """`runs` is the newest page across all branches; the newest run of each
+    workflow decides, as it always has. With `default_branch` and
+    `default_verdicts` both given, default-branch failures come from the
+    verdicts instead (see default_branch_verdicts), so neither a newer run on
+    another branch nor a full page can hide one; `runs` then decides only
+    pull-request and other-branch failures, and stuck runs on any branch.
+    Without both, every branch is judged by `runs` alone; `default_verdicts`
+    is still carried on the returned state, so a poll in which the default
+    branch is unknown does not lose verdicts read earlier.
+
+    Raises LookupError/TypeError/ValueError/AttributeError on a run it
     cannot read (not an object, no workflow_id, an unparseable created_at on
     a queued run); main.run_once skips the repo for that poll."""
+    tracked = default_branch is not None and default_verdicts is not None
     latest: dict[int, dict] = {}
     for r in runs:  # API returns newest first; keep first seen per workflow
         latest.setdefault(r["workflow_id"], r)
-    failing, stuck = [], []
+    failing = list(default_verdicts.values()) if tracked else []
+    stuck = []
     for r in latest.values():
         if r.get("conclusion") in FAILING:
-            failing.append(FailingRun(r.get("name") or "", _pr_or_branch(r)))
+            if not (tracked and _on_default_branch(r, repo, default_branch)):
+                failing.append(FailingRun(r.get("name") or "", _pr_or_branch(r)))
         elif r.get("status") == "queued" and stale_queued_minutes > 0:
             age_min = (now - _parse_ts(r["created_at"])).total_seconds() / 60
             if age_min >= stale_queued_minutes:
                 stuck.append(FailingRun(r.get("name") or "", _pr_or_branch(r)))
     key = lambda f: (f.workflow, f.ref)
     return RepoState(repo=repo, failing=sorted(failing, key=key),
-                     stuck=sorted(stuck, key=key), runs=runs)
+                     stuck=sorted(stuck, key=key), runs=runs,
+                     default_verdicts=default_verdicts)
 
 
 # --- overlay tier: shared row template (v1.5) -----------------------------------

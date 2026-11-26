@@ -649,3 +649,115 @@ def test_plain_403_without_a_rate_limit_message_is_still_a_refusal(mock_get):
     unreadable.json.side_effect = ValueError("no json")
     mock_get.return_value = unreadable
     assert RestPoller("tok").fetch_runs("o/r") is FETCH_DENIED
+
+
+# --- default-branch runs and the default-branch lookup ------------------------
+
+@patch("ci_status.github.requests.get")
+def test_fetch_default_runs_filters_to_the_branch_with_its_own_etag_slot(mock_get):
+    poller = RestPoller("tok")
+    mock_get.return_value = _response(200, {"workflow_runs": []}, etag='W/"all"')
+    poller.fetch_runs("o/r")
+
+    mock_get.return_value = _response(200, {"workflow_runs": [{"id": 3}]}, etag='W/"main"')
+    assert poller.fetch_default_runs("o/r", "main") == [{"id": 3}]
+    assert mock_get.call_args.args[0] == "https://api.github.com/repos/o/r/actions/runs"
+    assert mock_get.call_args.kwargs["params"] == {"branch": "main", "per_page": 100}
+    assert "If-None-Match" not in mock_get.call_args.kwargs["headers"]
+
+    mock_get.return_value = _response(304)
+    assert poller.fetch_default_runs("o/r", "main") is None
+    assert mock_get.call_args.kwargs["headers"]["If-None-Match"] == 'W/"main"'
+    poller.fetch_runs("o/r")
+    assert mock_get.call_args.kwargs["headers"]["If-None-Match"] == 'W/"all"'
+
+
+@patch("ci_status.github.requests.get")
+def test_fetch_default_runs_drops_the_etag_when_the_branch_name_changes(mock_get):
+    poller = RestPoller("tok")
+    mock_get.return_value = _response(200, {"workflow_runs": []}, etag='W/"master"')
+    poller.fetch_default_runs("o/r", "master")
+    poller.fetch_default_runs("o/r", "main")   # renamed: the old ETag answers another question
+    assert "If-None-Match" not in mock_get.call_args.kwargs["headers"]
+
+
+@patch("ci_status.github.requests.get")
+def test_fetch_default_runs_keeps_the_three_way_contract(mock_get):
+    poller = RestPoller("tok")
+    mock_get.return_value = _response(404)
+    assert poller.fetch_default_runs("o/r", "main") is FETCH_DENIED
+    mock_get.return_value = _response(502)
+    assert poller.fetch_default_runs("o/r", "main") is FETCH_FAILED
+    mock_get.side_effect = requests.ConnectionError()
+    assert poller.fetch_default_runs("o/r", "main") is FETCH_FAILED
+
+
+@patch("ci_status.github.time")
+@patch("ci_status.github.requests.get")
+def test_rate_limit_pause_also_silences_the_default_branch_requests(mock_get, mock_time):
+    mock_time.monotonic.return_value = 1000.0
+    mock_time.time.return_value = 5000.0
+    poller = RestPoller("tok")
+    mock_get.return_value = _limited(429, **{"Retry-After": "120"})
+    assert poller.fetch_runs("o/r") is FETCH_FAILED
+    sent = mock_get.call_count
+    assert poller.fetch_default_runs("o/r", "main") is FETCH_FAILED
+    assert poller.fetch_default_branch("o/r") is FETCH_FAILED
+    assert mock_get.call_count == sent
+
+
+@patch("ci_status.github.requests.get")
+def test_fetch_default_branch_reads_repo_metadata_and_answers_a_304_from_its_cache(mock_get):
+    poller = RestPoller("tok")
+    mock_get.return_value = _response(200, {"default_branch": "trunk"}, etag='W/"meta"')
+    assert poller.fetch_default_branch("o/r") == "trunk"
+    assert mock_get.call_args.args[0] == "https://api.github.com/repos/o/r"
+    assert "If-None-Match" not in mock_get.call_args.kwargs["headers"]
+
+    mock_get.return_value = _response(304)
+    assert poller.fetch_default_branch("o/r") == "trunk"
+    assert mock_get.call_args.kwargs["headers"]["If-None-Match"] == 'W/"meta"'
+
+
+@patch("ci_status.github.requests.get")
+def test_fetch_default_branch_failure_is_typed_and_commits_nothing(mock_get):
+    poller = RestPoller("tok")
+    mock_get.return_value = _response(404)
+    assert poller.fetch_default_branch("o/r") is FETCH_DENIED
+    mock_get.return_value = _response(200, {"default_branch": ""}, etag='W/"bad"')
+    assert poller.fetch_default_branch("o/r") is FETCH_FAILED
+    mock_get.return_value = _response(200, {"default_branch": "main"}, etag='W/"good"')
+    assert poller.fetch_default_branch("o/r") == "main"
+    assert "If-None-Match" not in mock_get.call_args.kwargs["headers"]
+
+
+@patch("ci_status.github.requests.get")
+def test_forget_repo_also_clears_the_default_branch_slots(mock_get):
+    poller = RestPoller("tok")
+    mock_get.return_value = _response(200, {"workflow_runs": [], "default_branch": "main"},
+                                      etag='W/"x"')
+    poller.fetch_default_runs("o/r", "main")
+    poller.fetch_default_branch("o/r")
+
+    poller.forget_repo("o/r", running=False)       # run data only: the lookup is kept
+    poller.fetch_default_runs("o/r", "main")
+    assert "If-None-Match" not in mock_get.call_args.kwargs["headers"]
+    poller.fetch_default_branch("o/r")
+    assert mock_get.call_args.kwargs["headers"]["If-None-Match"] == 'W/"x"'
+
+    poller.forget_repo("o/r")                      # the repo left the watch list
+    poller.fetch_default_branch("o/r")
+    assert "If-None-Match" not in mock_get.call_args.kwargs["headers"]
+
+
+@patch("ci_status.github.requests.get")
+def test_forget_default_runs_clears_only_the_default_branch_slot(mock_get):
+    poller = RestPoller("tok")
+    mock_get.return_value = _response(200, {"workflow_runs": []}, etag='W/"x"')
+    poller.fetch_runs("o/r")
+    poller.fetch_default_runs("o/r", "main")
+    poller.forget_default_runs("o/r")
+    poller.fetch_default_runs("o/r", "main")
+    assert "If-None-Match" not in mock_get.call_args.kwargs["headers"]
+    poller.fetch_runs("o/r")
+    assert mock_get.call_args.kwargs["headers"]["If-None-Match"] == 'W/"x"'

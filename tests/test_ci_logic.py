@@ -14,7 +14,7 @@ from ci_status.logic import (
     resolve_repo_list, _eta_label, RUNNING_NUMERAL_X, RUNNING_LABEL_GAP_PX,
     RUN_SPINNER_ID,
     resolve_ci_led_value, CI_LED_COLOR, LED_OFF_COLOR, LED_OFF_ELEMENTS,
-    _parse_ts, running_runs_usable,
+    _parse_ts, running_runs_usable, default_branch_verdicts,
 )
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS
 from calendar_countdown.logic import _text_width_px
@@ -787,3 +787,107 @@ def test_parse_rate_limit_ignores_malformed_buckets():
     assert parse_rate_limit({"resources": {"core": {**good, "reset": True}}}) is None
     assert parse_rate_limit({"resources": {"core": {**good, "used": "x"}}})["core"]["used"] == 1000
     assert parse_rate_limit({"resources": {"core": good, "graphql": []}}) == {"core": good}
+
+
+# --- default-branch verdicts: a failure on the default branch stays until it is green ---
+
+def main_run(workflow_id: int, name: str, conclusion: str | None, status: str = "completed",
+             created_min_ago: int = 5, head_branch: str = "main",
+             head_repo: str = "o/r") -> dict:
+    d = run(workflow_id, name, status, conclusion, created_min_ago, head_branch=head_branch)
+    d["head_repository"] = {"full_name": head_repo}
+    return d
+
+
+MAIN_FAIL = FailingRun("tests", "main")
+
+
+def test_default_branch_failure_is_recorded_per_workflow():
+    runs = [main_run(1, "tests", "failure"), main_run(2, "lint", "success")]
+    assert default_branch_verdicts("o/r", runs, "main", {}) == {1: MAIN_FAIL}
+
+
+def test_default_branch_verdict_clears_on_a_newer_passing_run():
+    for passing in ("success", "neutral", "skipped"):
+        runs = [main_run(1, "tests", passing, created_min_ago=1),
+                main_run(1, "tests", "failure", created_min_ago=9)]
+        assert default_branch_verdicts("o/r", runs, "main", {1: MAIN_FAIL}) == {}
+
+
+def test_default_branch_failure_survives_newer_runs_without_a_verdict():
+    # A re-run in progress, a queued run, or a cancelled one says nothing
+    # about whether the branch is green: the last verdict stands.
+    for status, conclusion in (("in_progress", None), ("queued", None), ("completed", "cancelled")):
+        runs = [main_run(1, "tests", conclusion, status=status)]
+        assert default_branch_verdicts("o/r", runs, "main", {1: MAIN_FAIL}) == {1: MAIN_FAIL}
+
+
+def test_default_branch_failure_survives_falling_off_the_page():
+    newer = [main_run(100 + i, f"wf{i}", "success") for i in range(100)]
+    assert default_branch_verdicts("o/r", newer, "main", {1: MAIN_FAIL})[1] == MAIN_FAIL
+
+
+def test_default_branch_verdicts_ignore_other_branches_and_same_named_fork_branches():
+    runs = [main_run(1, "tests", "success", head_branch="feature"),
+            main_run(1, "tests", "success", head_repo="someone/r"),   # a fork's own "main"
+            main_run(2, "lint", "failure", head_repo="someone/r")]
+    assert default_branch_verdicts("o/r", runs, "main", {1: MAIN_FAIL}) == {1: MAIN_FAIL}
+
+
+def test_default_branch_match_ignores_repo_name_case_and_a_missing_head_repository():
+    # GitHub reports the canonical casing, which need not match the config.
+    cased = [main_run(1, "tests", "failure", head_repo="O/R")]
+    assert default_branch_verdicts("o/r", cased, "main", {}) == {1: MAIN_FAIL}
+    bare = [run(1, "tests", "completed", "failure", head_branch="main")]
+    assert default_branch_verdicts("o/r", bare, "main", {}) == {1: MAIN_FAIL}
+
+
+def test_default_branch_verdicts_do_not_mutate_the_previous_mapping():
+    previous = {1: MAIN_FAIL}
+    default_branch_verdicts("o/r", [main_run(1, "tests", "success")], "main", previous)
+    assert previous == {1: MAIN_FAIL}
+
+
+def test_default_branch_failure_is_not_masked_by_a_newer_pr_success():
+    # The masking defect: the same workflow succeeding on a PR used to hide
+    # the failing default branch.
+    runs = [main_run(1, "tests", "success", created_min_ago=1, head_branch="feature"),
+            main_run(1, "tests", "failure", created_min_ago=9)]
+    assert evaluate_runs("o/r", runs, NOW, 0).failing == []          # the defect, still the fallback
+    state = evaluate_runs("o/r", runs, NOW, 0, default_branch="main",
+                          default_verdicts={1: MAIN_FAIL})
+    assert state.failing == [MAIN_FAIL]
+    assert state.default_verdicts == {1: MAIN_FAIL}
+
+
+def test_pr_failure_still_shows_alongside_a_default_branch_failure():
+    pr = main_run(1, "tests", "failure", created_min_ago=1, head_branch="feature")
+    pr["pull_requests"] = [{"number": 7}]
+    state = evaluate_runs("o/r", [pr], NOW, 0, default_branch="main",
+                          default_verdicts={2: FailingRun("lint", "main")})
+    assert state.failing == [FailingRun("lint", "main"), FailingRun("tests", "#7")]
+
+
+def test_default_branch_run_in_the_all_branches_page_defers_to_the_verdicts():
+    # No duplicate card when both pages show the failure, and no card when
+    # the verdicts say the default branch is clear.
+    runs = [main_run(1, "tests", "failure")]
+    both = evaluate_runs("o/r", runs, NOW, 0, default_branch="main",
+                         default_verdicts={1: MAIN_FAIL})
+    assert both.failing == [MAIN_FAIL]
+    clear = evaluate_runs("o/r", runs, NOW, 0, default_branch="main", default_verdicts={})
+    assert clear.failing == []
+
+
+def test_without_verdicts_every_branch_is_judged_as_before():
+    # Unknown default branch, or its page not read yet: the pre-existing rule.
+    runs = [main_run(1, "tests", "failure")]
+    assert evaluate_runs("o/r", runs, NOW, 0, default_branch="main").failing == [MAIN_FAIL]
+    assert evaluate_runs("o/r", runs, NOW, 0, default_verdicts={}).failing == [MAIN_FAIL]
+    assert evaluate_runs("o/r", runs, NOW, 0).default_verdicts is None
+
+
+def test_stuck_detection_still_covers_the_default_branch():
+    runs = [main_run(1, "tests", None, status="queued", created_min_ago=30)]
+    state = evaluate_runs("o/r", runs, NOW, 15, default_branch="main", default_verdicts={})
+    assert state.stuck == [MAIN_FAIL]

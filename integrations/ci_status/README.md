@@ -19,6 +19,8 @@ The integration uses the **GitHub REST API only** (no GraphQL) to maintain stric
 
 **Steady-state quota overhead is near zero.** The integration leverages **ETag/304 conditional requests**: an HTTP request is sent at each poll interval (e.g., every 120 seconds), but when no workflow state has changed, GitHub returns a cached `304 Not Modified` response, which does not consume REST API quota. Therefore, quota is spent only when CI state actually changes (workflows complete, fail, or queue transitions occur), not on every polling cycle.
 
+Each poll sends up to three conditional requests per watched repo, each with its own ETag: the newest 10 runs across all branches, the newest 100 runs of the default branch (see "Which Runs Decide a Failure Card"), and, with `show_running`, the runs in progress. GitHub is asked only at `poll_seconds` / `running_poll_seconds`; the display rotates on its own faster tick without sending GitHub anything (see "Overlay Rotation").
+
 ## Setup
 
 ### 1. Authenticate GitHub CLI
@@ -76,7 +78,7 @@ Once the foreground test completes, your `config.toml` is in place and GitHub au
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
-| `poll_seconds` | integer | 120 | Polling interval in seconds |
+| `poll_seconds` | integer | 120 | How often GitHub is asked, in seconds. Does not affect how often cards rotate. |
 | `repos` | array of strings | — | GitHub repositories to monitor in `owner/repo` format. Required unless `watch_account_repos` is true, in which case these are always-included repos layered on top of auto-discovery (never filtered by `active_within_days`, since you named them explicitly). |
 | `show_green` | boolean | false | Display successful/green workflow status (default: off to reduce noise) |
 | `stale_queued_minutes` | integer | (disabled) | Alert if a workflow run has been queued for N minutes without starting (optional; useful to catch offline self-hosted runners) |
@@ -96,7 +98,7 @@ By default this integration watches exactly the repos listed in `repos`. Setting
 
 **Private repos are included, and that's intentional.** Discovery has no way to filter private vs. public — it watches everything you own that's active. This is fine for this integration's threat model: both the resulting config state (the discovered list itself, cached in memory) and the physical display are local to your own device and your own account's token. But the practical consequence is real: **a private repo's name can render on the physical display** (in the running badge's title, or in a failure/stuck frame's `owner/repo #PR workflow` text) exactly like a public one would. If the device sits somewhere visible to people who shouldn't know a private repo exists, either keep `watch_account_repos` off and list repos explicitly, or add sensitive ones to `repos_exclude`.
 
-**Quota math.** With N repos in the effective watch list, each poll cycle costs N REST requests to `.../actions/runs` (steady-state, these return `304` and cost nothing against your quota — see "Design: REST-only, Quota-Efficient" above) at `poll_seconds` cadence (default every 120s, so N requests every 2 minutes = up to `N * 30` requests/hour, all free in the steady state), plus N more to the running-runs endpoint whenever `show_running` is on, at `running_poll_seconds` cadence while any run is active. Account-wide discovery itself adds one more request per `repo_refresh_minutes` (default hourly = 1 request/hour, also ETag-cached on its first page — see `RestPoller.fetch_account_repos`'s docstring). None of this touches your real GitHub REST quota unless workflow state is actually changing, since 304s are free; the practical cap that matters is request *volume* (GitHub does rate-limit request rate, not just quota), which is why `active_within_days` exists — it keeps N bounded to your actually-active repos instead of every repo you've ever created.
+**Quota math.** With N repos in the effective watch list, each poll cycle costs 2N REST requests to `.../actions/runs` — one for all branches and one for the default branch (steady-state, these return `304` and cost nothing against your quota — see "Design: REST-only, Quota-Efficient" above) — at `poll_seconds` cadence (default every 120s, so 2N requests every 2 minutes = up to `N * 60` requests/hour, all free in the steady state), plus N more to the running-runs endpoint whenever `show_running` is on; all three follow `running_poll_seconds` while any run is active. A default-branch body (up to 100 runs, roughly 1 MB) is downloaded only when a run on that branch changes. The default branch name comes from the account enumeration at no extra cost; a repo named in `repos` that your account does not own costs one more conditional request per `repo_refresh_minutes`. Account-wide discovery itself adds one more request per `repo_refresh_minutes` (default hourly = 1 request/hour, also ETag-cached on its first page — see `RestPoller.fetch_account_repos`'s docstring). None of this touches your real GitHub REST quota unless workflow state is actually changing, since 304s are free; the practical cap that matters is request *volume* (GitHub does rate-limit request rate, not just quota), which is why `active_within_days` exists — it keeps N bounded to your actually-active repos instead of every repo you've ever created.
 
 **Caveat: `active_within_days` filters on `pushed_at`, a repo-level field — it has no idea about *schedule*-triggered workflow runs.** A repo whose CI only ever runs on a cron schedule (no pushes) will fall out of the active window and stop being watched even while its scheduled runs keep firing, because nothing about a scheduled run touches `pushed_at`. If you rely on schedule-triggered CI on a repo that doesn't otherwise see regular pushes, add it to `repos` explicitly (explicit repos are never subject to the active-window filter) rather than relying on account-wide discovery to keep watching it.
 
@@ -147,6 +149,57 @@ frame, then — only when nothing else is present and `show_green` is
 on — a single quiet "CI ok" frame. See the design spec
 (`docs/superpowers/specs/2026-08-06-animation-accents-design.md`) for the
 running spinner implementation details.
+
+**The rhythm does not depend on how often GitHub is polled.** The agent
+wakes once a second and draws the next card as soon as it is due: one card
+for 10s, then at least 10s in which it sends the device nothing so the
+calendar can reclaim the panel, then the next card. That holds with nothing
+running (`poll_seconds`, 120s by default) exactly as it does during a run
+(`running_poll_seconds`); between polls the cards come from the last poll's
+result, and the running badge's countdown is recomputed for each draw. A
+wake-up with nothing due touches neither GitHub nor the device. A poll and a
+draw do not overlap: a card that falls due while GitHub is being asked is
+drawn as soon as the poll ends (usually well under a second; up to a few
+seconds per repo while GitHub is unreachable), and its 10s on and 10s of
+silence are counted from that moment. When there
+is nothing to show, the device is cleared once per poll, not once per
+wake-up. If the device refuses a card (the calendar is holding a higher
+tier) the same card is offered again 20s later, and if the device is
+unreachable the agent backs off from 5s up to 5 minutes between attempts.
+
+### Which Runs Decide a Failure Card
+
+Two views of each repo are kept apart:
+
+- **The default branch.** For each workflow, the newest default-branch run
+  that has a verdict decides. A `failure`, `timed_out` or `startup_failure`
+  puts up a `CI FAIL` card; it stays until that workflow finishes with
+  `success`, `neutral` or `skipped` on the default branch. Nothing else
+  takes it down: not the same workflow passing on a pull request or another
+  branch, not any number of newer runs, and not a re-run that is still
+  queued or in progress, or one that was cancelled.
+- **Pull requests and other branches.** The newest run of each workflow
+  among the repo's 10 most recent runs decides, as before: a failing PR or
+  branch run shows until a newer run of that workflow replaces it or it
+  leaves those 10.
+
+Stuck (`CI WAIT`) runs are found in the 10 most recent runs on any branch.
+
+The verdicts are held in memory. After a restart the agent reads the newest
+100 default-branch runs, so a failure older than that is not shown again
+until the workflow next runs. A workflow that is deleted while failing on
+the default branch keeps its card until the agent restarts, because it can
+never produce a passing run. A pull request from a fork whose branch has the
+same name as your default branch is treated as a pull request.
+
+**When the default branch is not known.** A repo that the account
+enumeration does not list is looked up once (`GET /repos/{owner}/{repo}`),
+then re-checked every `repo_refresh_minutes` to notice a rename. If that
+lookup fails, one warning is logged and it is retried every 5 minutes;
+until it succeeds the repo is judged the old way — the newest run of each
+workflow across all branches, from the 10 most recent — so its failures
+still show, but a default-branch failure can be hidden by a newer run of
+the same workflow elsewhere.
 
 ### Failure and Stuck Frames (v1.7)
 
@@ -286,7 +339,7 @@ Stdout and stderr are redirected to `~/Library/Logs/busybar/ci.log`. View recent
 tail -f ~/Library/Logs/busybar/ci.log
 ```
 
-The poll summary is logged at `INFO` only when it changes, plus a heartbeat line every 10 minutes. A repeating GitHub problem (an error status, GitHub unreachable, an unreadable response) is logged as a warning when it appears or changes, then as a reminder every 10 minutes — not once per repo per poll.
+Each distinct summary line (a card that was drawn, the silent gap, nothing to show) is logged at `INFO` once per 10 minutes, so cards alternating every 20 seconds do not fill the log; repeats are logged at `DEBUG`. A repeating GitHub problem (an error status, GitHub unreachable, an unreadable response) is logged as a warning when it appears or changes, then as a reminder every 10 minutes — not once per repo per poll.
 
 ### When GitHub Does Not Answer
 
@@ -295,6 +348,8 @@ A `304 Not Modified` means the cached state is still current and is kept indefin
 Only a refusal expires cached state: `401`, `404`, `410`, or a `403` that is not a rate limit. When GitHub has kept refusing a repo for 15 minutes, its failure/stuck frames and running badge are dropped (and the LED turned off if nothing else is failing), so a deleted or renamed repo, or a revoked token, cannot leave `CI FAIL` on the display. One warning lists every repo dropped in that poll. State returns on the next good answer. A revoked token needs `gh auth login` and an agent restart, since the token is read once at startup.
 
 A rate-limit answer (`403`/`429` carrying `Retry-After`, or with the quota exhausted) pauses every GitHub request for the time GitHub asks, bounded to between 1 and 15 minutes; after the cap one probe request is sent, and the pause repeats if GitHub is still limiting. GitHub's primary limit can take up to an hour to reset. The display keeps rotating cached frames meanwhile.
+
+The default-branch request follows the same rules. When it is answered `304`, cannot be asked, or is refused, the default-branch verdicts already held stay as they are; a new default-branch failure that appears in the all-branches request in the meantime is still shown. The verdicts are dropped only together with the rest of the repo's state, after 15 minutes of refusals on the all-branches request, or when the repo leaves the watch list. A poll in which the default branch name is unknown keeps them too.
 
 With account-wide watching, the repo list is replaced only by a complete enumeration: if any page fails, the previous list is kept and enumeration is retried on the next poll.
 
