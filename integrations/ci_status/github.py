@@ -154,10 +154,23 @@ class RestPoller:
         return FETCH_DENIED if resp.status_code in DENIED_STATUSES else FETCH_FAILED
 
     @staticmethod
+    def _says_rate_limit(resp: requests.Response) -> bool:
+        try:
+            body = resp.json()
+        except ValueError:
+            return False
+        message = body.get("message") if isinstance(body, dict) else None
+        return isinstance(message, str) and "rate limit" in message.lower()
+
+    @staticmethod
     def _rate_limit_pause(resp: requests.Response) -> float | None:
         """Seconds to stop sending requests if `resp` is a rate-limit
-        answer, else None. A 403 with neither Retry-After nor an exhausted
-        quota is a permissions answer about one repo, not a rate limit."""
+        answer, else None. A 403 with no Retry-After, quota remaining and no
+        rate-limit message is a permissions answer about one repo.
+
+        A secondary rate limit may carry neither header: GitHub identifies it
+        only by its error message and asks for at least a minute's wait.
+        """
         if resp.status_code not in (403, 429):
             return None
         retry_after = resp.headers.get("Retry-After")
@@ -166,7 +179,7 @@ class RestPoller:
                 pause = float(retry_after)
             elif resp.headers.get("X-RateLimit-Remaining") == "0":
                 pause = float(resp.headers.get("X-RateLimit-Reset")) - time.time()
-            elif resp.status_code == 429:
+            elif resp.status_code == 429 or RestPoller._says_rate_limit(resp):
                 pause = 0.0
             else:
                 return None

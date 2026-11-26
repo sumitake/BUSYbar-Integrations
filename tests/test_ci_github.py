@@ -614,3 +614,38 @@ def test_rate_limit_and_outage_are_could_not_ask_not_denied(mock_get, mock_time)
     mock_time.monotonic.return_value = 120.0
     mock_get.side_effect = requests.ConnectionError()
     assert poller.fetch_runs("o/r") is FETCH_FAILED
+
+
+# --- secondary rate limits carry no rate-limit headers ------------------------
+# GitHub identifies a secondary limit only by its error message; it can arrive
+# as a 403 with quota remaining and no Retry-After, and asks for at least a
+# minute's wait. It must never be mistaken for a refusal about one repo.
+
+@patch("ci_status.github.time")
+@patch("ci_status.github.requests.get")
+def test_secondary_rate_limit_without_headers_pauses_instead_of_denying(mock_get, mock_time):
+    mock_time.monotonic.return_value = 1000.0
+    limited = _limited(403, X_RateLimit_Remaining="4990")
+    limited.json.return_value = {"message": "You have exceeded a secondary rate limit. Please wait."}
+    mock_get.return_value = limited
+    poller = RestPoller("tok")
+    assert poller.fetch_runs("o/r") is FETCH_FAILED          # could not ask, not a refusal
+    assert poller.fetch_runs("o/other") is FETCH_FAILED      # and everything else waits too
+    assert mock_get.call_count == 1
+    mock_time.monotonic.return_value = 1000.0 + github.RATE_LIMIT_MIN_PAUSE_SECONDS
+    mock_get.return_value = _response(200, {"workflow_runs": []})
+    assert poller.fetch_runs("o/r") == []
+
+
+@patch("ci_status.github.requests.get")
+def test_plain_403_without_a_rate_limit_message_is_still_a_refusal(mock_get):
+    from ci_status.github import FETCH_DENIED
+    for body in ({"message": "Resource not accessible by integration"}, ["not", "an", "object"], None):
+        refused = _limited(403, X_RateLimit_Remaining="4990")
+        refused.json.return_value = body
+        mock_get.return_value = refused
+        assert RestPoller("tok").fetch_runs("o/r") is FETCH_DENIED
+    unreadable = _limited(403, X_RateLimit_Remaining="4990")
+    unreadable.json.side_effect = ValueError("no json")
+    mock_get.return_value = unreadable
+    assert RestPoller("tok").fetch_runs("o/r") is FETCH_DENIED
