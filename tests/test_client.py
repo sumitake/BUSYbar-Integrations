@@ -449,12 +449,251 @@ def test_unsafe_audio_may_fail_over_after_definite_connect_timeout(mock_request)
 
 
 @patch("busybar.client.requests.request")
-def test_auth_and_conflict_responses_never_trigger_failover(mock_request):
-    for status in (401, 403, 409):
-        mock_request.reset_mock()
-        mock_request.return_value = _response(status)
-        assert _cloud_client().draw("app", ELEMENTS) in (DrawResult.ERROR, DrawResult.REJECTED)
-        assert mock_request.call_count == 1
+def test_conflict_response_never_triggers_failover(mock_request):
+    # A 409 is the device answering "a higher-priority canvas owns the panel".
+    # That is a real answer from a working route, never a reason to re-route.
+    mock_request.return_value = _response(409)
+    client = _cloud_client(fallback_hosts=["192.0.2.2"])
+    assert client.draw("app", ELEMENTS) == DrawResult.REJECTED
+    assert mock_request.call_count == 1
+    assert client.active_transport == "local"
+
+
+# --- a route that refuses us (401/403) is an unusable route -------------------
+# Firmware 1.4.1 answers 403 to almost every request arriving over Wi-Fi while
+# "HTTP API access over Wi-Fi" is disabled (and 401/403 for a missing or wrong
+# key). The request was definitively not executed, so the next route may be
+# tried -- including for the at-most-once audio/timer operations.
+
+@patch("busybar.client.requests.request")
+@pytest.mark.parametrize("status", [401, 403])
+def test_denied_only_local_route_fails_over_to_cloud(mock_request, status):
+    mock_request.side_effect = [_response(status), _response(200)]
+    client = _cloud_client()
+    assert client.draw("app", ELEMENTS) == DrawResult.DRAWN
+    assert [call.args[1].split("/")[2] for call in mock_request.call_args_list] == [
+        "192.0.2.1", "cloud.example.test"]
+    assert client.active_transport == "cloud"
+
+
+@patch("busybar.client.requests.request")
+def test_unreachable_primary_then_denied_fallback_fails_over_to_cloud(mock_request):
+    # The observed outage: USB unreachable, Wi-Fi answers 403, cloud healthy.
+    mock_request.side_effect = [requests.ConnectionError(), _response(403), _response(200)]
+    client = _cloud_client(fallback_hosts=["192.0.2.2"])
+    assert client.draw("app", ELEMENTS) == DrawResult.DRAWN
+    assert [call.args[1].split("/")[2] for call in mock_request.call_args_list] == [
+        "192.0.2.1", "192.0.2.2", "cloud.example.test"]
+    assert client.active_transport == "cloud"
+    # The refusing route must not become the remembered "working" route.
+    assert client.base == "http://192.0.2.1"
+
+
+@patch("busybar.client.requests.request")
+def test_denied_route_is_skipped_for_the_next_local_route(mock_request):
+    mock_request.side_effect = [_response(403), _response(200)]
+    client = _cloud_client(fallback_hosts=["192.0.2.2"])
+    assert client.draw("app", ELEMENTS) == DrawResult.DRAWN
+    assert [call.args[1].split("/")[2] for call in mock_request.call_args_list] == [
+        "192.0.2.1", "192.0.2.2"]  # cloud never needed
+    assert client.active_transport == "local"
+    assert client.base == "http://192.0.2.2"
+
+
+@patch("busybar.client.requests.request")
+def test_denied_without_cloud_is_unreachable_so_pollers_back_off(mock_request):
+    # No route accepted the request and there is no relay: the device cannot be
+    # used right now, which is what UNREACHABLE means to the poll loops.
+    mock_request.return_value = _response(403)
+    client = BusyBarClient(host="192.0.2.1")
+    assert client.draw("app", ELEMENTS) == DrawResult.UNREACHABLE
+    assert mock_request.call_count == 1
+    assert client.status() is None
+    mock_request.reset_mock()
+    mock_request.side_effect = [requests.ConnectTimeout(), _response(403)]
+    client = BusyBarClient(host="192.0.2.1", fallback_hosts=["192.0.2.2"])
+    assert client.draw("app", ELEMENTS) == DrawResult.UNREACHABLE
+
+
+@patch("busybar.client.requests.request")
+def test_forced_local_never_uses_cloud_when_denied(mock_request):
+    mock_request.return_value = _response(403)
+    client = _cloud_client(transport="local")
+    assert client.draw("app", ELEMENTS) == DrawResult.UNREACHABLE
+    assert mock_request.call_count == 1
+
+
+@patch("busybar.client.requests.request")
+def test_local_only_operation_skips_a_denied_route_for_the_next_local_route(mock_request):
+    mock_request.side_effect = [_response(403), _response(200)]
+    client = _cloud_client(fallback_hosts=["192.0.2.2"])
+    assert client.upload_asset("app", "a.anim", b"x") is True
+    assert [call.args[1].split("/")[2] for call in mock_request.call_args_list] == [
+        "192.0.2.1", "192.0.2.2"]
+
+
+@patch("busybar.client.requests.request")
+def test_route_remembered_from_an_open_endpoint_is_replaced_once_it_refuses(mock_request):
+    # GET /api/version answers 200 even on a route that refuses everything
+    # else, so the capability probe can record that route as preferred.
+    client = _cloud_client(fallback_hosts=["192.0.2.2"])
+    client.base = "http://192.0.2.2"
+    client._last_primary_probe = __import__("time").monotonic()
+    mock_request.side_effect = [_response(403), _response(200)]
+    assert client.draw("app", ELEMENTS) == DrawResult.DRAWN
+    assert [call.args[1].split("/")[2] for call in mock_request.call_args_list] == [
+        "192.0.2.2", "192.0.2.1"]
+    assert client.base == "http://192.0.2.1" and client.active_transport == "local"
+
+
+@patch("busybar.client.requests.request")
+def test_credentials_stay_separate_across_a_denial_hop(mock_request):
+    mock_request.side_effect = [_response(401), _response(200)]
+    client = BusyBarClient(host="192.0.2.1", local_token="local-only-token",
+                            cloud_token=FAKE_TOKEN, cloud_base_url="https://cloud.example.test/busybar")
+    assert client.draw("app", ELEMENTS) == DrawResult.DRAWN
+    local_call, cloud_call = mock_request.call_args_list
+    assert local_call.kwargs["headers"] == {"X-API-Token": "local-only-token"}
+    assert cloud_call.kwargs["headers"] == {"Authorization": f"Bearer {FAKE_TOKEN}"}
+
+
+@patch("busybar.client.requests.request")
+def test_server_error_is_the_device_answering_and_never_reroutes(mock_request):
+    mock_request.return_value = _response(500)
+    client = _cloud_client(fallback_hosts=["192.0.2.2"])
+    assert client.draw("app", ELEMENTS) == DrawResult.ERROR
+    assert mock_request.call_count == 1 and client.active_transport == "local"
+
+
+@patch("busybar.client.requests.request")
+def test_local_only_operation_never_uses_cloud_when_denied(mock_request):
+    mock_request.return_value = _response(403)
+    client = _cloud_client()
+    assert client.upload_asset("app", "a.anim", b"x") is False
+    assert mock_request.call_count == 1
+    assert client.active_transport == "local"
+
+
+@patch("busybar.client.requests.request")
+def test_denied_read_fails_over_to_cloud(mock_request):
+    mock_request.side_effect = [_response(403), _response(200, {"ok": True})]
+    assert _cloud_client().status() == {"ok": True}
+
+
+@patch("busybar.client.time.monotonic")
+@patch("busybar.client.requests.request")
+def test_degraded_client_stays_on_cloud_while_local_is_still_denied(mock_request, mock_time, caplog):
+    mock_time.return_value = 1000.0
+    mock_request.side_effect = [_response(403), _response(200)]
+    client = _cloud_client()
+    assert client.draw("app", ELEMENTS) == DrawResult.DRAWN
+    mock_time.return_value = 1061.0  # recovery probe is due
+    mock_request.side_effect = [_response(403), _response(200)]
+    with caplog.at_level(logging.INFO, logger="busybar.client"):
+        assert client.draw("app", ELEMENTS) == DrawResult.DRAWN
+    assert client.active_transport == "cloud"
+    assert not [r for r in caplog.records if "recovered" in r.getMessage()]
+    mock_time.return_value = 1062.0  # inside the next window: straight to cloud
+    mock_request.side_effect = [_response(200)]
+    assert client.draw("app", ELEMENTS) == DrawResult.DRAWN
+    assert mock_request.call_args.args[1].startswith("https://cloud.example.test/")
+
+
+@patch("busybar.client.requests.request")
+def test_denied_unsafe_audio_may_fail_over_because_denial_is_definite(mock_request):
+    mock_request.side_effect = [_response(403), _response(200)]
+    assert _cloud_client().play_audio("app", stock_path="shared/x.snd") is True
+    assert mock_request.call_args_list[1].args[1].startswith("https://cloud.example.test/")
+
+
+@patch("busybar.client.requests.request")
+def test_uncertain_failure_after_denial_still_blocks_unsafe_replay(mock_request):
+    mock_request.side_effect = [_response(403), requests.ConnectionError()]
+    client = _cloud_client(fallback_hosts=["192.0.2.2"])
+    assert client.set_busy_simple(1_000) is False
+    assert mock_request.call_count == 2  # cloud never attempted
+
+
+# --- repeated identical failures must not flood the log -----------------------
+
+@patch("busybar.client.time.monotonic")
+@patch("busybar.client.requests.request")
+def test_repeated_draw_failure_is_logged_once_until_it_changes(mock_request, mock_time, caplog):
+    mock_time.return_value = 1000.0
+    client = BusyBarClient(host="192.0.2.1")
+
+    def warnings():
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+    with caplog.at_level(logging.WARNING, logger="busybar.client"):
+        mock_request.return_value = _response(500)
+        for _ in range(5):
+            assert client.draw("app", ELEMENTS) == DrawResult.ERROR
+        assert len(warnings()) == 1 and "500" in warnings()[0]
+
+        mock_request.return_value = _response(400)  # a different failure is news
+        client.draw("app", ELEMENTS)
+        assert len(warnings()) == 2 and "400" in warnings()[1]
+
+        mock_time.return_value = 1000.0 + 601.0     # periodic reminder
+        client.draw("app", ELEMENTS)
+        assert len(warnings()) == 3
+
+        mock_request.return_value = _response(200)  # success re-arms the warning
+        assert client.draw("app", ELEMENTS) == DrawResult.DRAWN
+        mock_request.return_value = _response(400)
+        client.draw("app", ELEMENTS)
+        assert len(warnings()) == 4
+
+        mock_request.return_value = _response(409)  # so does a healthy rejection
+        assert client.draw("app", ELEMENTS) == DrawResult.REJECTED
+        mock_request.return_value = _response(400)
+        client.draw("app", ELEMENTS)
+        assert len(warnings()) == 5
+
+
+@patch("busybar.client.requests.request")
+def test_denied_route_warning_names_the_route_and_is_not_repeated(mock_request, caplog):
+    client = BusyBarClient(host="192.0.2.1")
+    mock_request.return_value = _response(403)
+    with caplog.at_level(logging.WARNING, logger="busybar.client"):
+        for _ in range(4):
+            client.draw("app", ELEMENTS)
+        denied = [r.getMessage() for r in caplog.records if "refused" in r.getMessage()]
+        assert len(denied) == 1 and "192.0.2.1" in denied[0] and "403" in denied[0]
+
+        # An open endpoint (GET /api/version) still answers 200 on a refusing
+        # route once a minute; that must not re-arm the refusal warning.
+        mock_request.return_value = _response(200, {"api_semver": "27.15.0"})
+        assert client.get_json("/api/version", local_only=True) == {"api_semver": "27.15.0"}
+        mock_request.return_value = _response(403)
+        client.draw("app", ELEMENTS)
+    assert len([r for r in caplog.records if "refused" in r.getMessage()]) == 1
+
+
+@patch("busybar.client.time.monotonic")
+@patch("busybar.client.requests.request")
+def test_denied_route_warning_repeats_only_as_a_reminder(mock_request, mock_time, caplog):
+    mock_time.return_value = 1000.0
+    client = BusyBarClient(host="192.0.2.1")
+    mock_request.return_value = _response(403)
+    with caplog.at_level(logging.WARNING, logger="busybar.client"):
+        client.draw("app", ELEMENTS)
+        mock_time.return_value = 1599.0
+        client.draw("app", ELEMENTS)
+        assert len([r for r in caplog.records if "refused" in r.getMessage()]) == 1
+        mock_time.return_value = 1601.0
+        client.draw("app", ELEMENTS)
+    assert len([r for r in caplog.records if "refused" in r.getMessage()]) == 2
+
+
+@patch("busybar.client.requests.request")
+def test_warning_table_stays_bounded_across_many_refusing_routes(mock_request):
+    from busybar.client import MAX_WARNING_KEYS
+    client = BusyBarClient(host="192.0.2.1")
+    for index in range(MAX_WARNING_KEYS * 3):
+        client._warn(f"denied:198.51.100.{index}", "refused")
+    assert len(client._warned) <= MAX_WARNING_KEYS
 
 
 @patch("busybar.client.requests.request")
