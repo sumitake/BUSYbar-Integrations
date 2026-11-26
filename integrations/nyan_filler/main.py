@@ -15,7 +15,7 @@ from busybar.client import BusyBarClient, DrawResult
 from busybar.config import device_kwargs, load_config
 from busybar.display import PRIORITY_FILLER
 
-from .logic import (FILLER_APP, ASSET_NAME, build_filler_elements,
+from .logic import (FILLER_APP, ASSET_NAME, build_filler_elements, build_probe_elements,
                     in_quiet_hours, parse_quiet_hours)
 
 APP = FILLER_APP
@@ -24,6 +24,9 @@ log = logging.getLogger(APP)
 
 ASSET_PATH = Path(__file__).resolve().parents[2] / "assets" / "nyan" / ASSET_NAME
 
+
+RECLAIM_POLL_SECONDS = 0.25   # retry interval right after another app takes the panel
+RECLAIM_WINDOW_SECONDS = 15   # ...for a little longer than one 10s overlay card
 
 UPLOAD_BACKOFF_START = 5    # seconds; first delay after a failed asset upload
 UPLOAD_BACKOFF_CAP = 300    # seconds; cap on the delay between persistent-failure retries
@@ -87,7 +90,8 @@ def run_once(client, cfg: dict, now: datetime, state: dict, dry_run: bool = Fals
     `quiet_cleared` records whether we've already released the panel for the
     current quiet window (so we clear once on entry, not every poll);
     `asset_uploaded` latches once the .anim asset has landed on the device
-    (see ensure_asset_uploaded)."""
+    (see ensure_asset_uploaded); `panel_taken` records that the last animation
+    draw was rejected, so the next poll asks with the cheap probe first."""
     c = cfg["nyan_filler"]
     if not c["enabled"]:
         return "disabled; no-op"
@@ -107,10 +111,40 @@ def run_once(client, cfg: dict, now: datetime, state: dict, dry_run: bool = Fals
     if dry_run:
         return f"DRY-RUN draw @ {PRIORITY_FILLER}: {elements!r}"
     ensure_asset_uploaded(client, state)  # retries until it lands once; then a no-op
-    result = client.draw(APP, elements, priority=PRIORITY_FILLER)
+    result = DrawResult.DRAWN
+    if state.get("panel_taken"):
+        # Another app owned the panel at the last poll. Ask again with a draw
+        # the bar can refuse in milliseconds; the animation follows only once
+        # that is accepted.
+        result = client.draw(APP, build_probe_elements(), priority=PRIORITY_FILLER)
+    if result == DrawResult.DRAWN:
+        result = client.draw(APP, elements, priority=PRIORITY_FILLER)
+        state["panel_taken"] = result == DrawResult.REJECTED
     if result == DrawResult.UNREACHABLE:
         return "device unreachable"
     return f"nyan @ {PRIORITY_FILLER} -> {result.value}"
+
+
+def next_sleep_seconds(summary: str, state: dict, now_monotonic: float,
+                       poll_seconds: float, on_local_route: bool) -> float:
+    """How long to wait before the next poll.
+
+    A rejected draw means another app owns the panel. When it lets go, the
+    firmware does not restore us: the panel stays black until our next draw
+    lands, so the black gap is the wait for the next poll (the probe in
+    run_once keeps each refused poll to milliseconds). Retry at RECLAIM_POLL_SECONDS for the
+    first RECLAIM_WINDOW_SECONDS of an occupancy -- long enough to catch the
+    end of an overlay card -- then fall back, so a meeting or BUSY session
+    that holds the panel for hours is not polled faster. Only over a local
+    route; the cloud relay keeps the normal cadence.
+    """
+    if not summary.endswith(f"-> {DrawResult.REJECTED.value}"):
+        state.pop("rejected_since", None)
+        return poll_seconds
+    rejected_since = state.setdefault("rejected_since", now_monotonic)
+    if on_local_route and now_monotonic - rejected_since < RECLAIM_WINDOW_SECONDS:
+        return min(poll_seconds, RECLAIM_POLL_SECONDS)
+    return poll_seconds
 
 
 def should_log_info(summary: str, last_logged_summary: str | None,
@@ -180,7 +214,9 @@ def main() -> int:
             backoff = min(backoff * 2, 300)
         else:
             backoff = 5
-            time.sleep(cfg["nyan_filler"]["poll_seconds"])
+            time.sleep(next_sleep_seconds(summary, state, now_monotonic,
+                                          cfg["nyan_filler"]["poll_seconds"],
+                                          client.active_transport == "local"))
 
 
 if __name__ == "__main__":

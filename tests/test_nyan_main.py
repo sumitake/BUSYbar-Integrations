@@ -214,3 +214,89 @@ def test_unreadable_local_asset_does_not_crash_and_is_retried_with_backoff(monke
     clock["t"] = 60.0
     run_once(c, BASE, ACTIVE, st)
     assert st["asset_uploaded"] is True and len(c.uploads) == 1
+
+
+# --- reclaiming the panel quickly after another app lets go ------------------
+
+def test_rejected_draw_is_retried_sooner_for_a_short_window_on_a_local_route():
+    from integrations.nyan_filler.main import (RECLAIM_POLL_SECONDS, RECLAIM_WINDOW_SECONDS,
+                                               next_sleep_seconds)
+    rejected = f"nyan @ {PRIORITY_FILLER} -> rejected"
+    drawn = f"nyan @ {PRIORITY_FILLER} -> drawn"
+    st = {}
+    assert next_sleep_seconds(drawn, st, 100.0, 1, True) == 1
+    # Another app took the panel: when it lets go the panel is black until we
+    # draw again, so retry quickly...
+    assert next_sleep_seconds(rejected, st, 101.0, 1, True) == RECLAIM_POLL_SECONDS
+    assert next_sleep_seconds(rejected, st, 101.0 + RECLAIM_WINDOW_SECONDS - 0.1, 1, True) == RECLAIM_POLL_SECONDS
+    # ...but a long occupant (a meeting, a BUSY session) must not turn that
+    # into sustained fast polling.
+    assert next_sleep_seconds(rejected, st, 101.0 + RECLAIM_WINDOW_SECONDS, 1, True) == 1
+    assert next_sleep_seconds(rejected, st, 5000.0, 1, True) == 1
+    # Winning the panel back re-arms the window for the next occupant.
+    assert next_sleep_seconds(drawn, st, 5001.0, 1, True) == 1
+    assert next_sleep_seconds(rejected, st, 5002.0, 1, True) == RECLAIM_POLL_SECONDS
+
+
+def test_fast_reclaim_never_applies_over_the_cloud_route_or_slows_a_fast_poll():
+    from integrations.nyan_filler.main import RECLAIM_POLL_SECONDS, next_sleep_seconds
+    rejected = f"nyan @ {PRIORITY_FILLER} -> rejected"
+    assert next_sleep_seconds(rejected, {}, 0.0, 1, False) == 1
+    assert next_sleep_seconds(rejected, {}, 0.0, 0.1, True) == 0.1
+    for other in ("quiet hours: silent", "disabled; no-op", f"nyan @ {PRIORITY_FILLER} -> error"):
+        assert next_sleep_seconds(other, {}, 0.0, 1, True) == 1
+    assert RECLAIM_POLL_SECONDS < 1
+
+
+# --- asking for the panel cheaply while another app owns it -----------------
+# Measured on firmware 1.4.1: the bar takes ~1.5s to reject an animation draw
+# while a higher-priority app owns the panel, but ~6ms to reject a rectangle.
+
+class ScriptedClient(FakeClient):
+    active_transport = "local"
+
+    def __init__(self, results):
+        super().__init__()
+        self._results = list(results)
+
+    def draw(self, app, elements, priority=50, led_notification_color=None):
+        self.draws.append((app, elements, priority))
+        return self._results.pop(0)
+
+
+def _kinds(client):
+    return ["+".join(sorted(e["type"] for e in elements)) for _, elements, _ in client.draws]
+
+
+def test_while_another_app_owns_the_panel_only_a_cheap_probe_is_sent():
+    c = ScriptedClient([DrawResult.REJECTED, DrawResult.REJECTED, DrawResult.REJECTED])
+    st = {"asset_uploaded": True}
+    assert run_once(c, BASE, ACTIVE, st).endswith("-> rejected")   # the animation was refused
+    assert run_once(c, BASE, ACTIVE, st).endswith("-> rejected")
+    assert run_once(c, BASE, ACTIVE, st).endswith("-> rejected")
+    assert _kinds(c) == ["animation", "rectangle", "rectangle"]
+    probe = c.draws[1][1]
+    assert c.draws[1][0] == FILLER_APP and c.draws[1][2] == PRIORITY_FILLER
+    assert len(probe) == 1 and (probe[0]["width"], probe[0]["height"]) == (1, 1)
+    assert probe[0]["timeout"] <= 2 and probe[0]["id"] != c.draws[0][1][0]["id"]
+
+
+def test_accepted_probe_is_followed_by_the_animation_in_the_same_poll():
+    c = ScriptedClient([DrawResult.REJECTED, DrawResult.DRAWN, DrawResult.DRAWN, DrawResult.DRAWN])
+    st = {"asset_uploaded": True}
+    run_once(c, BASE, ACTIVE, st)
+    assert run_once(c, BASE, ACTIVE, st).endswith("-> drawn")      # probe accepted, animation drawn
+    assert run_once(c, BASE, ACTIVE, st).endswith("-> drawn")      # back to the animation alone
+    assert _kinds(c) == ["animation", "rectangle", "animation", "animation"]
+
+
+def test_probe_failure_is_reported_and_the_animation_is_not_sent():
+    c = ScriptedClient([DrawResult.REJECTED, DrawResult.UNREACHABLE, DrawResult.ERROR, DrawResult.DRAWN,
+                        DrawResult.DRAWN])
+    st = {"asset_uploaded": True}
+    run_once(c, BASE, ACTIVE, st)
+    assert run_once(c, BASE, ACTIVE, st) == "device unreachable"
+    assert run_once(c, BASE, ACTIVE, st).endswith("-> error")
+    assert _kinds(c) == ["animation", "rectangle", "rectangle"]
+    assert run_once(c, BASE, ACTIVE, st).endswith("-> drawn")      # recovers through the probe
+    assert _kinds(c)[-2:] == ["rectangle", "animation"]

@@ -1,5 +1,5 @@
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -46,6 +46,11 @@ class RepoState:
     repo: str
     failing: list[FailingRun]
     stuck: list[FailingRun]
+    # The runs this state was evaluated from, kept so main.run_once can
+    # re-evaluate it against a later `now` when GitHub answers 304: a queued
+    # run that never changes still has to age into "stuck". None on a
+    # hand-built state with nothing to re-evaluate.
+    runs: list[dict] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -74,7 +79,12 @@ class QuotaInfo:
 
 
 def _parse_ts(value: str) -> datetime:
-    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    """A GitHub timestamp as an aware datetime. GitHub sends
+    "2026-08-03T13:30:00Z"; any ISO-8601 form (fractional seconds, a numeric
+    offset) parses too, and a naive value is read as UTC. Raises ValueError
+    or TypeError for anything else -- callers skip the item, they don't crash."""
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_repos: bool,
@@ -117,7 +127,7 @@ def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_
     if watch_account_repos and account_repos:
         cutoff = now - timedelta(days=active_within_days)
         for r in account_repos:
-            if r.get("archived"):
+            if not isinstance(r, dict) or r.get("archived"):
                 continue
             pushed_at = r.get("pushed_at")
             if not pushed_at:
@@ -129,7 +139,7 @@ def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_
             if pushed < cutoff:
                 continue
             full_name = r.get("full_name")
-            if full_name:
+            if isinstance(full_name, str) and full_name:
                 names.add(full_name)
     names -= set(repos_exclude)
     return sorted(names)
@@ -137,20 +147,23 @@ def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_
 
 def evaluate_runs(repo: str, runs: list[dict], now: datetime,
                   stale_queued_minutes: int) -> RepoState:
+    """Raises LookupError/TypeError/ValueError/AttributeError on a run it
+    cannot read (not an object, no workflow_id, an unparseable created_at on
+    a queued run); main.run_once skips the repo for that poll."""
     latest: dict[int, dict] = {}
     for r in runs:  # API returns newest first; keep first seen per workflow
         latest.setdefault(r["workflow_id"], r)
     failing, stuck = [], []
     for r in latest.values():
         if r.get("conclusion") in FAILING:
-            failing.append(FailingRun(r["name"], _pr_or_branch(r)))
+            failing.append(FailingRun(r.get("name") or "", _pr_or_branch(r)))
         elif r.get("status") == "queued" and stale_queued_minutes > 0:
             age_min = (now - _parse_ts(r["created_at"])).total_seconds() / 60
             if age_min >= stale_queued_minutes:
-                stuck.append(FailingRun(r["name"], _pr_or_branch(r)))
+                stuck.append(FailingRun(r.get("name") or "", _pr_or_branch(r)))
     key = lambda f: (f.workflow, f.ref)
     return RepoState(repo=repo, failing=sorted(failing, key=key),
-                     stuck=sorted(stuck, key=key))
+                     stuck=sorted(stuck, key=key), runs=runs)
 
 
 # --- overlay tier: shared row template (v1.5) -----------------------------------
@@ -238,6 +251,21 @@ RUNNING_LABEL_BUDGET_PX = PANEL_WIDTH - RUNNING_NUMERAL_X - 2
 RUNNING_LABEL_Y = 9
 
 
+def repo_labels(repos: list[str]) -> dict[str, str]:
+    """Display label for each watched repo.
+
+    When several repos are watched and all share one owner, the owner says
+    nothing and costs most of the 68px title lane: a card would open and rest
+    on "owner/" while the repo name only passes by mid-scroll. Show the bare
+    repo name then. A single repo, mixed owners, or a name without an owner
+    keep the full name.
+    """
+    owners = {repo.partition("/")[0] for repo in repos}
+    if len(repos) > 1 and len(owners) == 1 and all("/" in repo for repo in repos):
+        return {repo: repo.partition("/")[2] for repo in repos}
+    return {repo: repo for repo in repos}
+
+
 def _pr_or_branch(run: dict) -> str:
     """PR number ("#42") if the run belongs to a pull request, else the
     branch it ran on (fork/push-triggered runs have an empty
@@ -263,6 +291,29 @@ def select_running_run(running_by_repo: dict[str, list[dict]]) -> tuple[dict, st
     return best_run, best_repo, len(candidates) - 1
 
 
+def running_runs_usable(runs: list) -> bool:
+    """True when every in_progress entry carries what the running badge and
+    the ETA lookup use, with the right types: an integer `workflow_id` (it
+    keys the ETA cache), a parseable `run_started_at`, and a `name` and PR
+    or branch reference that are text (they are joined into the title).
+    main.run_once checks this before caching a poll's answer, so one
+    malformed entry skips that repo for the poll instead of raising later
+    from select_running_run or the badge renderer."""
+    try:
+        for r in runs:
+            if r.get("status") != "in_progress":
+                continue
+            workflow_id = r["workflow_id"]
+            if not isinstance(workflow_id, int) or isinstance(workflow_id, bool):
+                return False
+            _parse_ts(r["run_started_at"])
+            if not isinstance(r.get("name") or "", str) or not isinstance(_pr_or_branch(r), str):
+                return False
+    except (LookupError, TypeError, ValueError, AttributeError):
+        return False
+    return True
+
+
 def compute_median_duration_minutes(successful_runs: list[dict]) -> float | None:
     """Median of (updated_at - run_started_at) in minutes across up to the
     first 5 runs given (the caller already requests per_page=5, but this
@@ -270,10 +321,13 @@ def compute_median_duration_minutes(successful_runs: list[dict]) -> float | None
     timestamps -- "no history", not an error."""
     durations = []
     for r in successful_runs[:5]:
-        started, updated = r.get("run_started_at"), r.get("updated_at")
-        if not started or not updated:
-            continue
-        durations.append((_parse_ts(updated) - _parse_ts(started)).total_seconds() / 60)
+        try:
+            started, updated = r.get("run_started_at"), r.get("updated_at")
+            if not started or not updated:
+                continue
+            durations.append((_parse_ts(updated) - _parse_ts(started)).total_seconds() / 60)
+        except (TypeError, ValueError, AttributeError):
+            continue   # an unreadable run is no history, not an error
     if not durations:
         return None
     durations.sort()
@@ -542,15 +596,21 @@ def parse_rate_limit(data: dict) -> dict[str, dict] | None:
     cycle, not crash or show stale data -- see RestPoller.fetch_rate_limit
     and main.py's staleness handling).
     """
-    resources = (data or {}).get("resources") or {}
+    def number(value) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    resources = data.get("resources") if isinstance(data, dict) else None
+    if not isinstance(resources, dict):
+        return None
     result: dict[str, dict] = {}
     for key in ("core", "graphql"):
         bucket = resources.get(key)
-        if not bucket or "limit" not in bucket or "remaining" not in bucket or "reset" not in bucket:
+        if not isinstance(bucket, dict) or not all(
+                number(bucket.get(field)) for field in ("limit", "remaining", "reset")):
             continue
         limit, remaining = bucket["limit"], bucket["remaining"]
         used = bucket.get("used")
-        if used is None:
+        if not number(used):
             used = max(0, limit - remaining)
         result[key] = {"limit": limit, "remaining": remaining, "used": used, "reset": bucket["reset"]}
     return result or None
@@ -654,7 +714,8 @@ def resolve_ci_led_value(led_should_be_on: bool, led_was_on: bool) -> str | None
 def build_overlay_payload(descriptor: dict, timeout_s: int, *,
                           running: RunningInfo | None = None,
                           quota_by_bucket: dict[str, QuotaInfo] | None = None,
-                          show_spinner: bool = False) -> dict | None:
+                          show_spinner: bool = False,
+                          repo_labels: dict[str, str] | None = None) -> dict | None:
     """Build the {"elements", "priority", "led"} payload for one overlay-tier
     dwell slot from a frame descriptor ({"kind": ...} plus kind-specific
     fields). Returns None only if a frame's data isn't available this cycle;
@@ -672,8 +733,12 @@ def build_overlay_payload(descriptor: dict, timeout_s: int, *,
     `show_spinner` (v1.6) is threaded through ONLY on the CI-badge branch
     -- quota frames never get a spinner, regardless of this flag. Defaults
     to False so existing callers are unaffected.
+
+    `repo_labels` maps a watched repo to the name shown on failure and waiting
+    cards (see `repo_labels()`); a repo without an entry shows its full name.
     """
     kind = descriptor["kind"]
+    label = (repo_labels or {}).get(descriptor.get("repo"), descriptor.get("repo"))
     if kind == OVERLAY_FRAME_CI_BADGE:
         if running is None:
             return None
@@ -687,11 +752,11 @@ def build_overlay_payload(descriptor: dict, timeout_s: int, *,
         return {"elements": _build_quota_elements(info, timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
     if kind == OVERLAY_FRAME_FAIL:
-        text = ascii_safe(_fail_line(descriptor["repo"], descriptor["run"]))
+        text = ascii_safe(_fail_line(label, descriptor["run"]))
         return {"elements": _badge_elements("CI FAIL", text, "#FF7A8AFF", timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
     if kind == OVERLAY_FRAME_STUCK:
-        text = ascii_safe(_fail_line(descriptor["repo"], descriptor["run"]))
+        text = ascii_safe(_fail_line(label, descriptor["run"]))
         return {"elements": _badge_elements("CI WAIT", text, "#FFCB6BFF", timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
     if kind == OVERLAY_FRAME_GREEN:

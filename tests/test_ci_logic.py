@@ -14,6 +14,7 @@ from ci_status.logic import (
     resolve_repo_list, _eta_label, RUNNING_NUMERAL_X, RUNNING_LABEL_GAP_PX,
     RUN_SPINNER_ID,
     resolve_ci_led_value, CI_LED_COLOR, LED_OFF_COLOR, LED_OFF_ELEMENTS,
+    _parse_ts, running_runs_usable,
 )
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS
 from calendar_countdown.logic import _text_width_px
@@ -683,3 +684,106 @@ def test_led_off_elements_is_single_expiring_placeholder():
     assert el["type"] == "rectangle" and el["width"] == 1 and el["height"] == 1
     assert el["fill_colors"] == ["#00000000"] and el["timeout"] == 5
     assert el["border_width"] == 0
+
+
+# --- malformed GitHub data degrades instead of raising ---------------------------
+
+def test_evaluate_tolerates_null_workflow_names():
+    # Two failing runs with a null name used to raise TypeError in the sort.
+    runs = [run(1, None, "completed", "failure", pr_number=2),
+            run(2, None, "completed", "failure"),
+            run(3, "lint", "completed", "failure")]
+    state = evaluate_runs("o/r", runs, NOW, 0)
+    assert state.failing == [FailingRun("", ""), FailingRun("", "#2"), FailingRun("lint", "")]
+
+
+def test_parse_ts_accepts_any_iso_8601_form():
+    expected = datetime(2026, 8, 3, 13, 30, tzinfo=timezone.utc)
+    assert _parse_ts("2026-08-03T13:30:00Z") == expected
+    assert _parse_ts("2026-08-03T13:30:00.000Z") == expected
+    assert _parse_ts("2026-08-03T13:30:00+00:00") == expected
+    assert _parse_ts("2026-08-03T15:30:00+02:00") == expected
+    assert _parse_ts("2026-08-03T13:30:00").tzinfo is not None   # naive is read as UTC
+
+
+def test_evaluate_keeps_the_runs_it_was_given_for_re_ageing():
+    runs = [run(1, "tests", "queued", None, created_min_ago=5)]
+    state = evaluate_runs("o/r", runs, NOW, 15)
+    assert state.stuck == [] and state.runs is runs
+    later = evaluate_runs("o/r", state.runs, NOW + timedelta(minutes=10), 15)
+    assert later.stuck == [FailingRun("tests", "")]
+
+
+def test_median_duration_skips_unparseable_runs():
+    runs = [{"run_started_at": "yesterday", "updated_at": "2026-08-03T10:04:00Z"},
+            None,
+            {"run_started_at": "2026-08-03T10:00:00Z", "updated_at": "2026-08-03T10:06:00Z"}]
+    assert compute_median_duration_minutes(runs) == 6.0
+
+
+def test_running_runs_usable_requires_what_the_badge_dereferences():
+    good = running_run()
+    assert running_runs_usable([good]) and running_runs_usable([])
+    assert not running_runs_usable([{**good, "run_started_at": None}])
+    assert not running_runs_usable([{**good, "run_started_at": "soon"}])
+    assert not running_runs_usable([{k: v for k, v in good.items() if k != "workflow_id"}])
+    assert not running_runs_usable([{**good, "pull_requests": [{"no": "number"}]}])
+    assert not running_runs_usable([good, "not a run"])
+    # Types, not just presence: each of these crashed the badge or the ETA cache.
+    assert not running_runs_usable([{**good, "name": 7}])
+    assert not running_runs_usable([{**good, "head_branch": 7, "pull_requests": []}])
+    assert not running_runs_usable([{**good, "workflow_id": [1]}])
+    assert not running_runs_usable([{**good, "workflow_id": "1"}])
+    assert running_runs_usable([{**good, "name": None, "head_branch": None, "pull_requests": []}])
+    assert not running_runs_usable({"workflow_runs": []})
+
+
+# --- repo labels: the shared owner is noise on a 68px title lane -------------
+
+def test_repo_labels_drop_an_owner_shared_by_every_watched_repo():
+    from ci_status.logic import repo_labels
+    assert repo_labels(["acme/widgets", "acme/gears"]) == {
+        "acme/widgets": "widgets", "acme/gears": "gears"}
+
+
+def test_repo_labels_keep_owners_when_they_differ_or_cannot_be_compared():
+    from ci_status.logic import repo_labels
+    mixed = ["acme/widgets", "globex/gears"]
+    assert repo_labels(mixed) == {r: r for r in mixed}
+    # One repo: nothing to compare it with, so its full name stays.
+    assert repo_labels(["acme/widgets"]) == {"acme/widgets": "acme/widgets"}
+    assert repo_labels(["acme/widgets", "no-owner"]) == {
+        "acme/widgets": "acme/widgets", "no-owner": "no-owner"}
+    assert repo_labels([]) == {}
+
+
+def test_fail_and_stuck_cards_use_the_repo_label():
+    from ci_status.logic import (OVERLAY_FRAME_FAIL, OVERLAY_FRAME_STUCK, FailingRun,
+                                 build_overlay_payload)
+    labels = {"acme/widgets": "widgets"}
+    for kind in (OVERLAY_FRAME_FAIL, OVERLAY_FRAME_STUCK):
+        descriptor = {"kind": kind, "repo": "acme/widgets", "run": FailingRun("tests", "#42")}
+        body = next(e for e in build_overlay_payload(descriptor, 10, repo_labels=labels)["elements"]
+                    if e["id"] == "ci")
+        assert body["text"] == "widgets #42 tests"
+        unlabeled = next(e for e in build_overlay_payload(descriptor, 10)["elements"] if e["id"] == "ci")
+        assert unlabeled["text"] == "acme/widgets #42 tests"
+
+
+
+def test_resolve_repo_list_skips_malformed_account_entries():
+    good = _account_repo("o/good")
+    account = [good, "not a repo", None, {**good, "full_name": 7}, {**good, "full_name": None},
+               {**good, "archived": False, "pushed_at": 12}]
+    assert resolve_repo_list([], [], True, account, 30, NOW) == ["o/good"]
+
+
+def test_parse_rate_limit_ignores_malformed_buckets():
+    good = {"limit": 5000, "remaining": 4000, "reset": 1000, "used": 1000}
+    assert parse_rate_limit({"resources": ["core"]}) is None
+    assert parse_rate_limit({"resources": {"core": "limited"}}) is None
+    assert parse_rate_limit({"resources": {"core": {**good, "limit": "5000"}}}) is None
+    assert parse_rate_limit({"resources": {"core": {**good, "remaining": None}}}) is None
+    assert parse_rate_limit({"resources": {"core": {**good, "reset": True}}}) is None
+    assert parse_rate_limit({"resources": {"core": {**good, "used": "x"}}})["core"]["used"] == 1000
+    assert parse_rate_limit({"resources": {"core": good, "graphql": []}}) == {"core": good}

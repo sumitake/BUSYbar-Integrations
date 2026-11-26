@@ -2,7 +2,7 @@
 
 ## What It Does
 
-This integration monitors GitHub Actions workflows across your repositories and displays CI status on the busybar device. **Failure/stuck frames (v1.7):** when a workflow fails or a queued run goes stale (stuck due to offline runners or capacity), the device doesn't take over the panel — instead, a full-panel badge for it joins the same calm **overlay-tier** rotation described below: a red badge (rounded background + bold white text) reading `CI FAIL owner/repo #42 · workflow` for a failure, or an amber badge with black text reading `CI stuck owner/repo #42 · workflow` for a stale-queued run (the `#42` is the PR number, falling back to the branch name when a run has no PR, and dropped entirely when neither is available). One frame per failing/stuck run, alternating with the calendar, the running badge, and the quota frames — not a priority-60 takeover. A gentle red LED stays lit while a workflow is failing (stuck-only states don't light it), and turns off on the poll where the last failure clears.
+This integration monitors GitHub Actions workflows across your repositories and displays CI status on the busybar device. **Failure/stuck frames (v1.7):** when a workflow fails or a queued run goes stale (stuck due to offline runners or capacity), the device doesn't take over the panel — instead, a full-panel card for it joins the same calm **overlay-tier** rotation described below: a dark two-row card with a fixed `CI FAIL` heading (coral divider) for a failure, or `CI WAIT` (amber divider) for a stale-queued run, over a bold white line that scrolls `owner/repo #42 workflow` (the `#42` is the PR number, falling back to the branch name when a run has no PR, and dropped entirely when neither is available). One frame per failing/stuck run, alternating with the calendar, the running badge, and the quota frames — not a priority-60 takeover. A gentle red LED stays lit while a workflow is failing (stuck-only states don't light it), and turns off on the poll where the last failure clears.
 
 **While a run is actively in progress** (and nothing is failing or stuck), the device shows a rotating set of **overlay-tier** frames instead: a cyan/blue "running" badge (repo, PR number or branch, and workflow name across the top; an ETA countdown below; a thin progress line tracking elapsed time against the workflow's typical duration), followed by two GitHub API quota frames (`show_quota`) if enabled. All of these frames share one dwell/gap rotation with the ambient-tier `calendar_countdown` integration — see "Display Priority Tiers" below for the shared framework this is built on, and "Overlay Rotation: Failure, Stuck, Running Badge, and Quota Frames" for content, config, and the measured alternation rhythm.
 
@@ -83,7 +83,8 @@ Once the foreground test completes, your `config.toml` is in place and GitHub au
 | `show_running` | boolean | true | Show the running-CI badge while a run is `in_progress` (across all configured repos; most-recently-started wins, `+N` if others are also running) |
 | `running_poll_seconds` | integer | 20 | Poll interval while a run is active (shortened from `poll_seconds`) |
 | `show_quota` | boolean | true | Join two GitHub API quota frames (GraphQL, REST) to the overlay rotation while a run is active. No effect if `show_running` is false — the quota frames only ever appear as part of that same rotation. |
-| `running_spinner` | boolean | true | Show an animated 8×8 spinner in the top-right corner of the running badge. Reduces the title's available width to prevent overlap. Set false for text-only running badge. No effect if `show_running` is false. |
+| `running_spinner` | boolean | true | Show an animated 8×8 spinner in the lower-right corner of the running badge (x=64, y=8). The title keeps its full width; the ETA text is limited to 60 pixels to leave the spinner a clear lane. Set false for text-only running badge. No effect if `show_running` is false. |
+| `bitmap_icons` | boolean | true | Add a 7×7 status icon beside the `CI FAIL` / `CI WAIT` / `CI OK` heading when the device's local firmware supports bitmap elements (1.2.3 and later). Purely cosmetic: without it, or on older firmware or the cloud route, the same card is drawn with text only. |
 | `watch_account_repos` | boolean | false | Auto-discover and watch every repo you own, in addition to `repos`. See "Account-wide watching" below. |
 | `repos_exclude` | array of strings | `[]` | Repos to never watch, regardless of mode — silences a specific repo without leaving account mode (or, less commonly, without editing `repos`). Applied last, unconditionally; a no-op when empty. |
 | `active_within_days` | integer | 30 | In account mode, only auto-discovered repos pushed within this many days are watched (caps request volume on large accounts). Repos in `repos` are never subject to this filter. |
@@ -93,7 +94,7 @@ Once the foreground test completes, your `config.toml` is in place and GitHub au
 
 By default this integration watches exactly the repos listed in `repos`. Setting `watch_account_repos = true` switches to a broader mode: the watch list becomes every repo you own (`GET /user/repos?affiliation=owner`, so this does **not** pick up repos you merely have collaborator/org-member access to, only ones under your own account) that's been pushed to within `active_within_days` days, **union** `repos` (always included, never filtered by recency), **minus** `repos_exclude`. New repos are picked up automatically — no config edit needed — within `repo_refresh_minutes` of their creation or of a first push that puts them back inside the active window.
 
-**Private repos are included, and that's intentional.** Discovery has no way to filter private vs. public — it watches everything you own that's active. This is fine for this integration's threat model: both the resulting config state (the discovered list itself, cached in memory) and the physical display are local to your own device and your own account's token. But the practical consequence is real: **a private repo's name can render on the physical display** (in the running badge's title, or in a failure/stuck frame's `repo #PR · workflow` text) exactly like a public one would. If the device sits somewhere visible to people who shouldn't know a private repo exists, either keep `watch_account_repos` off and list repos explicitly, or add sensitive ones to `repos_exclude`.
+**Private repos are included, and that's intentional.** Discovery has no way to filter private vs. public — it watches everything you own that's active. This is fine for this integration's threat model: both the resulting config state (the discovered list itself, cached in memory) and the physical display are local to your own device and your own account's token. But the practical consequence is real: **a private repo's name can render on the physical display** (in the running badge's title, or in a failure/stuck frame's `owner/repo #PR workflow` text) exactly like a public one would. If the device sits somewhere visible to people who shouldn't know a private repo exists, either keep `watch_account_repos` off and list repos explicitly, or add sensitive ones to `repos_exclude`.
 
 **Quota math.** With N repos in the effective watch list, each poll cycle costs N REST requests to `.../actions/runs` (steady-state, these return `304` and cost nothing against your quota — see "Design: REST-only, Quota-Efficient" above) at `poll_seconds` cadence (default every 120s, so N requests every 2 minutes = up to `N * 30` requests/hour, all free in the steady state), plus N more to the running-runs endpoint whenever `show_running` is on, at `running_poll_seconds` cadence while any run is active. Account-wide discovery itself adds one more request per `repo_refresh_minutes` (default hourly = 1 request/hour, also ETag-cached on its first page — see `RestPoller.fetch_account_repos`'s docstring). None of this touches your real GitHub REST quota unless workflow state is actually changing, since 304s are free; the practical cap that matters is request *volume* (GitHub does rate-limit request rate, not just quota), which is why `active_within_days` exists — it keeps N bounded to your actually-active repos instead of every repo you've ever created.
 
@@ -151,13 +152,16 @@ running spinner implementation details.
 
 Failure, waiting, and healthy frames share a dark two-row card. A fixed
 `CI FAIL`, `CI WAIT`, or `CI OK` heading stays visible while the bold lower
-row scrolls the complete `owner/repo #42 workflow` context. Coral, amber, and
+row scrolls the complete `owner/repo #42 workflow` context. When several repos
+are watched and they all share one owner, the owner is left out (`repo #42
+workflow`, and likewise in the running badge's title) so the card opens on
+the repository name instead of a prefix common to every card. Coral, amber, and
 mint divider lines distinguish the states; firmware 1.2.3 adds a matching
 7×7 status icon in the header. The healthy card reads `ALL CLEAR` without
 scrolling. The PR number is replaced by the branch for push/fork runs, or
 omitted if neither exists. Each failing or
 stuck run gets its own frame in the rotation — with several failures or
-stuck runs across repos, expect several red/amber frames in a row before
+stuck runs across repos, expect several `CI FAIL` / `CI WAIT` frames in a row before
 the rotation reaches the running badge or quota frames.
 
 A gentle red LED (`led_notification_color`) stays lit for the whole poll
@@ -213,14 +217,14 @@ frame (both fields are computed purely from the numeric `remaining` /
 `limit` / `reset` values in the API response).
 
 **Headroom theming.** Each quota frame's background gradient, track-fill
-color, title color, and numeral color all key off remaining-quota
-headroom, computed from the same fetch:
+color, and numeral color key off remaining-quota headroom, computed from
+the same fetch. The title and `RESET` label are white at every level:
 
 | Headroom | Remaining | Background gradient | Title / numeral / track-fill |
 |---|---|---|---|
-| High | > 50% | `#031F17` → `#000A08` (teal-black) | `#6FFFCF` / `#7CFFE0` / `#33FFC1` |
-| Medium | 20–50% | `#231400` → `#0A0400` (amber-black) | `#FFCB6B` / `#FFD98C` / `#FFB300` |
-| Low | < 20% | `#2E0509` → `#0A0101` (red-black) | `#FF6B7A` / `#FF8A96` / `#FF3B4E` |
+| High | > 50% | `#081B23` → `#020611` (teal-navy) | `#FFFFFF` / `#7CFFE0` / `#33FFC1` |
+| Medium | 20–50% | `#211707` → `#020611` (amber-navy) | `#FFFFFF` / `#FFD98C` / `#FFB300` |
+| Low | < 20% | `#240A10` → `#020611` (red-navy) | `#FFFFFF` / `#FF8A96` / `#FF3B4E` |
 
 **Important: none of this alternates cleanly with the calendar**, for the
 same firmware reasons as the running badge alone did before quota frames
@@ -241,7 +245,7 @@ own `poll_seconds` are the two knobs that shape the ratio.
 
 ### Stale Queued Detection
 
-If `stale_queued_minutes` is set (e.g., `15`), the integration monitors how long runs sit in the queued state. When a run exceeds this threshold without starting, it indicates a capacity problem — often an **offline or unavailable self-hosted runner**. The device displays a yellow "CI stuck" alert to notify you to investigate the runner.
+If `stale_queued_minutes` is set (e.g., `15`), the integration monitors how long runs sit in the queued state. When a run exceeds this threshold without starting, it indicates a capacity problem — often an **offline or unavailable self-hosted runner**. The device adds a `CI WAIT` card (amber divider) for that run to the overlay rotation so you can investigate the runner. The age is re-checked on every poll, so a run that sits untouched in the queue still crosses the threshold on time.
 
 For example:
 - Set `stale_queued_minutes = 15` to alert if any run has been queued for more than 15 minutes.
@@ -281,6 +285,20 @@ Stdout and stderr are redirected to `~/Library/Logs/busybar/ci.log`. View recent
 ```bash
 tail -f ~/Library/Logs/busybar/ci.log
 ```
+
+The poll summary is logged at `INFO` only when it changes, plus a heartbeat line every 10 minutes. A repeating GitHub problem (an error status, GitHub unreachable, an unreadable response) is logged as a warning when it appears or changes, then as a reminder every 10 minutes — not once per repo per poll.
+
+### When GitHub Does Not Answer
+
+A `304 Not Modified` means the cached state is still current and is kept indefinitely. The same goes for any failure that only means the question could not be asked — GitHub unreachable (including a laptop that is offline or asleep), a `5xx` server error, a rate limit, or a response this integration cannot read: the failure/stuck frames, the running badge and the LED stay as they were for as long as it lasts, because nothing has been learned about the repo.
+
+Only a refusal expires cached state: `401`, `404`, `410`, or a `403` that is not a rate limit. When GitHub has kept refusing a repo for 15 minutes, its failure/stuck frames and running badge are dropped (and the LED turned off if nothing else is failing), so a deleted or renamed repo, or a revoked token, cannot leave `CI FAIL` on the display. One warning lists every repo dropped in that poll. State returns on the next good answer. A revoked token needs `gh auth login` and an agent restart, since the token is read once at startup.
+
+A rate-limit answer (`403`/`429` carrying `Retry-After`, or with the quota exhausted) pauses every GitHub request for the time GitHub asks, bounded to between 1 and 15 minutes; after the cap one probe request is sent, and the pause repeats if GitHub is still limiting. GitHub's primary limit can take up to an hour to reset. The display keeps rotating cached frames meanwhile.
+
+With account-wide watching, the repo list is replaced only by a complete enumeration: if any page fails, the previous list is kept and enumeration is retried on the next poll.
+
+With `show_green` on, the `CI OK` card is withheld until every watched repo has been read successfully, so it never claims "all clear" for a repo GitHub has not answered for.
 
 ## GitHub-Hosted and Self-Hosted Runners
 
