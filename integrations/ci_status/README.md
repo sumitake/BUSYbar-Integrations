@@ -290,9 +290,13 @@ The poll summary is logged at `INFO` only when it changes, plus a heartbeat line
 
 ### When GitHub Does Not Answer
 
-A `304 Not Modified` means the cached state is still current and is kept indefinitely. Anything else that is not a usable answer — an error status such as `401`/`403`/`404`/`5xx`, a network failure, or a response this integration cannot read — keeps the cached state for that poll only as a stopgap: after 15 minutes without a usable answer for a repo, its failure/stuck frames and its running badge are dropped (and the LED turned off if nothing else is failing), so a deleted or renamed repo, or a revoked token, cannot leave `CI FAIL` on the display. State returns on the next good answer. A revoked token needs `gh auth login` and an agent restart, since the token is read once at startup.
+A `304 Not Modified` means the cached state is still current and is kept indefinitely. The same goes for any failure that only means the question could not be asked — GitHub unreachable (including a laptop that is offline or asleep), a `5xx` server error, a rate limit, or a response this integration cannot read: the failure/stuck frames, the running badge and the LED stay as they were for as long as it lasts, because nothing has been learned about the repo.
 
-A rate-limit answer (`403`/`429` carrying `Retry-After`, or with the quota exhausted) pauses every GitHub request for the time GitHub asks, bounded to between 1 and 15 minutes; the display keeps rotating cached frames meanwhile.
+Only a refusal expires cached state: `401`, `404`, `410`, or a `403` that is not a rate limit. When GitHub has kept refusing a repo for 15 minutes, its failure/stuck frames and running badge are dropped (and the LED turned off if nothing else is failing), so a deleted or renamed repo, or a revoked token, cannot leave `CI FAIL` on the display. One warning lists every repo dropped in that poll. State returns on the next good answer. A revoked token needs `gh auth login` and an agent restart, since the token is read once at startup.
+
+A rate-limit answer (`403`/`429` carrying `Retry-After`, or with the quota exhausted) pauses every GitHub request for the time GitHub asks, bounded to between 1 and 15 minutes; after the cap one probe request is sent, and the pause repeats if GitHub is still limiting. GitHub's primary limit can take up to an hour to reset. The display keeps rotating cached frames meanwhile.
+
+With account-wide watching, the repo list is replaced only by a complete enumeration: if any page fails, the previous list is kept and enumeration is retried on the next poll.
 
 With `show_green` on, the `CI OK` card is withheld until every watched repo has been read successfully, so it never claims "all clear" for a repo GitHub has not answered for.
 

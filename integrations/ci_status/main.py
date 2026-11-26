@@ -16,7 +16,7 @@ from busybar.config import device_kwargs, load_config
 from busybar.display import OVERLAY_DWELL_SECONDS, PRIORITY_OVERLAY, overlay_gap_elapsed
 from busybar.presentation import modern_display, prepare_frame, commit_frame, ci_bitmap_accent
 
-from .github import FETCH_FAILED, RestPoller, get_token
+from .github import FETCH_DENIED, FETCH_FAILED, RestPoller, get_token
 from .logic import (
     RepoState, RunningInfo, QuotaInfo,
     build_overlay_payload, build_overlay_sequence, evaluate_runs,
@@ -30,20 +30,26 @@ log = logging.getLogger(APP)
 
 QUOTA_LABELS = {"graphql": "GITHUB GRAPHQL", "core": "GITHUB REST"}
 QUOTA_STALE_SECONDS = 300  # never show rate_limit data older than 5 minutes
-# How long a repo may go without a usable answer from GitHub before its
-# cached failure/stuck state or running badge is dropped. Long enough to
-# ride out an outage or a rate-limit pause; short enough that a deleted
-# repo or a revoked token cannot leave "CI FAIL" on the display for good.
+# How long GitHub must keep refusing a repo (github.FETCH_DENIED: 401, a 403
+# that is not a rate limit, 404, 410) before its cached failure/stuck state
+# or running badge is dropped, so a deleted or renamed repo or a revoked
+# token cannot leave "CI FAIL" on the display for good. "Could not ask"
+# (outage, rate limit, server error, unreadable body) never counts: cached
+# state then stays for as long as the outage lasts.
 STALE_STATE_SECONDS = 900
 HEARTBEAT_SECONDS = 600  # INFO heartbeat when the poll summary is unchanged
 
 
-def _failed_too_long(fetch_health: dict, key: tuple[str, str], ok: bool,
+def _denied_too_long(fetch_health: dict, key: tuple[str, str], result,
                      now: datetime) -> bool:
-    """Track one (kind, repo) fetch's run of consecutive failures in
-    `fetch_health` (first-failure time; cleared by any usable answer, a 304
-    included). True once that run has lasted STALE_STATE_SECONDS."""
-    if ok:
+    """Track one (kind, repo) fetch's run of refusals in `fetch_health`
+    (time of the first refusal). FETCH_DENIED starts or continues the run;
+    FETCH_FAILED ("could not ask") leaves it as it is, neither starting nor
+    resetting it; any usable answer, a 304 included, clears it. True once a
+    refusal arrives STALE_STATE_SECONDS or more after the run began."""
+    if result is FETCH_FAILED:
+        return False
+    if result is not FETCH_DENIED:
         fetch_health.pop(key, None)
         return False
     since = fetch_health.setdefault(key, now)
@@ -126,15 +132,16 @@ def run_once(client, poller, cfg: dict, now: datetime,
     omitting `fetch_health` (the default) means failure runs are not
     remembered between calls, so cached state never expires.
 
-    GitHub answers three ways per repo (see `github.FETCH_FAILED`): a list
-    (new body), None (304: the cached copy is current), or FETCH_FAILED (no
-    usable answer). Cached state survives the last two, and is re-evaluated
-    against `now` every poll so a queued run keeps ageing toward "stuck"
-    even while GitHub answers 304. Only FETCH_FAILED -- or a body this code
-    cannot read, which skips that repo for the poll with one gated warning
-    -- counts toward `STALE_STATE_SECONDS`, after which the repo's cached
-    state (and, separately, its running badge) is dropped along with its
-    ETags, so a later 304 cannot vouch for state that is no longer held.
+    GitHub answers four ways per repo (see `github.FETCH_FAILED`): a list
+    (new body), None (304: the cached copy is current), FETCH_FAILED (could
+    not ask), or FETCH_DENIED (a refusal). Cached state survives the last
+    three, and is re-evaluated against `now` every poll so a queued run
+    keeps ageing toward "stuck" even while GitHub answers 304. A body this
+    code cannot read skips that repo for the poll with one gated warning and
+    counts as "could not ask". Only refusals spanning `STALE_STATE_SECONDS`
+    drop the repo's cached state (and, separately, its running badge) along
+    with that slot's ETag, so a later 304 cannot vouch for state that is no
+    longer held; one warning per poll lists every repo dropped.
     While any watched repo has no state, the green "ALL CLEAR" frame is
     withheld: it is a claim about every repo, not about the ones that
     happened to answer.
@@ -215,28 +222,28 @@ def run_once(client, poller, cfg: dict, now: datetime,
 
     labels = repo_labels(list(effective_repos))  # display names only; API calls keep the full name
 
+    dropped: set[str] = set()   # repos whose cached state expired this poll
     for repo in effective_repos:
         fetched = poller.fetch_runs(repo)
-        ok = fetched is not FETCH_FAILED
+        answered = fetched is not FETCH_FAILED and fetched is not FETCH_DENIED
         cached = state_cache.get(repo)
         # A new body, else the runs behind the cached state (304 or failure).
-        runs = fetched if ok and fetched is not None else (cached.runs if cached else None)
+        runs = fetched if answered and fetched is not None else (cached.runs if cached else None)
         if runs is not None:
             try:
                 state_cache[repo] = evaluate_runs(repo, runs, now,
                                                   c["stale_queued_minutes"])
             except (LookupError, TypeError, ValueError, AttributeError) as exc:
-                ok = False
+                fetched = FETCH_FAILED   # could not read it: says nothing about the repo
                 # The poller already committed this body's ETag; forget it so
                 # the next poll re-reads the body instead of getting a 304.
-                poller.forget_repo(repo)
+                poller.forget_repo(repo, running=False)
                 poller.warn(f"runs {repo}", f"skipping {repo} this poll: "
                                             f"unreadable run data ({exc!r})")
-        if _failed_too_long(fetch_health, ("runs", repo), ok, now) \
+        if _denied_too_long(fetch_health, ("runs", repo), fetched, now) \
                 and state_cache.pop(repo, None) is not None:
-            poller.forget_repo(repo)
-            log.warning("no usable answer from GitHub for %s in %d min; dropping its "
-                        "cached CI state", repo, STALE_STATE_SECONDS // 60)
+            poller.forget_repo(repo, running=False)
+            dropped.add(repo)
 
     states = list(state_cache.values())
 
@@ -250,20 +257,18 @@ def run_once(client, poller, cfg: dict, now: datetime,
     if running_cache is not None and c["show_running"]:
         for repo in effective_repos:
             running_runs = poller.fetch_running_runs(repo)
-            ok = running_runs is not FETCH_FAILED
-            if ok and running_runs is not None:
+            if isinstance(running_runs, list):
                 if running_runs_usable(running_runs):
                     running_cache[repo] = running_runs
                 else:
-                    ok = False
-                    poller.forget_repo(repo)   # same ETag reasoning as above
+                    running_runs = FETCH_FAILED
+                    poller.forget_repo(repo, runs=False)   # same ETag reasoning as above
                     poller.warn(f"running {repo}", f"skipping {repo} this poll: "
                                                    "unreadable running-run data")
-            if _failed_too_long(fetch_health, ("running", repo), ok, now) \
+            if _denied_too_long(fetch_health, ("running", repo), running_runs, now) \
                     and running_cache.pop(repo, None):
-                poller.forget_repo(repo)
-                log.warning("no usable answer from GitHub for %s's running jobs in %d min; "
-                            "dropping its running badge", repo, STALE_STATE_SECONDS // 60)
+                poller.forget_repo(repo, runs=False)
+                dropped.add(repo)
         selected = select_running_run(running_cache)
         if selected is not None:
             run, repo, other_count = selected
@@ -281,6 +286,13 @@ def run_once(client, poller, cfg: dict, now: datetime,
 
     # "ALL CLEAR" only when every watched repo has actually been read.
     show_green = c["show_green"] and all(repo in state_cache for repo in effective_repos)
+    if dropped:
+        # One line per poll, not per repo: a revoked token refuses every repo
+        # at once. Each repo is dropped once; it reappears only after a good
+        # answer, so this cannot repeat every poll.
+        log.warning("GitHub has refused %s for %d min; dropped cached CI state",
+                    ", ".join(sorted(dropped)), STALE_STATE_SECONDS // 60)
+
     sequence = build_overlay_sequence(states, running_present=running_present,
                                       quota_frames=quota_frames, show_green=show_green)
 

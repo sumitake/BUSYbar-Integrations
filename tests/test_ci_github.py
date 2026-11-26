@@ -6,7 +6,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 import ci_status.github as github
-from ci_status.github import FETCH_FAILED, RestPoller, get_token
+from ci_status.github import FETCH_DENIED, FETCH_FAILED, RestPoller, get_token
 
 
 def _response(status: int, body: dict | None = None, etag: str | None = None) -> Mock:
@@ -248,12 +248,15 @@ def test_fetch_account_repos_paginates_across_multiple_pages(mock_get):
     assert "If-None-Match" not in second_call.kwargs["headers"]
 
 @patch("ci_status.github.requests.get")
-def test_fetch_account_repos_partial_pagination_failure_keeps_earlier_pages(mock_get):
+def test_fetch_account_repos_partial_pagination_is_no_answer_not_a_short_list(mock_get):
+    # A truncated list would replace the caller's previous list for the whole
+    # refresh interval and prune every repo on the missing pages.
     page1 = [_repo(f"o/r{i}") for i in range(100)]
-    mock_get.side_effect = [_list_response(200, page1), _list_response(500)]
-    poller = RestPoller("tok")
-    result = poller.fetch_account_repos()
-    assert len(result) == 100   # page 1 kept, page 2's failure just stops pagination
+    for page2 in (_list_response(500), _limited(403, Retry_After="60"),
+                  _list_response(200, {"not": "a list"})):
+        mock_get.reset_mock()
+        mock_get.side_effect = [_list_response(200, page1), page2]
+        assert RestPoller("tok").fetch_account_repos() is None
 
 @patch("ci_status.github.requests.get")
 def test_fetch_account_repos_etag_not_locked_in_by_partial_pagination_failure(mock_get):
@@ -270,7 +273,7 @@ def test_fetch_account_repos_etag_not_locked_in_by_partial_pagination_failure(mo
     mock_get.side_effect = [_list_response(200, page1, etag='W/"page1-v1"'), _list_response(500)]
     poller = RestPoller("tok")
     first = poller.fetch_account_repos()
-    assert len(first) == 100   # partial result returned, as before
+    assert first is None   # incomplete -> no answer; the caller keeps its previous list
 
     # Second call: must NOT send If-None-Match for the page-1 ETag from
     # the incomplete run above -- the ETag was never committed. Both
@@ -335,6 +338,21 @@ def test_fetch_account_repos_empty_account_returns_empty_list_not_none(mock_get)
 # --- forget_repo: drops both ETag slots for a repo (v1.5.1) ---------------------
 
 @patch("ci_status.github.requests.get")
+def test_forget_repo_can_clear_one_slot_only(mock_get):
+    # Discarding an unusable running-runs body must not also discard the
+    # runs ETag fetch_runs just validated (and vice versa).
+    poller = RestPoller("tok")
+    mock_get.return_value = _response(200, {"workflow_runs": []}, etag='W/"a"')
+    poller.fetch_runs("o/r")
+    poller.fetch_running_runs("o/r")
+    poller.forget_repo("o/r", runs=False)
+    assert "o/r" in poller._etags and "o/r" not in poller._running_etags
+    poller.fetch_running_runs("o/r")
+    poller.forget_repo("o/r", running=False)
+    assert "o/r" not in poller._etags and "o/r" in poller._running_etags
+
+
+@patch("ci_status.github.requests.get")
 def test_forget_repo_clears_both_etag_slots(mock_get):
     poller = RestPoller("tok")
     mock_get.return_value = _response(200, {"workflow_runs": []}, etag='W/"a"')
@@ -355,10 +373,15 @@ def test_forget_repo_unknown_repo_is_a_no_op():
 
 @patch("ci_status.github.requests.get")
 def test_fetch_error_status_is_failed_not_unchanged(mock_get):
-    # 304 means "your cached copy is current"; every other non-200 means "no
-    # answer". Callers expire cached state on the latter, never the former.
+    # 304 means "your cached copy is current". A refusal (the repo is gone,
+    # or this token may not read it) is FETCH_DENIED and may expire cached
+    # state; a server error is FETCH_FAILED, "could not ask", and never does.
     poller = RestPoller("tok")
-    for status in (401, 403, 404, 500, 503):
+    for status in (401, 403, 404, 410):
+        mock_get.return_value = _response(status)
+        assert poller.fetch_runs("o/r") is FETCH_DENIED
+        assert poller.fetch_running_runs("o/r") is FETCH_DENIED
+    for status in (500, 502, 503):
         mock_get.return_value = _response(status)
         assert poller.fetch_runs("o/r") is FETCH_FAILED
         assert poller.fetch_running_runs("o/r") is FETCH_FAILED
@@ -492,7 +515,7 @@ def test_plain_403_is_not_treated_as_a_rate_limit(mock_get):
     # repo; it must not pause polling for every other repo.
     mock_get.return_value = _limited(403, X_RateLimit_Remaining="4999")
     poller = RestPoller("tok")
-    assert poller.fetch_runs("o/private") is FETCH_FAILED
+    assert poller.fetch_runs("o/private") is FETCH_DENIED
     mock_get.return_value = _response(200, {"workflow_runs": []})
     assert poller.fetch_runs("o/r") == []
     assert mock_get.call_count == 2
@@ -575,3 +598,19 @@ def test_warning_gate_holds_with_more_live_faults_than_its_size_bound(mock_get, 
             for repo in repos:
                 poller.fetch_runs(repo)
     assert len(_warnings(caplog)) == len(repos)      # once each, not once per poll
+
+
+@patch("ci_status.github.time")
+@patch("ci_status.github.requests.get")
+def test_rate_limit_and_outage_are_could_not_ask_not_denied(mock_get, mock_time):
+    mock_time.monotonic.return_value = 0.0
+    poller = RestPoller("tok")
+    mock_get.return_value = _limited(403, Retry_After="60")
+    assert poller.fetch_runs("o/r") is FETCH_FAILED          # the limiting answer
+    assert poller.fetch_runs("o/r") is FETCH_FAILED          # paused: nothing sent
+    mock_time.monotonic.return_value = 60.0
+    mock_get.return_value = _limited(429)
+    assert poller.fetch_running_runs("o/r") is FETCH_FAILED
+    mock_time.monotonic.return_value = 120.0
+    mock_get.side_effect = requests.ConnectionError()
+    assert poller.fetch_runs("o/r") is FETCH_FAILED

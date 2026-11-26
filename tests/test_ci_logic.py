@@ -729,6 +729,12 @@ def test_running_runs_usable_requires_what_the_badge_dereferences():
     assert not running_runs_usable([{k: v for k, v in good.items() if k != "workflow_id"}])
     assert not running_runs_usable([{**good, "pull_requests": [{"no": "number"}]}])
     assert not running_runs_usable([good, "not a run"])
+    # Types, not just presence: each of these crashed the badge or the ETA cache.
+    assert not running_runs_usable([{**good, "name": 7}])
+    assert not running_runs_usable([{**good, "head_branch": 7, "pull_requests": []}])
+    assert not running_runs_usable([{**good, "workflow_id": [1]}])
+    assert not running_runs_usable([{**good, "workflow_id": "1"}])
+    assert running_runs_usable([{**good, "name": None, "head_branch": None, "pull_requests": []}])
     assert not running_runs_usable({"workflow_runs": []})
 
 
@@ -762,3 +768,22 @@ def test_fail_and_stuck_cards_use_the_repo_label():
         assert body["text"] == "widgets #42 tests"
         unlabeled = next(e for e in build_overlay_payload(descriptor, 10)["elements"] if e["id"] == "ci")
         assert unlabeled["text"] == "acme/widgets #42 tests"
+
+
+
+def test_resolve_repo_list_skips_malformed_account_entries():
+    good = _account_repo("o/good")
+    account = [good, "not a repo", None, {**good, "full_name": 7}, {**good, "full_name": None},
+               {**good, "archived": False, "pushed_at": 12}]
+    assert resolve_repo_list([], [], True, account, 30, NOW) == ["o/good"]
+
+
+def test_parse_rate_limit_ignores_malformed_buckets():
+    good = {"limit": 5000, "remaining": 4000, "reset": 1000, "used": 1000}
+    assert parse_rate_limit({"resources": ["core"]}) is None
+    assert parse_rate_limit({"resources": {"core": "limited"}}) is None
+    assert parse_rate_limit({"resources": {"core": {**good, "limit": "5000"}}}) is None
+    assert parse_rate_limit({"resources": {"core": {**good, "remaining": None}}}) is None
+    assert parse_rate_limit({"resources": {"core": {**good, "reset": True}}}) is None
+    assert parse_rate_limit({"resources": {"core": {**good, "used": "x"}}})["core"]["used"] == 1000
+    assert parse_rate_limit({"resources": {"core": good, "graphql": []}}) == {"core": good}

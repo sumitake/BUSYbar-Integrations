@@ -11,17 +11,32 @@ log = logging.getLogger("ci_status")
 API = "https://api.github.com"
 
 
-class _FetchFailed:
+class _NoAnswer:
+    def __init__(self, name: str):
+        self._name = name
+
     def __repr__(self) -> str:
-        return "FETCH_FAILED"
+        return self._name
 
 
-# What fetch_runs / fetch_running_runs return when GitHub gave no usable
-# answer (unreachable, an error status, rate-limited, unusable body) -- as
-# opposed to None, which is a 304: GitHub confirming the cached copy is
-# still current. Callers keep cached state on both, but only a run of
-# FETCH_FAILED may expire it.
-FETCH_FAILED = _FetchFailed()
+# The two ways fetch_runs / fetch_running_runs can fail, as opposed to None,
+# which is a 304 (GitHub confirming the cached copy is still current):
+#
+# FETCH_FAILED -- we could not ask: GitHub unreachable, a server error, a
+#   rate limit (or the pause after one), or a body we cannot read. This says
+#   nothing about the repo, so callers keep cached state for as long as it
+#   lasts.
+# FETCH_DENIED -- GitHub answered that this repo cannot be read with this
+#   token (401, 403 that is not a rate limit, 404, 410): deleted, renamed,
+#   made private, or the token was revoked. Only a run of these may expire
+#   cached state.
+FETCH_FAILED = _NoAnswer("FETCH_FAILED")
+FETCH_DENIED = _NoAnswer("FETCH_DENIED")
+DENIED_STATUSES = frozenset({401, 403, 404, 410})
+
+
+def _answered(resp) -> bool:
+    return resp is not FETCH_FAILED and resp is not FETCH_DENIED
 
 WARN_REPEAT_SECONDS = 600   # same reminder interval as busybar.client
 MAX_WARNING_KEYS = 64
@@ -102,15 +117,16 @@ class RestPoller:
         log.warning("%s", message)
 
     def _get(self, url: str, what: str, params: dict | None,
-             etag: str | None = None) -> requests.Response | None:
+             etag: str | None = None) -> requests.Response | _NoAnswer:
         """The one place a request is sent. Returns the response for a 200
-        or 304; None -- after one gated warning -- when GitHub is
-        unreachable, answers with any other status, or has rate-limited
-        this token (in which case nothing is sent until the pause ends).
+        or 304; otherwise, after one gated warning, FETCH_DENIED for a
+        refusal (DENIED_STATUSES, a 403 only when it is not a rate limit) or
+        FETCH_FAILED for everything else -- unreachable, another status, or
+        a rate limit (in which case nothing is sent until the pause ends).
         `what` completes the warning ("github 404 <what>") and keys its gate.
         """
         if time.monotonic() < self._paused_until:
-            return None
+            return FETCH_FAILED
         headers = self._headers()
         if etag is not None:
             headers["If-None-Match"] = etag
@@ -118,7 +134,7 @@ class RestPoller:
             resp = requests.get(url, headers=headers, params=params, timeout=(5, 15))
         except requests.RequestException as exc:
             self.warn("unreachable", f"github unreachable ({type(exc).__name__})")
-            return None
+            return FETCH_FAILED
         if resp.status_code in (200, 304):
             return resp
         pause = self._rate_limit_pause(resp)
@@ -127,7 +143,7 @@ class RestPoller:
             log.debug("github rate limit: no requests for %ds", pause)
             self.warn("rate limit", f"github rate limit ({resp.status_code}); "
                                     "pausing GitHub requests until it clears")
-            return None
+            return FETCH_FAILED
         if resp.status_code == 401:
             # About the token, not the repo: one line, not one per repo. The
             # token is read once at startup, hence the restart.
@@ -135,7 +151,7 @@ class RestPoller:
                               "then restart ci_status")
         else:
             self.warn(what, f"github {resp.status_code} {what}")
-        return None
+        return FETCH_DENIED if resp.status_code in DENIED_STATUSES else FETCH_FAILED
 
     @staticmethod
     def _rate_limit_pause(resp: requests.Response) -> float | None:
@@ -171,15 +187,15 @@ class RestPoller:
         return body
 
     def _fetch_run_list(self, repo: str, etags: dict[str, str], params: dict,
-                        what: str) -> list[dict] | None | _FetchFailed:
+                        what: str) -> list[dict] | None | _NoAnswer:
         """Conditional GET of a repo's workflow runs: the list on a 200,
-        None on a 304, FETCH_FAILED otherwise. The ETag is committed only
+        None on a 304, FETCH_DENIED or FETCH_FAILED otherwise. The ETag is committed only
         once the body proved usable -- committing it first would turn the
         next poll into a 304 for content this process never read."""
         resp = self._get(f"{API}/repos/{repo}/actions/runs", what, params,
                          etag=etags.get(repo))
-        if resp is None:
-            return FETCH_FAILED
+        if not _answered(resp):
+            return resp
         if resp.status_code == 304:
             return None
         body = self._json_object(resp, what)
@@ -193,11 +209,11 @@ class RestPoller:
             etags[repo] = resp.headers["ETag"]
         return runs
 
-    def fetch_runs(self, repo: str) -> list[dict] | None | _FetchFailed:
-        """Newest 10 runs: the list, None on a 304, or FETCH_FAILED."""
+    def fetch_runs(self, repo: str) -> list[dict] | None | _NoAnswer:
+        """Newest 10 runs: the list, None on a 304, FETCH_DENIED or FETCH_FAILED."""
         return self._fetch_run_list(repo, self._etags, {"per_page": 10}, f"for {repo}")
 
-    def fetch_running_runs(self, repo: str) -> list[dict] | None | _FetchFailed:
+    def fetch_running_runs(self, repo: str) -> list[dict] | None | _NoAnswer:
         """GET .../actions/runs?status=in_progress&per_page=5 -- a distinct
         URL from fetch_runs, so it uses its own ETag slot (_running_etags,
         not _etags). Same three-way result as fetch_runs."""
@@ -219,7 +235,7 @@ class RestPoller:
         what = f"for {repo} workflow {workflow_id} (median fetch)"
         resp = self._get(f"{API}/repos/{repo}/actions/workflows/{workflow_id}/runs",
                          what, {"status": "success", "per_page": 5})
-        body = self._json_object(resp, what) if resp is not None else None
+        body = self._json_object(resp, what) if _answered(resp) else None
         runs = body.get("workflow_runs", []) if body is not None else None
         if not isinstance(runs, list):
             return None
@@ -246,7 +262,7 @@ class RestPoller:
         caller already treats None as "no quota frames this cycle".
         """
         resp = self._get(f"{API}/rate_limit", "(rate_limit fetch)", None)
-        return self._json_object(resp, "(rate_limit fetch)") if resp is not None else None
+        return self._json_object(resp, "(rate_limit fetch)") if _answered(resp) else None
 
     def fetch_account_repos(self) -> list[dict] | None:
         """GET /user/repos?affiliation=owner&sort=pushed&per_page=100,
@@ -269,44 +285,30 @@ class RestPoller:
         moved within page 2 without ever crossing into page 1.
 
         Returns `None` on a page-1 304 (nothing changed) or any failure
-        (network, non-200, malformed JSON) at any page -- the caller
-        (`main._refresh_account_repos`) treats `None` as "keep whatever
-        was cached before" and logs a warning on a genuine failure, never
-        falling back to an empty list (an empty list would look
+        (network, non-200, rate limit, malformed JSON) at any page -- the
+        caller (`main._refresh_account_repos`) treats `None` as "keep
+        whatever was cached before" and warns if nothing is cached yet,
+        never falling back to an empty list (an empty list would look
         indistinguishable from "this account genuinely owns zero repos,"
-        which would silently stop watching everything).
+        which would silently stop watching everything). That includes a
+        failure on page 2 or later: a truncated list would replace the
+        previous one for the whole refresh interval, and run_once would
+        drop the cached state of every repo on the missing pages.
 
         The page-1 ETag is committed to `self._account_repos_etag` ONLY
-        after pagination completes in full -- not right after page 1's
-        own response, even though that response is where the ETag value
-        comes from. Committing it earlier would create a silent
-        lock-in bug for >100-repo accounts: if page 2+ then failed, this
-        call would still return the partial `repos` list collected so
-        far (a partial result being better than discarding everything),
-        but the page-1 ETag would already be cached -- so the *next*
-        call sends `If-None-Match` for a page-1 body that genuinely
-        hasn't changed, gets a 304, and this method returns `None`. The
-        caller reads `None` as "nothing changed, keep the cached list" --
-        permanently freezing the account's watch list at that one
-        incomplete pagination run's partial subset, with no future call
-        ever able to recover the rest (every subsequent page-1 request
-        keeps matching the same cached ETag). On an incomplete pagination
-        run, `self._account_repos_etag` is simply left as whatever it
-        was (not overwritten) -- safe, not just "not actively wrong":
-        reaching this branch means page 1's *response this call* was a
-        fresh 200, not a 304, so page 1's content has already been
-        confirmed to differ from whatever the old cached ETag matched;
-        the next call sending that same old ETag will therefore get
-        another fresh 200 (never a wrongful 304), giving pagination
-        another full chance to complete rather than reusing the partial
-        result. See the regression test for the failure mode this
-        guards against.
+        after pagination completes in full. Committing it from page 1's own
+        response would make the next call get a 304 for page 1 and return
+        `None` without ever retrying the pages that failed, so a list that
+        was never fully read could not be recovered. Left uncommitted, the
+        next call sends the previous ETag (or none), which page 1's changed
+        content no longer matches, so it gets a fresh 200 and pagination
+        gets another full chance. See the regression test.
         """
         url = f"{API}/user/repos"
         resp = self._get(url, "(account repo enumeration)",
                          {"affiliation": "owner", "sort": "pushed", "per_page": 100},
                          etag=self._account_repos_etag)
-        if resp is None or resp.status_code == 304:
+        if not _answered(resp) or resp.status_code == 304:
             return None
         new_etag = resp.headers.get("ETag")   # not committed yet -- see the docstring above
         try:
@@ -325,9 +327,9 @@ class RestPoller:
             resp = self._get(url, f"(account repo enumeration page {page})",
                              {"affiliation": "owner", "sort": "pushed",
                               "per_page": 100, "page": page})
-            if resp is None or resp.status_code != 200:
+            if not _answered(resp) or resp.status_code != 200:
                 complete = False
-                break  # a partial result is still better than discarding everything
+                break
             try:
                 page_items = resp.json()
             except ValueError:
@@ -340,17 +342,22 @@ class RestPoller:
             repos.extend(page_items)
             page += 1
 
-        if complete and new_etag is not None:
+        if not complete:
+            return None   # a short list must not replace the caller's previous one
+        if new_etag is not None:
             self._account_repos_etag = new_etag
         return repos
 
-    def forget_repo(self, repo: str) -> None:
-        """Drop cached conditional-request state (both ETag slots) for a
-        repo that has left the effective watch list -- excluded, aged out
-        of `active_within_days`, or deleted upstream (v1.5.1). Called by
-        `main.run_once` alongside `state_cache`/`running_cache` pruning so
-        a repo that's later re-added (e.g. it becomes active again) starts
-        with a clean conditional-request slate instead of an ETag from a
-        stale enumeration."""
-        self._etags.pop(repo, None)
-        self._running_etags.pop(repo, None)
+    def forget_repo(self, repo: str, *, runs: bool = True, running: bool = True) -> None:
+        """Drop cached conditional-request state for a repo: both ETag slots
+        by default, for a repo that has left the effective watch list --
+        excluded, aged out of `active_within_days`, or deleted upstream
+        (v1.5.1) -- so a repo that's later re-added starts with a clean
+        conditional-request slate. `runs=False` / `running=False` keep that
+        slot: main.run_once drops only the slot whose body it could not use
+        or whose cached state it expired, so the other slot's just-validated
+        ETag keeps earning free 304s."""
+        if runs:
+            self._etags.pop(repo, None)
+        if running:
+            self._running_etags.pop(repo, None)

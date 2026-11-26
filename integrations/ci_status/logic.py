@@ -127,7 +127,7 @@ def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_
     if watch_account_repos and account_repos:
         cutoff = now - timedelta(days=active_within_days)
         for r in account_repos:
-            if r.get("archived"):
+            if not isinstance(r, dict) or r.get("archived"):
                 continue
             pushed_at = r.get("pushed_at")
             if not pushed_at:
@@ -139,7 +139,7 @@ def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_
             if pushed < cutoff:
                 continue
             full_name = r.get("full_name")
-            if full_name:
+            if isinstance(full_name, str) and full_name:
                 names.add(full_name)
     names -= set(repos_exclude)
     return sorted(names)
@@ -292,18 +292,23 @@ def select_running_run(running_by_repo: dict[str, list[dict]]) -> tuple[dict, st
 
 
 def running_runs_usable(runs: list) -> bool:
-    """True when every in_progress entry carries what the running badge
-    dereferences without a fallback (`workflow_id`, a parseable
-    `run_started_at`, a readable PR reference). main.run_once checks this
-    before caching a poll's answer, so one malformed entry skips that repo
-    for the poll instead of raising later from select_running_run or the
-    badge renderer."""
+    """True when every in_progress entry carries what the running badge and
+    the ETA lookup use, with the right types: an integer `workflow_id` (it
+    keys the ETA cache), a parseable `run_started_at`, and a `name` and PR
+    or branch reference that are text (they are joined into the title).
+    main.run_once checks this before caching a poll's answer, so one
+    malformed entry skips that repo for the poll instead of raising later
+    from select_running_run or the badge renderer."""
     try:
         for r in runs:
-            if r.get("status") == "in_progress":
-                r["workflow_id"]
-                _parse_ts(r["run_started_at"])
-                _pr_or_branch(r)
+            if r.get("status") != "in_progress":
+                continue
+            workflow_id = r["workflow_id"]
+            if not isinstance(workflow_id, int) or isinstance(workflow_id, bool):
+                return False
+            _parse_ts(r["run_started_at"])
+            if not isinstance(r.get("name") or "", str) or not isinstance(_pr_or_branch(r), str):
+                return False
     except (LookupError, TypeError, ValueError, AttributeError):
         return False
     return True
@@ -591,15 +596,21 @@ def parse_rate_limit(data: dict) -> dict[str, dict] | None:
     cycle, not crash or show stale data -- see RestPoller.fetch_rate_limit
     and main.py's staleness handling).
     """
-    resources = (data or {}).get("resources") or {}
+    def number(value) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    resources = data.get("resources") if isinstance(data, dict) else None
+    if not isinstance(resources, dict):
+        return None
     result: dict[str, dict] = {}
     for key in ("core", "graphql"):
         bucket = resources.get(key)
-        if not bucket or "limit" not in bucket or "remaining" not in bucket or "reset" not in bucket:
+        if not isinstance(bucket, dict) or not all(
+                number(bucket.get(field)) for field in ("limit", "remaining", "reset")):
             continue
         limit, remaining = bucket["limit"], bucket["remaining"]
         used = bucket.get("used")
-        if used is None:
+        if not number(used):
             used = max(0, limit - remaining)
         result[key] = {"limit": limit, "remaining": remaining, "used": used, "reset": bucket["reset"]}
     return result or None
