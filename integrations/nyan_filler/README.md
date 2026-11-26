@@ -4,7 +4,7 @@
 
 This integration fills unused screen time on the busybar device with a full-panel animated Nyan Cat, drawing at the **filler** tier (`busybar.display.PRIORITY_FILLER`, priority 5) — the lowest tier. The animation is a native on-device asset (`.anim` format) and runs entirely on the device, so host CPU overhead is minimal: roughly one tiny draw per second.
 
-**Priority ensures it never interrupts anything important.** Built-in apps draw at priority 10 (above filler); the CI status alert at priority 60, calendar events at priorities 20–65, and BUSY/CUSTOM sessions at priority 90 all preempt the Nyan animation immediately. The integration yields to every other display consumer — it exists *only* to fill gaps that would otherwise show black. Once any higher-priority display appears, the Nyan animation disappears, and when the screen goes dark again, it resumes.
+**Priority ensures it never interrupts anything important.** Built-in apps draw at priority 10 (above filler); the CI status overlay frames at priority 21, calendar events at priorities 20–65, and BUSY/CUSTOM sessions at priority 90 all preempt the Nyan animation immediately. The integration yields to every other display consumer — it exists *only* to fill gaps that would otherwise show black. Once any higher-priority display appears, the Nyan animation disappears, and when the screen goes dark again, it resumes.
 
 ## Requirements
 

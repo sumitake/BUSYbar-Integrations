@@ -63,7 +63,8 @@ start_window_seconds = 60    # how long that takeover holds
 
 [ci_status]
 poll_seconds = 120
-repos = ["your-user/your-repo"]
+repos = ["your-user/your-repo"]  # placeholder, NOT the default: the default is [] (watch nothing).
+                              # Set this, or watch_account_repos below, or ci_status exits at startup.
 show_green = false
 # stale_queued_minutes = 15  # omit to disable stuck-queue detection
 show_running = true          # show a badge (alternating with the calendar) while a run is in progress

@@ -204,7 +204,7 @@ To add a new integration:
 
 - All secrets (API tokens, credentials) go in `config.toml`, which you provide locally.
 - The repo ships only `config.example.toml`, documenting all fields and defaults.
-- CI/CD can inject secrets via environment-variable expansion in config parsing if needed.
+- Two environment variables override the file: `BUSYBAR_HOST` (device address) and `BUSYBAR_LOCAL_TOKEN` (local API token), so CI/CD can supply both without a `config.toml`. Nothing else is read from the environment — config parsing does no general environment-variable expansion (see `load_config` in `src/busybar/config.py`).
 
 ## Cloud transport
 
@@ -284,4 +284,4 @@ token, with these results:
 | Integration | Description |
 |---|---|
 | [`calendar_countdown`](integrations/calendar_countdown/) | Live countdown to your next macOS Calendar event. Four-stage escalation as an event approaches — `approach_minutes` (30m default), `notice_minutes` (15m, amber), `warn_minutes` (5m, red), and a final-minute LED blink — plus one audio chirp precisely at event start. The countdown itself turns teal while the event is in progress. Optional `auto_busy` starts a BUSY session automatically for the event's duration. |
-| [`ci_status`](integrations/ci_status/) | GitHub Actions status via the REST API with ETag caching (near-zero steady-state quota cost). Failure and stuck-queue frames rotate calmly at the overlay tier — `CI FAIL owner/repo #42 · workflow` (PR number, or branch when there's no PR) — with a gentle red LED while a workflow is failing. While a run is active, the same rotation adds a running badge (ETA plus a "remain"/"left" label) alongside GitHub GraphQL/REST quota gauges. Optional account-wide watching auto-discovers and monitors every repo you own, not just an explicit list. |
+| [`ci_status`](integrations/ci_status/) | GitHub Actions status via the REST API with ETag caching (near-zero steady-state quota cost). Failure and stuck-queue frames rotate calmly at the overlay tier — a `CI FAIL` or `CI WAIT` heading over a scrolling `owner/repo #42 workflow` line (PR number, or branch when there's no PR) — with a gentle red LED while a workflow is failing. While a run is active, the same rotation adds a running badge (ETA plus a "remain"/"left" label) alongside GitHub GraphQL/REST quota gauges. Optional account-wide watching auto-discovers and monitors every repo you own, not just an explicit list. |
