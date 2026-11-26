@@ -1,5 +1,5 @@
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -46,6 +46,11 @@ class RepoState:
     repo: str
     failing: list[FailingRun]
     stuck: list[FailingRun]
+    # The runs this state was evaluated from, kept so main.run_once can
+    # re-evaluate it against a later `now` when GitHub answers 304: a queued
+    # run that never changes still has to age into "stuck". None on a
+    # hand-built state with nothing to re-evaluate.
+    runs: list[dict] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -74,7 +79,12 @@ class QuotaInfo:
 
 
 def _parse_ts(value: str) -> datetime:
-    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    """A GitHub timestamp as an aware datetime. GitHub sends
+    "2026-08-03T13:30:00Z"; any ISO-8601 form (fractional seconds, a numeric
+    offset) parses too, and a naive value is read as UTC. Raises ValueError
+    or TypeError for anything else -- callers skip the item, they don't crash."""
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_repos: bool,
@@ -137,20 +147,23 @@ def resolve_repo_list(repos: list[str], repos_exclude: list[str], watch_account_
 
 def evaluate_runs(repo: str, runs: list[dict], now: datetime,
                   stale_queued_minutes: int) -> RepoState:
+    """Raises LookupError/TypeError/ValueError/AttributeError on a run it
+    cannot read (not an object, no workflow_id, an unparseable created_at on
+    a queued run); main.run_once skips the repo for that poll."""
     latest: dict[int, dict] = {}
     for r in runs:  # API returns newest first; keep first seen per workflow
         latest.setdefault(r["workflow_id"], r)
     failing, stuck = [], []
     for r in latest.values():
         if r.get("conclusion") in FAILING:
-            failing.append(FailingRun(r["name"], _pr_or_branch(r)))
+            failing.append(FailingRun(r.get("name") or "", _pr_or_branch(r)))
         elif r.get("status") == "queued" and stale_queued_minutes > 0:
             age_min = (now - _parse_ts(r["created_at"])).total_seconds() / 60
             if age_min >= stale_queued_minutes:
-                stuck.append(FailingRun(r["name"], _pr_or_branch(r)))
+                stuck.append(FailingRun(r.get("name") or "", _pr_or_branch(r)))
     key = lambda f: (f.workflow, f.ref)
     return RepoState(repo=repo, failing=sorted(failing, key=key),
-                     stuck=sorted(stuck, key=key))
+                     stuck=sorted(stuck, key=key), runs=runs)
 
 
 # --- overlay tier: shared row template (v1.5) -----------------------------------
@@ -263,6 +276,24 @@ def select_running_run(running_by_repo: dict[str, list[dict]]) -> tuple[dict, st
     return best_run, best_repo, len(candidates) - 1
 
 
+def running_runs_usable(runs: list) -> bool:
+    """True when every in_progress entry carries what the running badge
+    dereferences without a fallback (`workflow_id`, a parseable
+    `run_started_at`, a readable PR reference). main.run_once checks this
+    before caching a poll's answer, so one malformed entry skips that repo
+    for the poll instead of raising later from select_running_run or the
+    badge renderer."""
+    try:
+        for r in runs:
+            if r.get("status") == "in_progress":
+                r["workflow_id"]
+                _parse_ts(r["run_started_at"])
+                _pr_or_branch(r)
+    except (LookupError, TypeError, ValueError, AttributeError):
+        return False
+    return True
+
+
 def compute_median_duration_minutes(successful_runs: list[dict]) -> float | None:
     """Median of (updated_at - run_started_at) in minutes across up to the
     first 5 runs given (the caller already requests per_page=5, but this
@@ -270,10 +301,13 @@ def compute_median_duration_minutes(successful_runs: list[dict]) -> float | None
     timestamps -- "no history", not an error."""
     durations = []
     for r in successful_runs[:5]:
-        started, updated = r.get("run_started_at"), r.get("updated_at")
-        if not started or not updated:
-            continue
-        durations.append((_parse_ts(updated) - _parse_ts(started)).total_seconds() / 60)
+        try:
+            started, updated = r.get("run_started_at"), r.get("updated_at")
+            if not started or not updated:
+                continue
+            durations.append((_parse_ts(updated) - _parse_ts(started)).total_seconds() / 60)
+        except (TypeError, ValueError, AttributeError):
+            continue   # an unreadable run is no history, not an error
     if not durations:
         return None
     durations.sort()

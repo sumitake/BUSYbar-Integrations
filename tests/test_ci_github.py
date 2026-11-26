@@ -5,7 +5,8 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
-from ci_status.github import RestPoller, get_token
+import ci_status.github as github
+from ci_status.github import FETCH_FAILED, RestPoller, get_token
 
 
 def _response(status: int, body: dict | None = None, etag: str | None = None) -> Mock:
@@ -36,7 +37,7 @@ def test_fetch_returns_runs_and_caches_etag(mock_get):
 @patch("ci_status.github.requests.get")
 def test_fetch_swallows_network_errors(mock_get):
     mock_get.side_effect = requests.ConnectionError()
-    assert RestPoller("tok").fetch_runs("o/r") is None
+    assert RestPoller("tok").fetch_runs("o/r") is FETCH_FAILED
 
 
 @patch("ci_status.github.subprocess.run")
@@ -56,7 +57,7 @@ def test_fetch_returns_none_on_malformed_json(mock_get):
     resp.headers = {}
     resp.json.side_effect = ValueError("Invalid JSON")
     mock_get.return_value = resp
-    assert RestPoller("tok").fetch_runs("o/r") is None
+    assert RestPoller("tok").fetch_runs("o/r") is FETCH_FAILED
 
 
 # --- fetch_running_runs: separate ETag slot from fetch_runs -------------------
@@ -95,7 +96,7 @@ def test_fetch_running_runs_etag_is_independent_of_fetch_runs(mock_get):
 @patch("ci_status.github.requests.get")
 def test_fetch_running_runs_swallows_network_errors(mock_get):
     mock_get.side_effect = requests.ConnectionError()
-    assert RestPoller("tok").fetch_running_runs("o/r") is None
+    assert RestPoller("tok").fetch_running_runs("o/r") is FETCH_FAILED
 
 
 # --- fetch_median_eta: process-lifetime cache per workflow_id -----------------
@@ -348,3 +349,229 @@ def test_forget_repo_clears_both_etag_slots(mock_get):
 
 def test_forget_repo_unknown_repo_is_a_no_op():
     RestPoller("tok").forget_repo("never/seen")   # must not raise
+
+
+# --- "failed" is not "not modified" --------------------------------------------
+
+@patch("ci_status.github.requests.get")
+def test_fetch_error_status_is_failed_not_unchanged(mock_get):
+    # 304 means "your cached copy is current"; every other non-200 means "no
+    # answer". Callers expire cached state on the latter, never the former.
+    poller = RestPoller("tok")
+    for status in (401, 403, 404, 500, 503):
+        mock_get.return_value = _response(status)
+        assert poller.fetch_runs("o/r") is FETCH_FAILED
+        assert poller.fetch_running_runs("o/r") is FETCH_FAILED
+    mock_get.return_value = _response(304)
+    assert poller.fetch_runs("o/r") is None
+    assert poller.fetch_running_runs("o/r") is None
+
+
+@patch("ci_status.github.requests.get")
+def test_fetch_non_object_body_is_failed_not_a_crash(mock_get):
+    poller = RestPoller("tok")
+    for body in (["not", "an", "object"], "text", {"workflow_runs": {"oops": 1}}):
+        resp = _response(200)
+        resp.json.return_value = body
+        mock_get.return_value = resp
+        assert poller.fetch_runs("o/r") is FETCH_FAILED
+        assert poller.fetch_running_runs("o/r") is FETCH_FAILED
+        assert poller.fetch_median_eta("o/r", 7) is None
+        if not isinstance(body, dict):   # an object IS a valid /rate_limit body
+            assert poller.fetch_rate_limit() is None
+
+
+@patch("ci_status.github.requests.get")
+def test_etag_not_committed_for_an_unusable_body(mock_get):
+    # Committing the ETag of a body we could not use would turn the next
+    # poll into a 304 "unchanged" for content this process never read.
+    poller = RestPoller("tok")
+    for fetch in (poller.fetch_runs, poller.fetch_running_runs):
+        resp = _response(200, etag='W/"bad"')
+        resp.json.return_value = ["not", "an", "object"]
+        mock_get.return_value = resp
+        assert fetch("o/r") is FETCH_FAILED
+        mock_get.return_value = _response(200, {"workflow_runs": []})
+        fetch("o/r")
+        assert "If-None-Match" not in mock_get.call_args.kwargs["headers"]
+
+
+@patch("ci_status.github.subprocess.run")
+def test_get_token_timeout_is_actionable_not_a_traceback(mock_run):
+    import subprocess
+    mock_run.side_effect = subprocess.TimeoutExpired(cmd=["gh", "auth", "token"], timeout=10)
+    try:
+        get_token()
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as exc:
+        assert "gh auth" in str(exc)
+
+
+# --- rate limits: pause every request for a bounded time ------------------------
+
+def _limited(status: int, **headers: str) -> Mock:
+    resp = _response(status)
+    resp.headers = {k.replace("_", "-"): v for k, v in headers.items()}
+    return resp
+
+
+@patch("ci_status.github.time")
+@patch("ci_status.github.requests.get")
+def test_retry_after_pauses_all_requests_until_it_elapses(mock_get, mock_time):
+    mock_time.monotonic.return_value = 1000.0
+    mock_get.return_value = _limited(403, Retry_After="120")
+    poller = RestPoller("tok")
+    assert poller.fetch_runs("o/r") is FETCH_FAILED
+    assert mock_get.call_count == 1
+
+    # The limit is per token, so nothing else is sent either.
+    mock_time.monotonic.return_value = 1119.0
+    assert poller.fetch_runs("o/r") is FETCH_FAILED
+    assert poller.fetch_runs("o/other") is FETCH_FAILED
+    assert poller.fetch_running_runs("o/r") is FETCH_FAILED
+    assert poller.fetch_median_eta("o/r", 7) is None
+    assert poller.fetch_rate_limit() is None
+    assert poller.fetch_account_repos() is None
+    assert mock_get.call_count == 1
+
+    mock_time.monotonic.return_value = 1120.0
+    mock_get.return_value = _response(200, {"workflow_runs": [{"id": 1}]})
+    assert poller.fetch_runs("o/r") == [{"id": 1}]
+    assert mock_get.call_count == 2
+
+
+@patch("ci_status.github.time")
+@patch("ci_status.github.requests.get")
+def test_exhausted_quota_pauses_until_reset(mock_get, mock_time):
+    mock_time.monotonic.return_value = 500.0
+    mock_time.time.return_value = 1_800_000_000.0
+    mock_get.return_value = _limited(429, X_RateLimit_Remaining="0",
+                                     X_RateLimit_Reset="1800000300")
+    poller = RestPoller("tok")
+    assert poller.fetch_runs("o/r") is FETCH_FAILED
+    mock_time.monotonic.return_value = 799.0
+    poller.fetch_runs("o/r")
+    assert mock_get.call_count == 1
+    mock_time.monotonic.return_value = 800.0
+    poller.fetch_runs("o/r")
+    assert mock_get.call_count == 2
+
+
+@patch("ci_status.github.time")
+@patch("ci_status.github.requests.get")
+def test_rate_limit_pause_is_bounded_both_ways(mock_get, mock_time):
+    mock_time.monotonic.return_value = 0.0
+    mock_time.time.return_value = 1_800_000_000.0
+    poller = RestPoller("tok")
+    # An absurd header (or a wrong local clock) cannot silence polling for long.
+    mock_get.return_value = _limited(403, Retry_After="999999")
+    poller.fetch_runs("o/r")
+    mock_time.monotonic.return_value = float(github.RATE_LIMIT_MAX_PAUSE_SECONDS)
+    poller.fetch_runs("o/r")
+    assert mock_get.call_count == 2
+    # A reset already in the past, or an unreadable value, still waits the
+    # documented minimum instead of hammering.
+    for headers in ({"X_RateLimit_Remaining": "0", "X_RateLimit_Reset": "1"},
+                    {"Retry_After": "soon"}):
+        poller = RestPoller("tok")
+        mock_get.reset_mock()
+        mock_time.monotonic.return_value = 0.0
+        mock_get.return_value = _limited(429, **headers)
+        poller.fetch_runs("o/r")
+        mock_time.monotonic.return_value = github.RATE_LIMIT_MIN_PAUSE_SECONDS - 1.0
+        poller.fetch_runs("o/r")
+        assert mock_get.call_count == 1
+        mock_time.monotonic.return_value = float(github.RATE_LIMIT_MIN_PAUSE_SECONDS)
+        poller.fetch_runs("o/r")
+        assert mock_get.call_count == 2
+
+
+@patch("ci_status.github.requests.get")
+def test_plain_403_is_not_treated_as_a_rate_limit(mock_get):
+    # A permissions 403 (no Retry-After, quota not exhausted) concerns one
+    # repo; it must not pause polling for every other repo.
+    mock_get.return_value = _limited(403, X_RateLimit_Remaining="4999")
+    poller = RestPoller("tok")
+    assert poller.fetch_runs("o/private") is FETCH_FAILED
+    mock_get.return_value = _response(200, {"workflow_runs": []})
+    assert poller.fetch_runs("o/r") == []
+    assert mock_get.call_count == 2
+
+
+# --- repeated identical warnings are gated ---------------------------------------
+
+def _warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+
+
+@patch("ci_status.github.time")
+@patch("ci_status.github.requests.get")
+def test_repeated_error_warns_once_then_on_change_and_as_a_reminder(mock_get, mock_time, caplog):
+    import logging
+    mock_time.monotonic.return_value = 0.0
+    poller = RestPoller("tok")
+    with caplog.at_level(logging.WARNING, logger="ci_status"):
+        mock_get.return_value = _response(404)
+        for _ in range(5):
+            poller.fetch_runs("o/gone")
+        assert _warnings(caplog) == ["github 404 for o/gone"]
+
+        mock_get.return_value = _response(500)      # the fault changed: say so now
+        poller.fetch_runs("o/gone")
+        poller.fetch_runs("o/gone")
+        assert _warnings(caplog) == ["github 404 for o/gone", "github 500 for o/gone"]
+
+        mock_time.monotonic.return_value = float(github.WARN_REPEAT_SECONDS)
+        poller.fetch_runs("o/gone")                 # still broken: periodic reminder
+        assert _warnings(caplog)[2:] == ["github 500 for o/gone"]
+
+
+@patch("ci_status.github.time")
+@patch("ci_status.github.requests.get")
+def test_unreachable_and_rate_limit_each_warn_once(mock_get, mock_time, caplog):
+    import logging
+    mock_time.monotonic.return_value = 0.0
+    poller = RestPoller("tok")
+    with caplog.at_level(logging.WARNING, logger="ci_status"):
+        mock_get.side_effect = requests.ConnectionError()
+        for repo in ("o/a", "o/b", "o/c"):
+            poller.fetch_runs(repo)
+            poller.fetch_running_runs(repo)
+        assert len(_warnings(caplog)) == 1 and "unreachable" in _warnings(caplog)[0]
+
+        mock_get.side_effect = None
+        for start in (0.0, 100.0, 200.0):           # limited again on every probe
+            mock_time.monotonic.return_value = start
+            mock_get.return_value = _limited(403, Retry_After="60")
+            poller.fetch_runs("o/a")
+        limited = [m for m in _warnings(caplog) if "rate limit" in m]
+        assert len(limited) == 1
+
+
+@patch("ci_status.github.time")
+@patch("ci_status.github.requests.get")
+def test_revoked_token_warns_once_not_once_per_repo(mock_get, mock_time, caplog):
+    import logging
+    mock_time.monotonic.return_value = 0.0
+    mock_get.return_value = _response(401)
+    poller = RestPoller("tok")
+    with caplog.at_level(logging.WARNING, logger="ci_status"):
+        for repo in ("o/a", "o/b", "o/c"):
+            poller.fetch_runs(repo)
+            poller.fetch_running_runs(repo)
+    assert len(_warnings(caplog)) == 1 and "gh auth login" in _warnings(caplog)[0]
+
+
+@patch("ci_status.github.time")
+@patch("ci_status.github.requests.get")
+def test_warning_gate_holds_with_more_live_faults_than_its_size_bound(mock_get, mock_time, caplog):
+    import logging
+    mock_time.monotonic.return_value = 0.0
+    mock_get.return_value = _response(404)
+    poller = RestPoller("tok")
+    repos = [f"o/r{i}" for i in range(github.MAX_WARNING_KEYS + 10)]
+    with caplog.at_level(logging.WARNING, logger="ci_status"):
+        for _ in range(3):                           # three polls
+            for repo in repos:
+                poller.fetch_runs(repo)
+    assert len(_warnings(caplog)) == len(repos)      # once each, not once per poll

@@ -6,8 +6,10 @@ from unittest.mock import Mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 from busybar.client import DrawResult
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS
-from ci_status.logic import RepoState
-from ci_status.main import run_once, next_poll_seconds, config_requires_repos
+from ci_status.logic import FailingRun, RepoState
+from ci_status.github import FETCH_FAILED
+from ci_status.main import (run_once, next_poll_seconds, config_requires_repos,
+                            should_log_info, STALE_STATE_SECONDS)
 
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=timezone.utc)
 CFG = {"ci_status": {"poll_seconds": 120, "repos": ["o/r"],
@@ -574,11 +576,15 @@ def test_enumeration_failure_with_no_prior_list_logs_warning_and_watches_nothing
     poller = Mock()
     poller.fetch_account_repos.return_value = None
     repo_cache: dict = {}   # never successfully populated
-    import logging
-    with caplog.at_level(logging.WARNING, logger="ci_status"):
-        run_once(client, poller, CFG_ACCOUNT, NOW, {}, dry_run=False, repo_cache=repo_cache)
+    # Twice: the condition repeats every poll until enumeration succeeds, so
+    # it goes through the poller's gate (once, then a periodic reminder)
+    # rather than straight to the log.
+    run_once(client, poller, CFG_ACCOUNT, NOW, {}, dry_run=False, repo_cache=repo_cache)
+    run_once(client, poller, CFG_ACCOUNT, NOW, {}, dry_run=False, repo_cache=repo_cache)
     poller.fetch_runs.assert_not_called()
-    assert any("enumeration failed" in rec.message for rec in caplog.records)
+    assert poller.warn.call_count == 2
+    assert all("enumeration failed" in call.args[1] for call in poller.warn.call_args_list)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
 
 # --- state_cache / running_cache pruning for dropped repos -----------------------
@@ -736,3 +742,256 @@ def test_modern_ci_draws_complete_green_card_after_failure():
     by_id = {e["id"]: e for e in frame}
     assert by_id["ci"]["text"] == "ALL CLEAR"
     assert all(e["timeout"] == 10 for e in frame)
+
+
+# --- GitHub errors expire cached state instead of freezing it --------------------
+
+STALE = timedelta(seconds=STALE_STATE_SECONDS)
+
+
+def test_persistent_fetch_failure_expires_a_cached_failure():
+    # A repo that was failing and is then deleted/renamed (404), or a revoked
+    # token (401): the CI FAIL frame must not stay on the display forever.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_run("failure")]
+    cache: dict = {}; health: dict = {}; overlay: dict = {}
+    run_once(client, poller, CFG, NOW, cache, False, overlay_state=overlay, fetch_health=health)
+    assert cache["o/r"].failing
+
+    poller.fetch_runs.return_value = FETCH_FAILED
+    first_failure = NOW + timedelta(minutes=2)
+    run_once(client, poller, CFG, first_failure, cache, False,
+             overlay_state=overlay, fetch_health=health)
+    just_before = first_failure + STALE - timedelta(seconds=1)
+    summary = run_once(client, poller, CFG, just_before, cache, False,
+                       overlay_state=overlay, fetch_health=health)
+    assert cache["o/r"].failing and "CI FAIL" in summary     # a blip keeps the frame
+    poller.forget_repo.assert_not_called()
+
+    client.reset_mock()
+    summary = run_once(client, poller, CFG, first_failure + STALE, cache, False,
+                       overlay_state=overlay, fetch_health=health)
+    assert "o/r" not in cache
+    # The ETag goes too: a later 304 must not vouch for state we dropped.
+    poller.forget_repo.assert_called_once_with("o/r")
+    assert client.draw.call_args.kwargs["led_notification_color"] == "#00000000"
+    assert "led off" in summary
+
+
+def test_not_modified_never_expires_cached_state():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_run("failure")]
+    cache: dict = {}; health: dict = {}
+    run_once(client, poller, CFG, NOW, cache, False, fetch_health=health)
+    poller.fetch_runs.return_value = None                     # 304, for hours
+    for minutes in (2, 30, 600):
+        run_once(client, poller, CFG, NOW + timedelta(minutes=minutes), cache, False,
+                 fetch_health=health)
+    assert cache["o/r"].failing
+    poller.forget_repo.assert_not_called()
+
+
+def test_a_good_answer_resets_the_failure_clock():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_run("failure")]
+    cache: dict = {}; health: dict = {}
+    run_once(client, poller, CFG, NOW, cache, False, fetch_health=health)
+    step = STALE - timedelta(seconds=1)
+    for i, answer in enumerate((FETCH_FAILED, None, FETCH_FAILED), start=1):
+        poller.fetch_runs.return_value = answer
+        run_once(client, poller, CFG, NOW + step * i, cache, False, fetch_health=health)
+    assert cache["o/r"].failing   # never a full STALE of consecutive failures
+
+
+def test_persistent_running_poll_failure_expires_the_running_badge():
+    # Otherwise the badge's timer grows forever and next_poll_seconds stays
+    # on the fast cadence against a repo that no longer answers.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    poller.fetch_running_runs.return_value = [_running_run()]
+    poller.fetch_median_eta.return_value = None
+    running: dict = {}; health: dict = {}
+    run_once(client, poller, CFG_RUNNING, NOW, {}, False, running_cache=running,
+             fetch_health=health)
+    assert next_poll_seconds(CFG_RUNNING["ci_status"], running) == 20
+
+    poller.fetch_runs.return_value = FETCH_FAILED
+    poller.fetch_running_runs.return_value = FETCH_FAILED
+    run_once(client, poller, CFG_RUNNING, NOW + timedelta(minutes=1), {}, False,
+             running_cache=running, fetch_health=health)
+    assert running["o/r"]                                      # a blip keeps the badge
+    run_once(client, poller, CFG_RUNNING, NOW + timedelta(minutes=1) + STALE, {}, False,
+             running_cache=running, fetch_health=health)
+    assert not running.get("o/r")
+    assert next_poll_seconds(CFG_RUNNING["ci_status"], running) == 120
+
+
+def test_fetch_health_pruned_with_the_repo():
+    client = Mock()
+    poller = Mock(); poller.fetch_runs.return_value = [_run("success")]
+    health = {("runs", "o/gone"): NOW, ("running", "o/gone"): NOW}
+    run_once(client, poller, CFG, NOW, {}, False, fetch_health=health)
+    assert health == {}
+
+
+def test_no_all_clear_while_a_watched_repo_is_unknown():
+    # "ALL CLEAR" is a claim about every watched repo. With no answer from
+    # GitHub (at startup, or after cached state expired) it would be a false
+    # success, so the green frame waits until every repo has been read.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = FETCH_FAILED
+    cfg = {"ci_status": {**CFG["ci_status"], "show_green": True}}
+    cache: dict = {}
+    summary = run_once(client, poller, cfg, NOW, cache, False, overlay_state={})
+    client.draw.assert_not_called()
+    assert "nothing to show" in summary
+
+    poller.fetch_runs.return_value = [_run("success")]
+    run_once(client, poller, cfg, NOW, cache, False, overlay_state={})
+    assert "ALL CLEAR" in _drawn_texts(client)
+
+
+# --- stuck-queue ageing does not depend on GitHub sending a new body -------------
+
+def _queued(created_min_ago: int) -> dict:
+    created = (NOW - timedelta(minutes=created_min_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"workflow_id": 1, "name": "tests", "status": "queued", "conclusion": None,
+            "created_at": created, "head_branch": "main", "pull_requests": []}
+
+
+def test_queued_run_becomes_stuck_while_github_answers_304():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_queued(created_min_ago=5)]
+    cfg = {"ci_status": {**CFG["ci_status"], "stale_queued_minutes": 15}}
+    cache: dict = {}
+    run_once(client, poller, cfg, NOW, cache, False, overlay_state={})
+    assert cache["o/r"].stuck == []
+
+    poller.fetch_runs.return_value = None      # a queued run that never changes: 304
+    summary = run_once(client, poller, cfg, NOW + timedelta(minutes=10), cache, False,
+                       overlay_state={})
+    assert [f.workflow for f in cache["o/r"].stuck] == ["tests"]
+    assert "CI WAIT" in summary
+
+
+def test_queued_run_keeps_ageing_through_a_failed_fetch():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_queued(created_min_ago=5)]
+    cfg = {"ci_status": {**CFG["ci_status"], "stale_queued_minutes": 15}}
+    cache: dict = {}
+    run_once(client, poller, cfg, NOW, cache, False)
+    poller.fetch_runs.return_value = FETCH_FAILED
+    run_once(client, poller, cfg, NOW + timedelta(minutes=10), cache, False)
+    assert [f.workflow for f in cache["o/r"].stuck] == ["tests"]
+
+
+def test_hand_built_state_without_runs_survives_a_304():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = None
+    cache = {"o/r": RepoState("o/r", [FailingRun("tests", "")], [])}
+    run_once(client, poller, CFG, NOW, cache, False)
+    assert cache["o/r"].failing == [FailingRun("tests", "")]
+
+
+# --- malformed run data skips the repo for one poll, never the process -----------
+
+def test_unusable_run_data_skips_the_repo_and_keeps_previous_state():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_run("failure")]
+    cfg = {"ci_status": {**CFG["ci_status"], "stale_queued_minutes": 15}}
+    cache: dict = {}
+    run_once(client, poller, cfg, NOW, cache, False)
+    for bad in ([{"name": "no workflow id"}],
+                [{**_queued(5), "created_at": "not a timestamp"}],
+                [{**_queued(5), "created_at": None}],
+                ["not a run"]):
+        poller.reset_mock()
+        poller.fetch_runs.return_value = bad
+        summary = run_once(client, poller, cfg, NOW + timedelta(minutes=1), cache, False)
+        assert cache["o/r"].failing and "CI FAIL" in summary
+        poller.warn.assert_called_once()
+        assert "skipping o/r this poll" in poller.warn.call_args.args[1]
+        # The body's ETag was already committed by the poller; forget it so
+        # the next poll re-reads the body instead of getting a 304 for it.
+        poller.forget_repo.assert_called_once_with("o/r")
+
+
+def test_unusable_run_data_counts_toward_expiry():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock(); poller.fetch_runs.return_value = [_run("failure")]
+    cache: dict = {}; health: dict = {}
+    run_once(client, poller, CFG, NOW, cache, False, fetch_health=health)
+    poller.fetch_runs.return_value = [{"name": "no workflow id"}]
+    run_once(client, poller, CFG, NOW + timedelta(minutes=1), cache, False, fetch_health=health)
+    run_once(client, poller, CFG, NOW + timedelta(minutes=1) + STALE, cache, False,
+             fetch_health=health)
+    assert "o/r" not in cache
+
+
+def test_unusable_running_data_skips_the_repo_and_keeps_previous_runs():
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("success")]
+    poller.fetch_running_runs.return_value = [_running_run()]
+    poller.fetch_median_eta.return_value = None
+    running: dict = {}
+    run_once(client, poller, CFG_RUNNING, NOW, {}, False, running_cache=running)
+    for bad in ([{**_running_run(), "run_started_at": None}],
+                [{"status": "in_progress", "run_started_at": "2026-08-03T13:30:00Z"}],
+                ["not a run"]):
+        poller.reset_mock()
+        poller.fetch_running_runs.return_value = bad
+        run_once(client, poller, CFG_RUNNING, NOW + timedelta(minutes=1), {}, False,
+                 running_cache=running)
+        assert running["o/r"] == [_running_run()]
+        poller.warn.assert_called_once()
+        poller.forget_repo.assert_called_once_with("o/r")
+
+
+# --- log-noise control (the other two agents' change-or-heartbeat gate) ----------
+
+def test_should_log_info_true_when_summary_changes():
+    assert should_log_info("'CI FAIL o/r' -> drawn", "nothing to show; cleared", 0) is True
+
+def test_should_log_info_false_when_unchanged_and_no_heartbeat_due():
+    assert should_log_info("nothing to show; cleared", "nothing to show; cleared", 1) is False
+
+def test_should_log_info_true_when_unchanged_past_heartbeat():
+    assert should_log_info("nothing to show; cleared", "nothing to show; cleared", 600) is True
+
+def test_should_log_info_true_on_first_summary():
+    assert should_log_info("nothing to show; cleared", None, 0) is True
+
+
+def test_main_logs_an_unchanged_summary_once_not_every_poll(monkeypatch, caplog):
+    import logging
+    import ci_status.main as ci_main
+
+    class Stop(Exception):
+        pass
+
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 5:
+            raise Stop
+
+    monkeypatch.setattr("sys.argv", ["ci_status", "--dry-run"])
+    monkeypatch.setattr(ci_main, "load_config", lambda: {
+        "ci_status": {**CFG_RUNNING["ci_status"]}, "device": {}})
+    monkeypatch.setattr(ci_main, "device_kwargs", lambda cfg: {})
+    monkeypatch.setattr(ci_main, "BusyBarClient", lambda **kwargs: Mock())
+    monkeypatch.setattr(ci_main, "get_token", lambda: "tok")
+    monkeypatch.setattr(ci_main, "run_once", lambda *a, **k: "nothing to show; cleared")
+    monkeypatch.setattr(ci_main.time, "sleep", fake_sleep)
+    monkeypatch.setattr(ci_main.logging, "basicConfig", lambda **kwargs: None)
+    with caplog.at_level(logging.DEBUG, logger="ci_status"):
+        try:
+            ci_main.main()
+        except Stop:
+            pass
+    info = [r for r in caplog.records if r.levelname == "INFO"]
+    debug = [r for r in caplog.records if r.levelname == "DEBUG"]
+    assert len(info) == 1 and len(debug) == 4

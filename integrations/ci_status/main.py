@@ -16,11 +16,13 @@ from busybar.config import device_kwargs, load_config
 from busybar.display import OVERLAY_DWELL_SECONDS, PRIORITY_OVERLAY, overlay_gap_elapsed
 from busybar.presentation import modern_display, prepare_frame, commit_frame, ci_bitmap_accent
 
+from .github import FETCH_FAILED, RestPoller, get_token
 from .logic import (
     RepoState, RunningInfo, QuotaInfo,
     build_overlay_payload, build_overlay_sequence, evaluate_runs,
     LED_OFF_COLOR, LED_OFF_ELEMENTS, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST,
-    parse_rate_limit, resolve_ci_led_value, resolve_repo_list, select_running_run,
+    parse_rate_limit, resolve_ci_led_value, resolve_repo_list, running_runs_usable,
+    select_running_run,
 )
 
 APP = "ci_status"
@@ -28,6 +30,24 @@ log = logging.getLogger(APP)
 
 QUOTA_LABELS = {"graphql": "GITHUB GRAPHQL", "core": "GITHUB REST"}
 QUOTA_STALE_SECONDS = 300  # never show rate_limit data older than 5 minutes
+# How long a repo may go without a usable answer from GitHub before its
+# cached failure/stuck state or running badge is dropped. Long enough to
+# ride out an outage or a rate-limit pause; short enough that a deleted
+# repo or a revoked token cannot leave "CI FAIL" on the display for good.
+STALE_STATE_SECONDS = 900
+HEARTBEAT_SECONDS = 600  # INFO heartbeat when the poll summary is unchanged
+
+
+def _failed_too_long(fetch_health: dict, key: tuple[str, str], ok: bool,
+                     now: datetime) -> bool:
+    """Track one (kind, repo) fetch's run of consecutive failures in
+    `fetch_health` (first-failure time; cleared by any usable answer, a 304
+    included). True once that run has lasted STALE_STATE_SECONDS."""
+    if ok:
+        fetch_health.pop(key, None)
+        return False
+    since = fetch_health.setdefault(key, now)
+    return (now - since).total_seconds() >= STALE_STATE_SECONDS
 
 
 def _refresh_account_repos(poller, repo_cache: dict | None, now: datetime,
@@ -50,8 +70,11 @@ def _refresh_account_repos(poller, repo_cache: dict | None, now: datetime,
             repo_cache["repos"] = fetched
             repo_cache["fetched_at"] = now
         elif repo_cache.get("repos") is None:
-            log.warning("account repo enumeration failed and no previous list is "
-                       "cached yet -- watch_account_repos contributes nothing this poll")
+            # Repeats every poll until enumeration succeeds, so it goes
+            # through the poller's gate rather than straight to the log.
+            poller.warn("account repos",
+                        "account repo enumeration failed and no previous list is "
+                        "cached yet -- watch_account_repos contributes nothing this poll")
     return repo_cache.get("repos")
 
 
@@ -89,16 +112,32 @@ def run_once(client, poller, cfg: dict, now: datetime,
              running_cache: dict[str, list[dict]] | None = None,
              overlay_state: dict | None = None,
              quota_cache: dict | None = None,
-             repo_cache: dict | None = None) -> str:
-    """`running_cache`, `overlay_state`, `quota_cache`, and `repo_cache`,
-    when passed, are caller-owned dicts this function mutates in place
-    (mirroring `state_cache`'s existing pattern) so `main()` can hold one
-    instance of each across loop iterations while `run_once` itself stays
-    a pure function of its arguments plus those dicts. Omitting
-    `running_cache` (the default) skips running-job/overlay detection
-    entirely; omitting `repo_cache` (the default) skips account-wide
-    discovery entirely and falls back to the pre-v1.5.1 behavior of
-    polling exactly `cfg["ci_status"]["repos"]` every cycle.
+             repo_cache: dict | None = None,
+             fetch_health: dict | None = None) -> str:
+    """`running_cache`, `overlay_state`, `quota_cache`, `repo_cache`, and
+    `fetch_health`, when passed, are caller-owned dicts this function
+    mutates in place (mirroring `state_cache`'s existing pattern) so
+    `main()` can hold one instance of each across loop iterations while
+    `run_once` itself stays a pure function of its arguments plus those
+    dicts. Omitting `running_cache` (the default) skips running-job/overlay
+    detection entirely; omitting `repo_cache` (the default) skips
+    account-wide discovery entirely and falls back to the pre-v1.5.1
+    behavior of polling exactly `cfg["ci_status"]["repos"]` every cycle;
+    omitting `fetch_health` (the default) means failure runs are not
+    remembered between calls, so cached state never expires.
+
+    GitHub answers three ways per repo (see `github.FETCH_FAILED`): a list
+    (new body), None (304: the cached copy is current), or FETCH_FAILED (no
+    usable answer). Cached state survives the last two, and is re-evaluated
+    against `now` every poll so a queued run keeps ageing toward "stuck"
+    even while GitHub answers 304. Only FETCH_FAILED -- or a body this code
+    cannot read, which skips that repo for the poll with one gated warning
+    -- counts toward `STALE_STATE_SECONDS`, after which the repo's cached
+    state (and, separately, its running badge) is dropped along with its
+    ETags, so a later 304 cannot vouch for state that is no longer held.
+    While any watched repo has no state, the green "ALL CLEAR" frame is
+    withheld: it is a claim about every repo, not about the ones that
+    happened to answer.
 
     Account-wide watching (v1.5.1): when `repo_cache` is given, the
     effective repo list for this poll is resolved fresh each call via
@@ -158,6 +197,8 @@ def run_once(client, poller, cfg: dict, now: datetime,
             account_repos, c.get("active_within_days", 30), now)
     else:
         effective_repos = c["repos"]
+    if fetch_health is None:
+        fetch_health = {}
 
     # Drop cached state for any repo that left the effective list this
     # poll (excluded, aged out, deleted upstream) so a stale alert or
@@ -169,12 +210,31 @@ def run_once(client, poller, cfg: dict, now: datetime,
         for repo in set(running_cache) - set(effective_repos):
             running_cache.pop(repo, None)
             poller.forget_repo(repo)
+    for key in [k for k in fetch_health if k[1] not in effective_repos]:
+        del fetch_health[key]
 
     for repo in effective_repos:
-        runs = poller.fetch_runs(repo)
-        if runs is not None:  # None = 304/no-change/error -> keep cached state
-            state_cache[repo] = evaluate_runs(repo, runs, now,
-                                              c["stale_queued_minutes"])
+        fetched = poller.fetch_runs(repo)
+        ok = fetched is not FETCH_FAILED
+        cached = state_cache.get(repo)
+        # A new body, else the runs behind the cached state (304 or failure).
+        runs = fetched if ok and fetched is not None else (cached.runs if cached else None)
+        if runs is not None:
+            try:
+                state_cache[repo] = evaluate_runs(repo, runs, now,
+                                                  c["stale_queued_minutes"])
+            except (LookupError, TypeError, ValueError, AttributeError) as exc:
+                ok = False
+                # The poller already committed this body's ETag; forget it so
+                # the next poll re-reads the body instead of getting a 304.
+                poller.forget_repo(repo)
+                poller.warn(f"runs {repo}", f"skipping {repo} this poll: "
+                                            f"unreadable run data ({exc!r})")
+        if _failed_too_long(fetch_health, ("runs", repo), ok, now) \
+                and state_cache.pop(repo, None) is not None:
+            poller.forget_repo(repo)
+            log.warning("no usable answer from GitHub for %s in %d min; dropping its "
+                        "cached CI state", repo, STALE_STATE_SECONDS // 60)
 
     states = list(state_cache.values())
 
@@ -188,8 +248,20 @@ def run_once(client, poller, cfg: dict, now: datetime,
     if running_cache is not None and c["show_running"]:
         for repo in effective_repos:
             running_runs = poller.fetch_running_runs(repo)
-            if running_runs is not None:
-                running_cache[repo] = running_runs
+            ok = running_runs is not FETCH_FAILED
+            if ok and running_runs is not None:
+                if running_runs_usable(running_runs):
+                    running_cache[repo] = running_runs
+                else:
+                    ok = False
+                    poller.forget_repo(repo)   # same ETag reasoning as above
+                    poller.warn(f"running {repo}", f"skipping {repo} this poll: "
+                                                   "unreadable running-run data")
+            if _failed_too_long(fetch_health, ("running", repo), ok, now) \
+                    and running_cache.pop(repo, None):
+                poller.forget_repo(repo)
+                log.warning("no usable answer from GitHub for %s's running jobs in %d min; "
+                            "dropping its running badge", repo, STALE_STATE_SECONDS // 60)
         selected = select_running_run(running_cache)
         if selected is not None:
             run, repo, other_count = selected
@@ -205,8 +277,10 @@ def run_once(client, poller, cfg: dict, now: datetime,
                     if "core" in quota_by_bucket:
                         quota_frames.append(OVERLAY_FRAME_QUOTA_REST)
 
+    # "ALL CLEAR" only when every watched repo has actually been read.
+    show_green = c["show_green"] and all(repo in state_cache for repo in effective_repos)
     sequence = build_overlay_sequence(states, running_present=running_present,
-                                      quota_frames=quota_frames, show_green=c["show_green"])
+                                      quota_frames=quota_frames, show_green=show_green)
 
     # Failure-driven LED (Request B keeps a gentle cue). led_should_be_on is
     # driven by FAILURES only -- stuck keeps its historical LED-None behavior.
@@ -303,6 +377,17 @@ def config_requires_repos(cfg: dict) -> str | None:
     return None
 
 
+def should_log_info(summary: str, last_logged_summary: str | None,
+                    seconds_since_heartbeat: float,
+                    heartbeat_seconds: int = HEARTBEAT_SECONDS) -> bool:
+    """Log-noise control, mirroring calendar_countdown's and nyan_filler's
+    should_log_info: INFO only when the summary changed since the last INFO
+    line, or a heartbeat interval has elapsed (so a long unchanging run
+    still leaves a periodic "yes, I'm alive" trail) -- DEBUG otherwise.
+    """
+    return summary != last_logged_summary or seconds_since_heartbeat >= heartbeat_seconds
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="BUSY Bar CI status")
     parser.add_argument("--once", action="store_true")
@@ -315,7 +400,6 @@ def main() -> int:
     if error is not None:
         log.error(error)
         return 1
-    from .github import RestPoller, get_token
     try:
         poller = RestPoller(get_token())
     except RuntimeError as exc:
@@ -330,13 +414,23 @@ def main() -> int:
     overlay_state: dict = {}
     quota_cache: dict = {}
     repo_cache: dict = {}
+    fetch_health: dict = {}
     backoff = 5
+    last_logged_summary: str | None = None
+    last_heartbeat = time.monotonic()
     while True:
         summary = run_once(client, poller, cfg, datetime.now(timezone.utc),
                            state_cache, args.dry_run, running_cache=running_cache,
                            overlay_state=overlay_state, quota_cache=quota_cache,
-                           repo_cache=repo_cache)
-        log.info(summary)
+                           repo_cache=repo_cache, fetch_health=fetch_health)
+        now_monotonic = time.monotonic()
+        if args.once or should_log_info(summary, last_logged_summary,
+                                        now_monotonic - last_heartbeat):
+            log.info(summary)
+            last_logged_summary = summary
+            last_heartbeat = now_monotonic
+        else:
+            log.debug(summary)
         if args.once:
             return 0
         if summary.endswith("unreachable"):  # device offline: back off, not full poll
