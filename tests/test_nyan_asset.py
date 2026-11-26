@@ -8,10 +8,10 @@ META  = Path(__file__).resolve().parents[1] / "assets" / "nyan" / "meta.json"
 
 def test_committed_asset_parses():
     h = parse_header(ASSET.read_bytes())
-    assert h["magic"] == b"bicycle0"
+    assert h["magic"] == b"bicycle1"
     assert (h["width"], h["height"]) == (72, 16)
     assert h["color_mode"] == 0
-    assert h["n_display"] == FRAMES
+    assert h["n_frames"] == FRAMES
     assert h["fps"] == json.loads(META.read_text())["fps"]
 
 
