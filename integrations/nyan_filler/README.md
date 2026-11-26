@@ -75,7 +75,7 @@ Once the foreground test completes, your `config.toml` is in place. The LaunchAg
 | Key | Type | Default | Purpose |
 |---|---|---|---|
 | `enabled` | boolean | true | Enable or disable the Nyan animation. Set `false` to pause the filler without uninstalling the agent; restart the agent to re-enable. |
-| `poll_seconds` | integer | 1 | Polling interval in seconds. Determines how quickly the agent wakes to re-assert the filler draw and reclaims a dark gap once higher-priority content disappears. |
+| `poll_seconds` | integer | 1 | Polling interval in seconds. Determines how often the agent re-asserts the filler draw. Right after another app takes the panel the agent instead asks every 0.25 s, for up to 15 s and only over a local route, with a one-pixel draw the bar can refuse in milliseconds, so the black gap after an overlay card is as short as the firmware allows. |
 | `quiet_hours` | string | "00:00-07:00" | Local time window during which the filler is suppressed (typically for sleep hours). Format: `"HH:MM-HH:MM"`; use `""` to disable quiet hours entirely. |
 
 ## Autostart

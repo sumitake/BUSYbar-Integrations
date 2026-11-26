@@ -251,6 +251,21 @@ RUNNING_LABEL_BUDGET_PX = PANEL_WIDTH - RUNNING_NUMERAL_X - 2
 RUNNING_LABEL_Y = 9
 
 
+def repo_labels(repos: list[str]) -> dict[str, str]:
+    """Display label for each watched repo.
+
+    When several repos are watched and all share one owner, the owner says
+    nothing and costs most of the 68px title lane: a card would open and rest
+    on "owner/" while the repo name only passes by mid-scroll. Show the bare
+    repo name then. A single repo, mixed owners, or a name without an owner
+    keep the full name.
+    """
+    owners = {repo.partition("/")[0] for repo in repos}
+    if len(repos) > 1 and len(owners) == 1 and all("/" in repo for repo in repos):
+        return {repo: repo.partition("/")[2] for repo in repos}
+    return {repo: repo for repo in repos}
+
+
 def _pr_or_branch(run: dict) -> str:
     """PR number ("#42") if the run belongs to a pull request, else the
     branch it ran on (fork/push-triggered runs have an empty
@@ -688,7 +703,8 @@ def resolve_ci_led_value(led_should_be_on: bool, led_was_on: bool) -> str | None
 def build_overlay_payload(descriptor: dict, timeout_s: int, *,
                           running: RunningInfo | None = None,
                           quota_by_bucket: dict[str, QuotaInfo] | None = None,
-                          show_spinner: bool = False) -> dict | None:
+                          show_spinner: bool = False,
+                          repo_labels: dict[str, str] | None = None) -> dict | None:
     """Build the {"elements", "priority", "led"} payload for one overlay-tier
     dwell slot from a frame descriptor ({"kind": ...} plus kind-specific
     fields). Returns None only if a frame's data isn't available this cycle;
@@ -706,8 +722,12 @@ def build_overlay_payload(descriptor: dict, timeout_s: int, *,
     `show_spinner` (v1.6) is threaded through ONLY on the CI-badge branch
     -- quota frames never get a spinner, regardless of this flag. Defaults
     to False so existing callers are unaffected.
+
+    `repo_labels` maps a watched repo to the name shown on failure and waiting
+    cards (see `repo_labels()`); a repo without an entry shows its full name.
     """
     kind = descriptor["kind"]
+    label = (repo_labels or {}).get(descriptor.get("repo"), descriptor.get("repo"))
     if kind == OVERLAY_FRAME_CI_BADGE:
         if running is None:
             return None
@@ -721,11 +741,11 @@ def build_overlay_payload(descriptor: dict, timeout_s: int, *,
         return {"elements": _build_quota_elements(info, timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
     if kind == OVERLAY_FRAME_FAIL:
-        text = ascii_safe(_fail_line(descriptor["repo"], descriptor["run"]))
+        text = ascii_safe(_fail_line(label, descriptor["run"]))
         return {"elements": _badge_elements("CI FAIL", text, "#FF7A8AFF", timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
     if kind == OVERLAY_FRAME_STUCK:
-        text = ascii_safe(_fail_line(descriptor["repo"], descriptor["run"]))
+        text = ascii_safe(_fail_line(label, descriptor["run"]))
         return {"elements": _badge_elements("CI WAIT", text, "#FFCB6BFF", timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
     if kind == OVERLAY_FRAME_GREEN:

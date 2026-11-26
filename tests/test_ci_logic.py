@@ -730,3 +730,35 @@ def test_running_runs_usable_requires_what_the_badge_dereferences():
     assert not running_runs_usable([{**good, "pull_requests": [{"no": "number"}]}])
     assert not running_runs_usable([good, "not a run"])
     assert not running_runs_usable({"workflow_runs": []})
+
+
+# --- repo labels: the shared owner is noise on a 68px title lane -------------
+
+def test_repo_labels_drop_an_owner_shared_by_every_watched_repo():
+    from ci_status.logic import repo_labels
+    assert repo_labels(["acme/widgets", "acme/gears"]) == {
+        "acme/widgets": "widgets", "acme/gears": "gears"}
+
+
+def test_repo_labels_keep_owners_when_they_differ_or_cannot_be_compared():
+    from ci_status.logic import repo_labels
+    mixed = ["acme/widgets", "globex/gears"]
+    assert repo_labels(mixed) == {r: r for r in mixed}
+    # One repo: nothing to compare it with, so its full name stays.
+    assert repo_labels(["acme/widgets"]) == {"acme/widgets": "acme/widgets"}
+    assert repo_labels(["acme/widgets", "no-owner"]) == {
+        "acme/widgets": "acme/widgets", "no-owner": "no-owner"}
+    assert repo_labels([]) == {}
+
+
+def test_fail_and_stuck_cards_use_the_repo_label():
+    from ci_status.logic import (OVERLAY_FRAME_FAIL, OVERLAY_FRAME_STUCK, FailingRun,
+                                 build_overlay_payload)
+    labels = {"acme/widgets": "widgets"}
+    for kind in (OVERLAY_FRAME_FAIL, OVERLAY_FRAME_STUCK):
+        descriptor = {"kind": kind, "repo": "acme/widgets", "run": FailingRun("tests", "#42")}
+        body = next(e for e in build_overlay_payload(descriptor, 10, repo_labels=labels)["elements"]
+                    if e["id"] == "ci")
+        assert body["text"] == "widgets #42 tests"
+        unlabeled = next(e for e in build_overlay_payload(descriptor, 10)["elements"] if e["id"] == "ci")
+        assert unlabeled["text"] == "acme/widgets #42 tests"

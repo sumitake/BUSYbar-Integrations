@@ -995,3 +995,38 @@ def test_main_logs_an_unchanged_summary_once_not_every_poll(monkeypatch, caplog)
     info = [r for r in caplog.records if r.levelname == "INFO"]
     debug = [r for r in caplog.records if r.levelname == "DEBUG"]
     assert len(info) == 1 and len(debug) == 4
+
+
+# --- shared-owner labels reach the drawn cards --------------------------------
+
+def test_cards_omit_an_owner_shared_by_all_watched_repos():
+    cfg = {"ci_status": {**CFG_RUNNING["ci_status"], "repos": ["acme/widgets", "acme/gears"]}}
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.side_effect = lambda repo: [_run("failure")] if repo == "acme/widgets" else []
+    poller.fetch_running_runs.return_value = []
+    summary = run_once(client, poller, cfg, NOW, {}, dry_run=False, running_cache={}, overlay_state={})
+    body = [t for t in _drawn_texts(client) if t != "CI FAIL"]
+    assert body == ["widgets tests"]
+    assert "acme/" not in summary
+
+    # A run in progress on the other repo: its title drops the owner too.
+    client.draw.reset_mock()
+    poller.fetch_runs.side_effect = lambda repo: []
+    poller.fetch_running_runs.side_effect = lambda repo: (
+        [{"workflow_id": 7, "name": "build", "status": "in_progress",
+          "run_started_at": "2026-08-03T13:35:00Z", "pull_requests": [{"number": 9}]}]
+        if repo == "acme/gears" else [])
+    poller.fetch_median_eta.return_value = 4.0
+    run_once(client, poller, cfg, NOW, {}, dry_run=False, running_cache={}, overlay_state={})
+    assert "GEARS #9 BUILD" in _drawn_texts(client)
+    poller.fetch_median_eta.assert_called_once_with("acme/gears", 7)   # API calls keep the full name
+
+
+def test_cards_keep_owners_when_watched_repos_have_different_owners():
+    cfg = {"ci_status": {**CFG["ci_status"], "repos": ["acme/widgets", "globex/gears"]}}
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.side_effect = lambda repo: [_run("failure")] if repo == "acme/widgets" else []
+    run_once(client, poller, cfg, NOW, {}, dry_run=False)
+    assert "acme/widgets tests" in _drawn_texts(client)

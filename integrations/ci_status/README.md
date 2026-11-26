@@ -152,7 +152,10 @@ running spinner implementation details.
 
 Failure, waiting, and healthy frames share a dark two-row card. A fixed
 `CI FAIL`, `CI WAIT`, or `CI OK` heading stays visible while the bold lower
-row scrolls the complete `owner/repo #42 workflow` context. Coral, amber, and
+row scrolls the complete `owner/repo #42 workflow` context. When several repos
+are watched and they all share one owner, the owner is left out (`repo #42
+workflow`, and likewise in the running badge's title) so the card opens on
+the repository name instead of a prefix common to every card. Coral, amber, and
 mint divider lines distinguish the states; firmware 1.2.3 adds a matching
 7×7 status icon in the header. The healthy card reads `ALL CLEAR` without
 scrolling. The PR number is replaced by the branch for push/fork runs, or

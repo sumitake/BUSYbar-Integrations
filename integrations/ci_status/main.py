@@ -21,7 +21,7 @@ from .logic import (
     RepoState, RunningInfo, QuotaInfo,
     build_overlay_payload, build_overlay_sequence, evaluate_runs,
     LED_OFF_COLOR, LED_OFF_ELEMENTS, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST,
-    parse_rate_limit, resolve_ci_led_value, resolve_repo_list, running_runs_usable,
+    parse_rate_limit, repo_labels, resolve_ci_led_value, resolve_repo_list, running_runs_usable,
     select_running_run,
 )
 
@@ -213,6 +213,8 @@ def run_once(client, poller, cfg: dict, now: datetime,
     for key in [k for k in fetch_health if k[1] not in effective_repos]:
         del fetch_health[key]
 
+    labels = repo_labels(list(effective_repos))  # display names only; API calls keep the full name
+
     for repo in effective_repos:
         fetched = poller.fetch_runs(repo)
         ok = fetched is not FETCH_FAILED
@@ -266,7 +268,7 @@ def run_once(client, poller, cfg: dict, now: datetime,
         if selected is not None:
             run, repo, other_count = selected
             median = poller.fetch_median_eta(repo, run["workflow_id"])
-            running_info = RunningInfo(run=run, repo=repo, other_count=other_count,
+            running_info = RunningInfo(run=run, repo=labels.get(repo, repo), other_count=other_count,
                                        median_minutes=median, now=now)
             running_present = True
             if c["show_quota"]:
@@ -318,7 +320,8 @@ def run_once(client, poller, cfg: dict, now: datetime,
 
     payload = build_overlay_payload(sequence[frame_index], OVERLAY_DWELL_SECONDS,
                                     running=running_info, quota_by_bucket=quota_by_bucket,
-                                    show_spinner=c.get("running_spinner", False))
+                                    show_spinner=c.get("running_spinner", False),
+                                    repo_labels=labels)
 
     if dry_run:
         return f"DRY-RUN payload: {payload!r} led={led_value}"
