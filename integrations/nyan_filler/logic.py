@@ -8,6 +8,8 @@ from datetime import datetime
 FILLER_APP = "nyan_filler"
 ASSET_NAME = "nyan_72x16.anim"
 ELEMENT_ID = "nyan"
+PROBE_ELEMENT_ID = "probe"
+PROBE_COLOR = "#040614FF"   # the animation's own backdrop, so the pixel is not seen
 
 _HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)-([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -43,3 +45,14 @@ def build_filler_elements(asset: str, timeout_s: int) -> list[dict]:
     """The single looping animation element drawn at PRIORITY_FILLER."""
     return [{"id": ELEMENT_ID, "type": "animation", "path": asset,
              "x": 0, "y": 0, "loop": True, "timeout": timeout_s}]
+
+
+def build_probe_elements() -> list[dict]:
+    """One backdrop-coloured pixel used to ask whether the panel is free.
+
+    While a higher-priority app owns the panel the bar takes about 1.5s to
+    reject an animation draw but only milliseconds to reject a rectangle
+    (measured on firmware 1.4.1), so the question is asked with this instead.
+    """
+    return [{"id": PROBE_ELEMENT_ID, "type": "rectangle", "x": 0, "y": 0, "width": 1, "height": 1,
+             "fill": "solid", "fill_colors": [PROBE_COLOR], "border_width": 0, "timeout": 1}]
