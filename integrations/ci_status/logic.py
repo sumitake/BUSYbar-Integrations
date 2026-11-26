@@ -45,6 +45,15 @@ class FailingRun:
     ref: str        # _pr_or_branch(r): "#42", the branch, or ""
 
 
+@dataclass(frozen=True)
+class Verdict:
+    """What the default branch last said about one workflow: the run that
+    decided (`run_id`, None when the run carried no readable id) and the
+    failure it recorded, or None when that run passed."""
+    run_id: int | None
+    failure: FailingRun | None
+
+
 @dataclass
 class RepoState:
     repo: str
@@ -55,11 +64,11 @@ class RepoState:
     # run that never changes still has to age into "stuck". None on a
     # hand-built state with nothing to re-evaluate.
     runs: list[dict] | None = field(default=None, repr=False, compare=False)
-    # workflow_id -> the failure currently standing on the default branch
+    # workflow_id -> the default branch's last verdict on that workflow
     # (see default_branch_verdicts). None until the default-branch page has
     # been read once; until then every branch is judged by `runs` alone.
-    default_verdicts: dict[int, FailingRun] | None = field(default=None, repr=False,
-                                                           compare=False)
+    default_verdicts: dict[int, Verdict] | None = field(default=None, repr=False,
+                                                        compare=False)
 
 
 @dataclass
@@ -168,17 +177,32 @@ def _on_default_branch(run: dict, repo: str, default_branch: str) -> bool:
     return not isinstance(full_name, str) or full_name.lower() == repo.lower()
 
 
+def _run_id(run: dict) -> int | None:
+    run_id = run.get("id")
+    return run_id if isinstance(run_id, int) and not isinstance(run_id, bool) else None
+
+
 def default_branch_verdicts(repo: str, runs: list[dict], default_branch: str,
-                            previous: dict[int, FailingRun] | None) -> dict[int, FailingRun]:
-    """The failures standing on `repo`'s default branch, by workflow_id:
+                            previous: dict[int, Verdict] | None) -> dict[int, Verdict]:
+    """`repo`'s default branch's verdict on each workflow, by workflow_id:
     `previous` updated from `runs` (newest first, as GitHub returns them).
 
     For each workflow the newest default-branch run that carries a verdict
-    decides: a FAILING conclusion records the failure, a PASSING one removes
-    it. A workflow with no such run in `runs` keeps its previous entry, which
-    is what keeps a failure showing after it has left the page and while a
-    re-run is still in progress. Returns a new dict; `previous` is not
-    modified. Raises like evaluate_runs on a run it cannot read."""
+    decides: a FAILING conclusion records the failure, a PASSING one records
+    a pass. A workflow with no such run in `runs` keeps its previous verdict,
+    which is what keeps a failure showing after it has left the page.
+
+    A run older than the one that decided the previous verdict never
+    replaces it. A re-run keeps its run id and has no conclusion until it
+    finishes, so without this rule a retry of the failing run would let an
+    older success further down the page clear the failure (and a retry of
+    the passing run would bring back an older failure). Run ids of one
+    workflow increase with creation time (observed on the live API; GitHub
+    does not document it), and a re-run keeps its id. A run without a
+    readable id is judged by page order alone.
+
+    Returns a new dict; `previous` is not modified. Raises like
+    evaluate_runs on a run it cannot read."""
     verdicts = dict(previous or {})
     decided: set[int] = set()
     for r in runs:
@@ -186,19 +210,23 @@ def default_branch_verdicts(repo: str, runs: list[dict], default_branch: str,
         if workflow_id in decided or not _on_default_branch(r, repo, default_branch):
             continue
         conclusion = r.get("conclusion")
-        if conclusion in FAILING:
-            verdicts[workflow_id] = FailingRun(r.get("name") or "", _pr_or_branch(r))
-        elif conclusion in PASSING:
-            verdicts.pop(workflow_id, None)
-        else:
+        if conclusion not in FAILING and conclusion not in PASSING:
             continue
         decided.add(workflow_id)
+        run_id = _run_id(r)
+        standing = verdicts.get(workflow_id)
+        if (standing is not None and standing.run_id is not None and run_id is not None
+                and run_id < standing.run_id):
+            continue   # older than the run that decided: the standing verdict holds
+        failure = (FailingRun(r.get("name") or "", _pr_or_branch(r))
+                   if conclusion in FAILING else None)
+        verdicts[workflow_id] = Verdict(run_id, failure)
     return verdicts
 
 
 def evaluate_runs(repo: str, runs: list[dict], now: datetime,
                   stale_queued_minutes: int, *, default_branch: str | None = None,
-                  default_verdicts: dict[int, FailingRun] | None = None) -> RepoState:
+                  default_verdicts: dict[int, Verdict] | None = None) -> RepoState:
     """`runs` is the newest page across all branches; the newest run of each
     workflow decides, as it always has. With `default_branch` and
     `default_verdicts` both given, default-branch failures come from the
@@ -216,7 +244,8 @@ def evaluate_runs(repo: str, runs: list[dict], now: datetime,
     latest: dict[int, dict] = {}
     for r in runs:  # API returns newest first; keep first seen per workflow
         latest.setdefault(r["workflow_id"], r)
-    failing = list(default_verdicts.values()) if tracked else []
+    failing = ([v.failure for v in default_verdicts.values() if v.failure is not None]
+               if tracked else [])
     stuck = []
     for r in latest.values():
         if r.get("conclusion") in FAILING:

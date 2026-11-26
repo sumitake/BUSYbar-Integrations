@@ -177,7 +177,10 @@ Two views of each repo are kept apart:
   `success`, `neutral` or `skipped` on the default branch. Nothing else
   takes it down: not the same workflow passing on a pull request or another
   branch, not any number of newer runs, and not a re-run that is still
-  queued or in progress, or one that was cancelled.
+  queued or in progress, or one that was cancelled. While the failed run
+  itself is being re-run, an older success of that workflow further down
+  the page does not count either: a verdict is replaced only by the same
+  run or a newer one.
 - **Pull requests and other branches.** The newest run of each workflow
   among the repo's 10 most recent runs decides, as before: a failing PR or
   branch run shows until a newer run of that workflow replaces it or it

@@ -14,7 +14,7 @@ from ci_status.logic import (
     resolve_repo_list, _eta_label, RUNNING_NUMERAL_X, RUNNING_LABEL_GAP_PX,
     RUN_SPINNER_ID,
     resolve_ci_led_value, CI_LED_COLOR, LED_OFF_COLOR, LED_OFF_ELEMENTS,
-    _parse_ts, running_runs_usable, default_branch_verdicts,
+    _parse_ts, running_runs_usable, default_branch_verdicts, Verdict,
 )
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS
 from calendar_countdown.logic import _text_width_px
@@ -802,16 +802,25 @@ def main_run(workflow_id: int, name: str, conclusion: str | None, status: str = 
 MAIN_FAIL = FailingRun("tests", "main")
 
 
+MAIN_FAIL = FailingRun("tests", "main")
+MAIN_V = Verdict(None, MAIN_FAIL)
+
+
+def _fails(verdicts) -> dict:
+    """The standing failures in a verdict mapping, by workflow_id."""
+    return {k: v.failure for k, v in verdicts.items() if v.failure is not None}
+
+
 def test_default_branch_failure_is_recorded_per_workflow():
     runs = [main_run(1, "tests", "failure"), main_run(2, "lint", "success")]
-    assert default_branch_verdicts("o/r", runs, "main", {}) == {1: MAIN_FAIL}
+    assert _fails(default_branch_verdicts("o/r", runs, "main", {})) == {1: MAIN_FAIL}
 
 
 def test_default_branch_verdict_clears_on_a_newer_passing_run():
     for passing in ("success", "neutral", "skipped"):
         runs = [main_run(1, "tests", passing, created_min_ago=1),
                 main_run(1, "tests", "failure", created_min_ago=9)]
-        assert default_branch_verdicts("o/r", runs, "main", {1: MAIN_FAIL}) == {}
+        assert _fails(default_branch_verdicts("o/r", runs, "main", {1: MAIN_V})) == {}
 
 
 def test_default_branch_failure_survives_newer_runs_without_a_verdict():
@@ -819,33 +828,33 @@ def test_default_branch_failure_survives_newer_runs_without_a_verdict():
     # about whether the branch is green: the last verdict stands.
     for status, conclusion in (("in_progress", None), ("queued", None), ("completed", "cancelled")):
         runs = [main_run(1, "tests", conclusion, status=status)]
-        assert default_branch_verdicts("o/r", runs, "main", {1: MAIN_FAIL}) == {1: MAIN_FAIL}
+        assert _fails(default_branch_verdicts("o/r", runs, "main", {1: MAIN_V})) == {1: MAIN_FAIL}
 
 
 def test_default_branch_failure_survives_falling_off_the_page():
     newer = [main_run(100 + i, f"wf{i}", "success") for i in range(100)]
-    assert default_branch_verdicts("o/r", newer, "main", {1: MAIN_FAIL})[1] == MAIN_FAIL
+    assert _fails(default_branch_verdicts("o/r", newer, "main", {1: MAIN_V}))[1] == MAIN_FAIL
 
 
 def test_default_branch_verdicts_ignore_other_branches_and_same_named_fork_branches():
     runs = [main_run(1, "tests", "success", head_branch="feature"),
             main_run(1, "tests", "success", head_repo="someone/r"),   # a fork's own "main"
             main_run(2, "lint", "failure", head_repo="someone/r")]
-    assert default_branch_verdicts("o/r", runs, "main", {1: MAIN_FAIL}) == {1: MAIN_FAIL}
+    assert _fails(default_branch_verdicts("o/r", runs, "main", {1: MAIN_V})) == {1: MAIN_FAIL}
 
 
 def test_default_branch_match_ignores_repo_name_case_and_a_missing_head_repository():
     # GitHub reports the canonical casing, which need not match the config.
     cased = [main_run(1, "tests", "failure", head_repo="O/R")]
-    assert default_branch_verdicts("o/r", cased, "main", {}) == {1: MAIN_FAIL}
+    assert _fails(default_branch_verdicts("o/r", cased, "main", {})) == {1: MAIN_FAIL}
     bare = [run(1, "tests", "completed", "failure", head_branch="main")]
-    assert default_branch_verdicts("o/r", bare, "main", {}) == {1: MAIN_FAIL}
+    assert _fails(default_branch_verdicts("o/r", bare, "main", {})) == {1: MAIN_FAIL}
 
 
 def test_default_branch_verdicts_do_not_mutate_the_previous_mapping():
-    previous = {1: MAIN_FAIL}
+    previous = {1: MAIN_V}
     default_branch_verdicts("o/r", [main_run(1, "tests", "success")], "main", previous)
-    assert previous == {1: MAIN_FAIL}
+    assert previous == {1: MAIN_V}
 
 
 def test_default_branch_failure_is_not_masked_by_a_newer_pr_success():
@@ -855,16 +864,16 @@ def test_default_branch_failure_is_not_masked_by_a_newer_pr_success():
             main_run(1, "tests", "failure", created_min_ago=9)]
     assert evaluate_runs("o/r", runs, NOW, 0).failing == []          # the defect, still the fallback
     state = evaluate_runs("o/r", runs, NOW, 0, default_branch="main",
-                          default_verdicts={1: MAIN_FAIL})
+                          default_verdicts={1: MAIN_V})
     assert state.failing == [MAIN_FAIL]
-    assert state.default_verdicts == {1: MAIN_FAIL}
+    assert _fails(state.default_verdicts) == {1: MAIN_FAIL}
 
 
 def test_pr_failure_still_shows_alongside_a_default_branch_failure():
     pr = main_run(1, "tests", "failure", created_min_ago=1, head_branch="feature")
     pr["pull_requests"] = [{"number": 7}]
     state = evaluate_runs("o/r", [pr], NOW, 0, default_branch="main",
-                          default_verdicts={2: FailingRun("lint", "main")})
+                          default_verdicts={2: Verdict(None, FailingRun("lint", "main"))})
     assert state.failing == [FailingRun("lint", "main"), FailingRun("tests", "#7")]
 
 
@@ -873,7 +882,7 @@ def test_default_branch_run_in_the_all_branches_page_defers_to_the_verdicts():
     # the verdicts say the default branch is clear.
     runs = [main_run(1, "tests", "failure")]
     both = evaluate_runs("o/r", runs, NOW, 0, default_branch="main",
-                         default_verdicts={1: MAIN_FAIL})
+                         default_verdicts={1: MAIN_V})
     assert both.failing == [MAIN_FAIL]
     clear = evaluate_runs("o/r", runs, NOW, 0, default_branch="main", default_verdicts={})
     assert clear.failing == []
@@ -891,3 +900,45 @@ def test_stuck_detection_still_covers_the_default_branch():
     runs = [main_run(1, "tests", None, status="queued", created_min_ago=30)]
     state = evaluate_runs("o/r", runs, NOW, 15, default_branch="main", default_verdicts={})
     assert state.stuck == [MAIN_FAIL]
+
+
+def _with_id(run_id: int, d: dict) -> dict:
+    return {**d, "id": run_id}
+
+
+def test_a_retry_of_the_failing_run_does_not_let_an_older_success_clear_it():
+    # A re-run keeps its run id and has no conclusion until it finishes;
+    # the older success below it must not decide.
+    fail = _with_id(11, main_run(1, "tests", "failure", created_min_ago=5))
+    older_ok = _with_id(10, main_run(1, "tests", "success", created_min_ago=30))
+    verdicts = default_branch_verdicts("o/r", [fail, older_ok], "main", {})
+    assert _fails(verdicts) == {1: MAIN_FAIL}
+    retrying = _with_id(11, main_run(1, "tests", None, status="in_progress", created_min_ago=5))
+    verdicts = default_branch_verdicts("o/r", [retrying, older_ok], "main", verdicts)
+    assert _fails(verdicts) == {1: MAIN_FAIL}
+    passed = _with_id(11, main_run(1, "tests", "success", created_min_ago=5))
+    assert _fails(default_branch_verdicts("o/r", [passed, older_ok], "main", verdicts)) == {}
+
+
+def test_a_retry_of_the_passing_run_does_not_bring_back_an_older_failure():
+    ok = _with_id(12, main_run(1, "tests", "success", created_min_ago=5))
+    older_fail = _with_id(11, main_run(1, "tests", "failure", created_min_ago=30))
+    verdicts = default_branch_verdicts("o/r", [ok, older_fail], "main", {})
+    assert _fails(verdicts) == {}
+    retrying = _with_id(12, main_run(1, "tests", None, status="queued", created_min_ago=5))
+    assert _fails(default_branch_verdicts("o/r", [retrying, older_fail], "main", verdicts)) == {}
+
+
+def test_a_newer_run_still_replaces_the_verdict():
+    fail = _with_id(11, main_run(1, "tests", "failure"))
+    verdicts = default_branch_verdicts("o/r", [fail], "main", {})
+    newer_ok = _with_id(13, main_run(1, "tests", "success"))
+    assert _fails(default_branch_verdicts("o/r", [newer_ok, fail], "main", verdicts)) == {}
+
+
+def test_a_run_without_a_readable_id_is_judged_by_page_order_alone():
+    verdicts = default_branch_verdicts("o/r", [_with_id(11, main_run(1, "tests", "failure"))],
+                                       "main", {})
+    for bad in (None, "11", True):
+        ok = {**main_run(1, "tests", "success"), "id": bad}
+        assert _fails(default_branch_verdicts("o/r", [ok], "main", verdicts)) == {}, bad

@@ -1565,8 +1565,8 @@ def test_verdicts_survive_a_poll_in_which_the_default_branch_is_unknown():
 
 
 def test_verdicts_are_carried_while_untracked_and_resume_when_the_branch_returns():
-    previous = {1: MAIN_FAIL}
-    from ci_status.logic import evaluate_runs
+    from ci_status.logic import Verdict, evaluate_runs
+    previous = {1: Verdict(11, MAIN_FAIL)}
     untracked = evaluate_runs("o/r", [], NOW, 0, default_branch=None, default_verdicts=previous)
     assert untracked.default_verdicts == previous
 
@@ -1577,3 +1577,22 @@ def test_unreadable_default_page_keeps_the_all_branches_etag():
     run_once(client, poller, CFG, NOW, {}, dry_run=False, branch_cache={})
     poller.forget_default_runs.assert_called_with("o/r")
     assert all(call.kwargs.get("running", True) for call in poller.forget_repo.call_args_list)
+
+
+def test_retrying_the_failed_default_branch_run_keeps_the_card_and_led():
+    # The Codex review case through run_once: [11 failure, 10 success], then
+    # [11 in_progress, 10 success] must keep the card and the LED.
+    client = Mock(); client.draw.return_value = DrawResult.DRAWN
+    fail = {**_branch_run("failure"), "id": 11}
+    older_ok = {**_branch_run("success"), "id": 10}
+    poller = _branch_poller([fail, older_ok], [fail, older_ok])
+    state_cache: dict = {}; branch_cache: dict = {}; overlay_state: dict = {}
+    run_once(client, poller, CFG, NOW, state_cache, dry_run=False, branch_cache=branch_cache,
+             overlay_state=overlay_state)
+    retrying = {**_branch_run(None, status="in_progress"), "id": 11}
+    poller.fetch_runs.return_value = [retrying, older_ok]
+    poller.fetch_default_runs.return_value = [retrying, older_ok]
+    run_once(client, poller, CFG, NOW + timedelta(minutes=2), state_cache, dry_run=False,
+             branch_cache=branch_cache, overlay_state=overlay_state)
+    assert state_cache["o/r"].failing == [MAIN_FAIL]
+    assert client.draw.call_args.kwargs["led_notification_color"] == "#FF0000FF"
