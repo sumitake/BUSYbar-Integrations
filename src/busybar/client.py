@@ -5,6 +5,13 @@ credentials are deliberately never sent to that relay. Discovery is a
 trusted-LAN convenience only; the configured service identifier prevents us
 from selecting an arbitrary discovered bar, but does not authenticate a LAN
 advertisement.
+
+A route that answers 401/403 has refused us (observed on firmware 1.4.1 for
+nearly every Wi-Fi request while "HTTP API access over Wi-Fi" is disabled). That is a
+definite non-execution, so it is treated like an unusable route: the next local
+route is tried, then the cloud relay; with no route left the device is reported
+unreachable. Every other HTTP answer -- including 409 and 5xx -- is the device
+speaking and never causes re-routing.
 """
 
 from __future__ import annotations
@@ -22,6 +29,9 @@ log = logging.getLogger(__name__)
 NULL_CARD_ID = "00000000-0000-0000-0000-000000000000"
 LOCAL_RETRY_SECONDS = 60
 MAX_FALLBACK_HOSTS = 3
+DENIED_STATUSES = frozenset({401, 403})
+WARN_REPEAT_SECONDS = 600
+MAX_WARNING_KEYS = 32
 
 
 class DrawResult(Enum):
@@ -87,6 +97,8 @@ class BusyBarClient:
         self._last_discovery: float | None = None
         self._capabilities_checked_at: float | None = None
         self.supports_display_v2 = False
+        self._warned: dict[str, tuple[str, float]] = {}
+        self._last_route = ""
 
         routes: list[str] = []
         for candidate in (host, *fallback_hosts):
@@ -105,9 +117,24 @@ class BusyBarClient:
     def _all_local_hosts(self) -> list[str]:
         return self._static_hosts + [h for h in self._discovered_hosts if h not in self._static_hosts]
 
-    def _mark_degraded(self) -> None:
+    def _warn(self, key: str, message: str) -> None:
+        """Warn when a condition appears or changes, then only as a reminder.
+
+        Pollers call this client as often as once a second; a fault that lasts
+        for days must not write one line per poll.
+        """
+        now = time.monotonic()
+        last = self._warned.get(key)
+        if last is not None and last[0] == message and now - last[1] < WARN_REPEAT_SECONDS:
+            return
+        if last is None and len(self._warned) >= MAX_WARNING_KEYS:
+            self._warned.clear()  # discovered addresses must not grow this without bound
+        self._warned[key] = (message, now)
+        log.warning("%s", message)
+
+    def _mark_degraded(self, reason: str = "local route unavailable") -> None:
         if self.active_transport != "cloud":
-            log.info("busybar transport: local -> cloud (local route unavailable)")
+            log.info("busybar transport: local -> cloud (%s)", reason)
         self.active_transport = "cloud"
         self._degraded_since = time.monotonic()
 
@@ -160,6 +187,13 @@ class BusyBarClient:
     def _try_local(
         self, method: str, path: str, *, replay_safe: bool, **kwargs: Any
     ) -> tuple[requests.Response | None, BaseException | None]:
+        """Return ``(response, failure)`` for one bounded local attempt.
+
+        ``response`` is the answer from the first route that accepted us. When
+        it is None, ``failure`` is the last transport exception, or None if
+        every attempted route refused us with 401/403. An uncertain failure of
+        a request that must not be replayed ends the attempt at once.
+        """
         routes = self._local_order()
         if not routes:
             return None, None
@@ -167,6 +201,7 @@ class BusyBarClient:
         if self.local_token:
             headers["X-API-Token"] = self.local_token
         refreshed = False
+        failure: BaseException | None = None
         for attempt, route in enumerate(routes):
             if route == self._static_hosts[0]:
                 self._last_primary_probe = time.monotonic()
@@ -176,17 +211,22 @@ class BusyBarClient:
                     headers=headers or None, allow_redirects=False, **kwargs,
                 )
             except requests.ConnectTimeout as exc:
-                failure: BaseException = exc
+                failure = exc
             except requests.RequestException as exc:
                 log.debug("local route unavailable (%s)", type(exc).__name__)
+                failure = exc
                 if not replay_safe:
                     return None, exc
-                failure = exc
             else:
-                self.base = self._base_for(route)
-                return response, None
-            if not replay_safe and not isinstance(failure, requests.ConnectTimeout):
-                return None, failure
+                if response.status_code not in DENIED_STATUSES:
+                    self.base = self._base_for(route)
+                    self._last_route = route
+                    return response, None
+                self._warn(
+                    f"denied:{route}",
+                    f"local route {route} refused the request (HTTP {response.status_code}); "
+                    "check the bar's HTTP API access over Wi-Fi setting and local_token",
+                )
             if not refreshed and (attempt == len(routes) - 1 or attempt == 2):
                 # Reserve the last attempt for discovery when configured routes
                 # fill the budget. Keep the original remaining routes if no
@@ -205,13 +245,15 @@ class BusyBarClient:
         headers = dict(kwargs.pop("headers", None) or {})
         headers["Authorization"] = f"Bearer {self.cloud_token}"
         try:
-            return requests.request(
+            response = requests.request(
                 method, f"{self.cloud_base}{self._cloud_path(path)}", timeout=self.cloud_timeout,
                 headers=headers, allow_redirects=False, **kwargs,
             )
         except requests.RequestException as exc:
             log.debug("cloud route unavailable (%s)", type(exc).__name__)
             return None
+        self._last_route = "cloud"
+        return response
 
     def _request(
         self, method: str, path: str, *, replay_safe: bool = True,
@@ -227,9 +269,11 @@ class BusyBarClient:
             if response is not None:
                 self._mark_recovered()
                 return response
-            if not self._cloud_configured or (not replay_safe and not isinstance(failure, requests.ConnectTimeout)):
+            # A refusal and a connect timeout are definite: nothing was applied.
+            uncertain = failure is not None and not isinstance(failure, requests.ConnectTimeout)
+            if not self._cloud_configured or (not replay_safe and uncertain):
                 return None
-            self._mark_degraded()
+            self._mark_degraded("local route unavailable" if failure is not None else "local route refused the request")
         return self._try_cloud(method, path, **(cloud_kwargs or kwargs))
 
     def _display_payload(self, elements: list[dict], modern: bool) -> list[dict]:
@@ -267,11 +311,10 @@ class BusyBarClient:
         )
         if response is None:
             return DrawResult.UNREACHABLE
-        if response.status_code == 409:
-            return DrawResult.REJECTED
-        if response.status_code == 200:
-            return DrawResult.DRAWN
-        log.warning("draw failed: HTTP %s", response.status_code)
+        if response.status_code in (200, 409):
+            self._warned.pop("draw", None)
+            return DrawResult.DRAWN if response.status_code == 200 else DrawResult.REJECTED
+        self._warn("draw", f"draw failed: HTTP {response.status_code} via {self._last_route}")
         return DrawResult.ERROR
 
     def play_audio(self, application_name: str, stock_path: str | None = None, path: str | None = None) -> bool:

@@ -1,4 +1,4 @@
-"""Render a fixed Nyan Cat loop and compile it to a bicycle0 .anim.
+"""Render a fixed Nyan Cat loop and compile it to a bicycle1 .anim.
 
 Renderer geometry adapted from the community reference app
 (maxswinkels/busybar-apps, apps/nyan-cat). Deterministic and analytical so the

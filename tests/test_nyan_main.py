@@ -172,3 +172,45 @@ def test_upload_success_latches_and_clears_backoff(monkeypatch):
     assert "upload_next_try" not in st
     m.ensure_asset_uploaded(c, st)      # latched: no further uploads
     assert c.uploads == 1
+
+
+def test_unreadable_local_asset_does_not_crash_and_is_retried_with_backoff(monkeypatch, caplog):
+    # Observed in production: macOS revoked the agent's access to the repo
+    # folder mid-run, read_bytes() raised PermissionError, and the unguarded
+    # poll loop took the whole agent down. An unreadable asset is an upload
+    # that could not be attempted, so it shares the upload's backoff.
+    import logging
+    import integrations.nyan_filler.main as m
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock["t"])
+
+    class Unreadable:
+        name = "nyan.anim"
+        reads = 0
+        def exists(self): return True
+        def read_bytes(self):
+            Unreadable.reads += 1
+            raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(m, "ASSET_PATH", Unreadable())
+    c = FakeClient(); st = {}
+    with caplog.at_level(logging.WARNING):
+        run_once(c, BASE, ACTIVE, st)
+        run_once(c, BASE, ACTIVE, st)       # inside the backoff: no second read
+        clock["t"] = 6.0
+        run_once(c, BASE, ACTIVE, st)       # past the backoff: one retry
+    assert Unreadable.reads == 2
+    assert c.uploads == [] and "asset_uploaded" not in st
+    assert len(c.draws) == 3                # the poll loop kept drawing
+    assert sum("unreadable" in r.message for r in caplog.records) == 1
+    assert not any("missing" in r.message for r in caplog.records)
+
+    class Readable:
+        name = "nyan.anim"
+        def read_bytes(self): return b"anim-bytes"
+
+    monkeypatch.setattr(m, "ASSET_PATH", Readable())   # access restored
+    clock["t"] = 60.0
+    run_once(c, BASE, ACTIVE, st)
+    assert st["asset_uploaded"] is True and len(c.uploads) == 1

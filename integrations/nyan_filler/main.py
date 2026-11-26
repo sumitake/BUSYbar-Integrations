@@ -53,18 +53,29 @@ def ensure_asset_uploaded(client, state: dict) -> None:
     poll."""
     if state.get("asset_uploaded"):
         return
-    if not ASSET_PATH.exists():
+    now_mono = time.monotonic()
+    if now_mono < state.get("upload_next_try", 0.0):
+        return  # throttled after a recent failed attempt
+    try:
+        data = ASSET_PATH.read_bytes()
+    except FileNotFoundError:
         if not state.get("asset_missing_warned"):
             log.warning("asset %s missing; run `uv run python -m tools.build_nyan_anim`", ASSET_PATH)
             state["asset_missing_warned"] = True
         return
-    now_mono = time.monotonic()
-    if now_mono < state.get("upload_next_try", 0.0):
-        return  # throttled after a recent failed upload attempt
-    if client.upload_asset(APP, ASSET_NAME, ASSET_PATH.read_bytes()):
+    except OSError as exc:
+        # The file cannot be read (macOS can withdraw folder access from a
+        # running agent). Treat it as an upload that could not be attempted:
+        # warn once, back off, and keep the poll loop alive.
+        if not state.get("asset_unreadable_warned"):
+            log.warning("asset %s unreadable (%s); will retry", ASSET_PATH.name, type(exc).__name__)
+            state["asset_unreadable_warned"] = True
+        data = None
+    if data is not None and client.upload_asset(APP, ASSET_NAME, data):
         state["asset_uploaded"] = True
         state.pop("upload_backoff", None)
         state.pop("upload_next_try", None)
+        state.pop("asset_unreadable_warned", None)
     else:
         backoff = min(max(state.get("upload_backoff", 0) * 2, UPLOAD_BACKOFF_START), UPLOAD_BACKOFF_CAP)
         state["upload_backoff"] = backoff

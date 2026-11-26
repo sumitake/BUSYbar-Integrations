@@ -76,6 +76,11 @@ layout; Nyan already plays its uploaded animation on the bar. Firmware fixes
 for Wi-Fi status streaming and networking benefit the existing local API
 without adding another background listener.
 
+The Nyan asset now uses the animation container introduced in firmware 1.3.0
+(checked on 1.4.1), so the filler needs firmware 1.3.0 or later; calendar and
+CI use the bar's own stock animations and are unaffected. See the
+[Nyan filler README](integrations/nyan_filler/README.md).
+
 ### Inspect the device
 
 ```bash
@@ -128,10 +133,20 @@ between recovery probes. Missing discovery support or a failed scan leaves
 explicit hosts usable; the CLI distinguishes an unavailable scan from a
 successful scan that found no devices.
 
-HTTP rejections (including authentication errors and a higher-priority canvas)
-do not trigger failover. Reads and display updates can use bounded fallback.
+A route that answers `401` or `403` has refused the request, so it is treated
+as unusable for that operation: the next local address is tried, then the cloud
+route. The bar answers `403` to nearly every request that arrives over Wi-Fi
+while its **HTTP API access over Wi-Fi** setting is disabled (observed on
+firmware 1.4.1; `/api/version` and `/api/transport` still answer there),
+so a Wi-Fi address in `fallback_hosts` only helps once that setting is enabled
+(with a key supplied as `local_token`). Every other HTTP answer, including a
+higher-priority canvas (`409`) and server errors, is the device's reply and does
+not trigger failover. When no route accepts a request and no cloud route is
+configured, the device is reported unreachable and the agents back off. Set
+`transport = "local"` if a local refusal must never be routed through the cloud. Reads and display updates can use bounded fallback.
 Audio and timer starts are not replayed after an uncertain send/read failure;
-only a definite connection timeout permits another route. Calendar chirps are
+only a definite connection timeout or a refusal permits another route.
+Identical failures are logged once and then repeated at most every ten minutes. Calendar chirps are
 attempted once per event edge, and `auto_busy` requires a positively observed
 nested `NOT_STARTED` snapshot rather than treating unavailable state as idle.
 
